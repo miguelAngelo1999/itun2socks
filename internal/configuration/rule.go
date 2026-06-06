@@ -92,3 +92,21 @@ func EditCustomizedRule(oldRule string, newRule string) error {
 func GetBuiltInRules(id string) ([]rule_engine.Rule, error) {
 	return rule_engine.Parse(id, []string{})
 }
+
+// ReorderCustomizedRules replaces the entire customized rules list with a new ordered list.
+func ReorderCustomizedRules(rules []string) error {
+	c, err := Read()
+	if err != nil {
+		return err
+	}
+	// Validate each rule exists and format it
+	newRules := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		formattedRule := strings.TrimSpace(rule)
+		if formattedRule != "" {
+			newRules = append(newRules, formattedRule)
+		}
+	}
+	c.Rules = newRules
+	return Write(c)
+}

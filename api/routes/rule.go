@@ -19,6 +19,7 @@ func ruleRouter() http.Handler {
 	r.Put("/customized", addCustomizedRules)
 	r.Post("/customized", editCustomizedRule)
 	r.Delete("/customized", deleteCustomizedRules)
+r.Post("/customized/reorder", reorderCustomizedRules)
 	return r
 }
 
@@ -153,6 +154,24 @@ func editCustomizedRule(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, NewError(err.Error()))
 			return
 		}
+	}
+	render.NoContent(w, r)
+}
+
+func reorderCustomizedRules(w http.ResponseWriter, r *http.Request) {
+	var req map[string][]string
+	if err := render.DecodeJSON(r.Body, &req); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	if err := configuration.ReorderCustomizedRules(req["rules"]); err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, NewError(err.Error()))
+		return
+	}
+	if manager.GetIsStarted() {
+		executor.UpdateRule()
 	}
 	render.NoContent(w, r)
 }

@@ -45,6 +45,16 @@ func UpdateRule() (string, error) {
 	matcher.UpdateRuleEngine(rEngine)
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "update rule: %v"), selectedRule)
 	dns.ResetCache()
+
+	// Initialize named proxies for multi-proxy routing
+	namedNames := configuration.ExtractNamedProxiesFromRules(rawConfig.Rules)
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "rules count=%d named=%d"), len(rawConfig.Rules), len(namedNames))
+	if len(namedNames) > 0 {
+		namedCfgs := configuration.GetProxiesByNames(namedNames)
+		conn.SetNamedProxies(namedCfgs)
+		log.Infoln(log.FormatLog(log.ExecutorPrefix, "loaded %d named proxies: %v"), len(namedCfgs), namedNames)
+	}
+
 	return selectedRule, nil
 }
 

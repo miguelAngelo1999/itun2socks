@@ -119,3 +119,19 @@ func handleMetadata(metadata *C.Metadata) rule_engine.Rule {
 	}
 	return rule
 }
+
+func NamedProxiesCount() int {
+mux.RLock()
+defer mux.RUnlock()
+return len(namedProxies)
+}
+
+func NamedProxiesKeys() []string {
+mux.RLock()
+defer mux.RUnlock()
+keys := make([]string, 0, len(namedProxies))
+for k := range namedProxies {
+keys = append(keys, k)
+}
+return keys
+}

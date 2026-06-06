@@ -26,6 +26,7 @@ func proxyRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getProxies)
 	r.Get("/names", getProxyNames)
+r.Get("/debug-named", debugNamedProxies)
 	r.Get("/cur-proxy", handleGetProxy)
 	r.Get("/{proxyId}", getProxy) // NEW: get single proxy with password
 	r.Put("/", addProxy)
@@ -382,4 +383,19 @@ func getProxyNames(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	render.JSON(w, r, names)
+}
+// ReloadNamedProxies refreshes the named proxy pool from current config/rules
+func ReloadNamedProxies() {
+rawConfig, err := configuration.Read()
+if err != nil {
+return
+}
+namedProxyNames := configuration.ExtractNamedProxiesFromRules(rawConfig.Rules)
+if len(namedProxyNames) > 0 {
+namedConfigs := configuration.GetProxiesByNames(namedProxyNames)
+conn.SetNamedProxies(namedConfigs)
+}
+}
+func debugNamedProxies(w http.ResponseWriter, r *http.Request) {
+render.JSON(w, r, render.M{"count": conn.NamedProxiesCount(), "keys": conn.NamedProxiesKeys()})
 }

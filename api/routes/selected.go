@@ -75,7 +75,8 @@ func setProxySelectedId(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		conn.UpdateProxy(proxy)
-	}
+ReloadNamedProxies()
+}
 
 	render.NoContent(w, r)
 }
