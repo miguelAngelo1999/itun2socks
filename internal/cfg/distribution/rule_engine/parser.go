@@ -71,10 +71,11 @@ func ParseItem(rawRuleType, value, rawPolicy string) (Rule, error) {
 	var rule Rule
 	var err error
 	policy := constants.Policy(rawPolicy)
-	if !slices.Contains([]constants.Policy{constants.PolicyDirect, constants.PolicyReject, constants.PolicyProxy}, policy) {
-		err = fmt.Errorf("policy not match: %v", ruleType)
-		return nil, err
-	}
+	// Allow standard policies AND named proxy IDs for per-profile routing
+		isStandardPolicy := slices.Contains([]constants.Policy{constants.PolicyDirect, constants.PolicyReject, constants.PolicyProxy}, policy)
+		if !isStandardPolicy && rawPolicy == "" {
+			return nil, fmt.Errorf("policy not match: %v", ruleType)
+		}
 
 	switch ruleType {
 	case constants.RuleIpCidr:

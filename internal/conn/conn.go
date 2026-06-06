@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
+	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
@@ -44,6 +45,25 @@ func UpdateProxy(remoteProxy C.Proxy) {
 	proxies[constants.PolicyProxy] = remoteProxy
 	proxies[constants.PolicyDirect] = adapter.NewProxy(outbound.NewDirect())
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
+	// Register named proxies for per-profile rule routing
+	if config, err := configuration.Read(); err == nil {
+		for _, proxyConfig := range config.Proxy {
+			name, _ := proxyConfig["name"].(string)
+			id, _ := proxyConfig["id"].(string)
+			if name == "" && id == "" {
+				continue
+			}
+			if p, err := adapter.ParseProxy(proxyConfig); err == nil {
+				proxy := adapter.NewProxy(p)
+				if name != "" {
+					proxies[constants.Policy(name)] = proxy
+				}
+				if id != "" {
+					proxies[constants.Policy(id)] = proxy
+				}
+			}
+		}
+	}
 }
 
 func GetProxy(rule constants.Policy) (C.Proxy, error) {
