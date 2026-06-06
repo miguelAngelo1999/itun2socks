@@ -23,8 +23,9 @@ func UpdateIsFakeIpEnabled(value bool) {
 }
 
 var (
-	proxies map[constants.Policy]C.Proxy
-	mux     sync.RWMutex
+	proxies      map[constants.Policy]C.Proxy
+	namedProxies map[string]C.Proxy
+	mux          sync.RWMutex
 )
 
 type Matcher func(metadata *C.Metadata, rule rule_engine.Rule) (rule_engine.Rule, error)
@@ -44,6 +45,44 @@ func UpdateProxy(remoteProxy C.Proxy) {
 	proxies[constants.PolicyProxy] = remoteProxy
 	proxies[constants.PolicyDirect] = adapter.NewProxy(outbound.NewDirect())
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
+}
+
+// SetNamedProxies initializes adapters for proxies referenced by name in rules
+func SetNamedProxies(proxyConfigs []map[string]any) {
+	mux.Lock()
+	defer mux.Unlock()
+	namedProxies = make(map[string]C.Proxy)
+	for _, cfg := range proxyConfigs {
+		name, _ := cfg["name"].(string)
+		if name == "" {
+			continue
+		}
+		p, err := adapter.ParseProxy(cfg)
+		if err != nil {
+			log.Warnln(log.FormatLog(log.HubPrefix, "fail to parse named proxy '%v': %v"), name, err)
+			continue
+		}
+		namedProxies[strings.ToLower(name)] = adapter.NewProxy(p)
+		log.Infoln(log.FormatLog(log.HubPrefix, "loaded named proxy: %v"), name)
+	}
+}
+
+// GetProxyForPolicy resolves a policy to a proxy - supports named proxies
+func GetProxyForPolicy(policy constants.Policy) (C.Proxy, error) {
+	mux.RLock()
+	defer mux.RUnlock()
+
+	if constants.IsNamedProxy(policy) {
+		if p, ok := namedProxies[strings.ToLower(string(policy))]; ok {
+			return p, nil
+		}
+		// Fallback to default selected proxy
+		if p := proxies[constants.PolicyProxy]; p != nil {
+			return p, nil
+		}
+		return nil, fmt.Errorf("named proxy '%v' not found", policy)
+	}
+	return GetProxy(policy)
 }
 
 func GetProxy(rule constants.Policy) (C.Proxy, error) {

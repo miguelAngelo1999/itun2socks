@@ -2,6 +2,16 @@ package constants
 
 type Policy string
 
+// IsNamedProxy returns true if policy is a proxy name (not DIRECT/REJECT/PROXY)
+func IsNamedProxy(p Policy) bool {
+	switch p {
+	case PolicyDirect, PolicyProxy, PolicyReject:
+		return false
+	default:
+		return p != ""
+	}
+}
+
 const (
 	PolicyDirect Policy = "DIRECT"
 	PolicyProxy  Policy = "PROXY"

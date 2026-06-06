@@ -25,6 +25,7 @@ var (
 func proxyRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getProxies)
+	r.Get("/names", getProxyNames)
 	r.Get("/cur-proxy", handleGetProxy)
 	r.Get("/{proxyId}", getProxy) // NEW: get single proxy with password
 	r.Put("/", addProxy)
@@ -358,4 +359,27 @@ func getPasswordStatus(w http.ResponseWriter, r *http.Request) {
 		"setAt":       proxy["passwordSetAt"],
 		"ttlMinutes":  proxy["passwordTTLMinutes"],
 	})
+}
+
+// getProxyNames returns all proxy ID/name pairs for the rule editor
+func getProxyNames(w http.ResponseWriter, r *http.Request) {
+	proxiesMap, err := configuration.GetProxies()
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, NewError(err.Error()))
+		return
+	}
+	type proxyName struct {
+		Id   string `json:"id"`
+		Name string `json:"name"`
+	}
+	names := make([]proxyName, 0)
+	for _, proxy := range proxiesMap {
+		id, _ := proxy["id"].(string)
+		name, _ := proxy["name"].(string)
+		if name != "" {
+			names = append(names, proxyName{Id: id, Name: name})
+		}
+	}
+	render.JSON(w, r, names)
 }

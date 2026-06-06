@@ -4,7 +4,6 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"slices"
 	"strings"
 
 	"github.com/igoogolx/itun2socks/internal/constants"
@@ -71,10 +70,7 @@ func ParseItem(rawRuleType, value, rawPolicy string) (Rule, error) {
 	var rule Rule
 	var err error
 	policy := constants.Policy(rawPolicy)
-	if !slices.Contains([]constants.Policy{constants.PolicyDirect, constants.PolicyReject, constants.PolicyProxy}, policy) {
-		err = fmt.Errorf("policy not match: %v", ruleType)
-		return nil, err
-	}
+	// Named proxy policies (proxy names) are allowed alongside DIRECT/REJECT/PROXY
 
 	switch ruleType {
 	case constants.RuleIpCidr:

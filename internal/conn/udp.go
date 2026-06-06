@@ -147,7 +147,7 @@ func (uc *CopyableReaderWriterConn) WriteTo(data []byte, addr net.Addr) (int, er
 }
 
 func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule, defaultInterface string) (*CopyablePacketConn, error) {
-	connDialer, err := GetProxy(rule.GetPolicy())
+	connDialer, err := GetProxyForPolicy(rule.GetPolicy())
 	if err != nil {
 		return nil, err
 	}

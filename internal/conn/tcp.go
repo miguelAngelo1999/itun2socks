@@ -54,7 +54,7 @@ func NewTcpConnContext(ctx context.Context, conn net.Conn, metadata *C.Metadata,
 }
 
 func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule, defaultInterface string) (net.Conn, error) {
-	connDialer, err := GetProxy(rule.GetPolicy())
+	connDialer, err := GetProxyForPolicy(rule.GetPolicy())
 	if err != nil {
 		return nil, err
 	}

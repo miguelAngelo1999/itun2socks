@@ -230,6 +230,12 @@ func AddProxy(proxy map[string]any) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fail to parse proxy,error:%v", err)
 	}
+	// Validate unique name
+	if name, ok := proxy["name"].(string); ok && name != "" {
+		if err := validateProxyName(name, ""); err != nil {
+			return "", err
+		}
+	}
 	data, err := Read()
 	if err != nil {
 		return "", err
@@ -245,4 +251,72 @@ func AddProxy(proxy map[string]any) (string, error) {
 		return "", err
 	}
 	return id.String(), nil
+}
+
+// validateProxyName checks that the name is unique and not reserved.
+func validateProxyName(name string, excludeId string) error {
+	if name == "" {
+		return nil // empty name is allowed (legacy)
+	}
+	reserved := []string{"direct", "reject", "proxy"}
+	lower := strings.ToLower(name)
+	for _, r := range reserved {
+		if lower == r {
+			return fmt.Errorf("'%s' is a reserved name", name)
+		}
+	}
+	data, err := readFile()
+	if err != nil {
+		return err
+	}
+	for _, p := range data.Proxy {
+		id, _ := p["id"].(string)
+		if id == excludeId {
+			continue
+		}
+		existing, _ := p["name"].(string)
+		if strings.EqualFold(existing, name) {
+			return fmt.Errorf("proxy name '%s' already exists", name)
+		}
+	}
+	return nil
+}
+
+// GetProxiesByNames returns proxy configs for the given names (case-insensitive)
+func GetProxiesByNames(names []string) []map[string]any {
+	data, err := Read()
+	if err != nil {
+		return nil
+	}
+	nameSet := make(map[string]bool)
+	for _, n := range names {
+		nameSet[strings.ToLower(n)] = true
+	}
+	var result []map[string]any
+	for _, p := range data.Proxy {
+		name, _ := p["name"].(string)
+		if nameSet[strings.ToLower(name)] {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// ExtractNamedProxiesFromRules extracts proxy names referenced in rules
+func ExtractNamedProxiesFromRules(rules []string) []string {
+	reserved := map[string]bool{"direct": true, "reject": true, "proxy": true}
+	seen := make(map[string]bool)
+	var names []string
+	for _, rule := range rules {
+		parts := strings.Split(rule, ",")
+		if len(parts) >= 3 {
+			policy := strings.TrimSpace(parts[len(parts)-1])
+			lower := strings.ToLower(policy)
+			if !reserved[lower] && !seen[lower] {
+				seen[lower] = true
+				names = append(names, policy)
+			}
+		}
+	}
+	return names
 }
