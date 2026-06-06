@@ -26,7 +26,8 @@ func proxyRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getProxies)
 	r.Get("/cur-proxy", handleGetProxy)
-	r.Get("/{proxyId}", getProxy) // NEW: get single proxy with password
+	r.Get("/names", getProxyNames) // Proxy id+name list for rule routing
+	r.Get("/{proxyId}", getProxy) // get single proxy with password
 	r.Put("/", addProxy)
 	r.Delete("/all", deleteAllProxies)
 	r.Delete("/", deleteProxies)
@@ -358,4 +359,27 @@ func getPasswordStatus(w http.ResponseWriter, r *http.Request) {
 		"setAt":       proxy["passwordSetAt"],
 		"ttlMinutes":  proxy["passwordTTLMinutes"],
 	})
+}
+
+// getProxyNames returns a lightweight [{id, name}] list for rule routing.
+func getProxyNames(w http.ResponseWriter, r *http.Request) {
+	proxiesMap, err := configuration.GetProxies()
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, NewError(err.Error()))
+		return
+	}
+	selected, _ := configuration.GetSelectedId("proxy")
+	names := make([]map[string]any, 0)
+	for _, proxy := range proxiesMap {
+		entry := map[string]any{
+			"id":   proxy["id"],
+			"name": proxy["name"],
+		}
+		if proxy["id"] == selected {
+			entry["selected"] = true
+		}
+		names = append(names, entry)
+	}
+	render.JSON(w, r, names)
 }
