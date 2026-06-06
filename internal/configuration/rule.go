@@ -123,28 +123,29 @@ func ReorderCustomizedRules(rules []string) error {
 	return Write(c)
 }
 
-// ToggleCustomizedRule toggles a rule between enabled and disabled (# prefix).
+// ToggleCustomizedRule toggles a rule between enabled (#-prefixed) and disabled.
 func ToggleCustomizedRule(rule string) error {
 	c, err := Read()
 	if err != nil {
 		return err
 	}
 	trimmed := strings.TrimSpace(rule)
+	// Strip ALL leading # to get the base rule
+	baseRule := strings.TrimLeft(trimmed, "#")
+
 	for i, r := range c.Rules {
-		if r == trimmed {
-			// Enable -> disable
-			c.Rules[i] = "#" + trimmed
-			return Write(c)
+		rBase := strings.TrimLeft(strings.TrimSpace(r), "#")
+		if rBase != baseRule {
+			continue
 		}
-		if r == "#"+trimmed || "#"+r == trimmed {
-			// Disable -> enable (strip #)
-			stripped := strings.TrimPrefix(r, "#")
-			if stripped == "" {
-				stripped = strings.TrimPrefix(trimmed, "#")
-			}
-			c.Rules[i] = stripped
-			return Write(c)
+		if strings.HasPrefix(strings.TrimSpace(r), "#") {
+			// Currently disabled -> enable (remove all # prefixes)
+			c.Rules[i] = baseRule
+		} else {
+			// Currently enabled -> disable (add single #)
+			c.Rules[i] = "#" + baseRule
 		}
+		return Write(c)
 	}
 	return fmt.Errorf("rule not found: %s", rule)
 }
@@ -160,10 +161,7 @@ func GetCustomizedRulesRaw() ([]map[string]any, error) {
 	for _, rule := range c.Rules {
 		trimmed := strings.TrimSpace(rule)
 		disabled := strings.HasPrefix(trimmed, "#")
-		rawRule := trimmed
-		if disabled {
-			rawRule = strings.TrimPrefix(trimmed, "#")
-		}
+		rawRule := strings.TrimLeft(trimmed, "#") // strip ALL leading #s
 		chunks := strings.Split(rawRule, ",")
 		if len(chunks) != 3 {
 			continue // skip built-in rule names (no commas)
