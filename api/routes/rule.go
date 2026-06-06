@@ -5,7 +5,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
-	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/executor"
 	"github.com/igoogolx/itun2socks/internal/manager"
@@ -19,6 +18,8 @@ func ruleRouter() http.Handler {
 	r.Put("/customized", addCustomizedRules)
 	r.Post("/customized", editCustomizedRule)
 	r.Delete("/customized", deleteCustomizedRules)
+	r.Post("/customized/reorder", reorderCustomizedRules)
+	r.Post("/customized/toggle", toggleCustomizedRule)
 	return r
 }
 
@@ -110,13 +111,18 @@ func getRuleDetail(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, ErrBadRequest)
 		return
 	}
-	var rules []rule_engine.Rule
-	var err error
 	if id == "customized" {
-		rules, err = configuration.GetCustomizedRules()
-	} else {
-		rules, err = configuration.GetBuiltInRules(id)
+		// Return raw rules including disabled ones
+		items, err := configuration.GetCustomizedRulesRaw()
+		if err != nil {
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, NewError(err.Error()))
+			return
+		}
+		render.JSON(w, r, render.M{"items": items})
+		return
 	}
+	rules, err := configuration.GetBuiltInRules(id)
 	if err != nil {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, ErrBadRequest)
@@ -153,6 +159,48 @@ func editCustomizedRule(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, NewError(err.Error()))
 			return
 		}
+	}
+	render.NoContent(w, r)
+}
+
+func reorderCustomizedRules(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Rules []string `json:"rules"`
+	}
+	if err := render.DecodeJSON(r.Body, &req); err != nil || len(req.Rules) == 0 {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	if err := configuration.ReorderCustomizedRules(req.Rules); err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, NewError(err.Error()))
+		return
+	}
+	if manager.GetIsStarted() {
+		_ = manager.Close()
+		_ = manager.Start()
+	}
+	render.NoContent(w, r)
+}
+
+func toggleCustomizedRule(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Rule string `json:"rule"`
+	}
+	if err := render.DecodeJSON(r.Body, &req); err != nil || req.Rule == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	if err := configuration.ToggleCustomizedRule(req.Rule); err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, NewError(err.Error()))
+		return
+	}
+	if manager.GetIsStarted() {
+		_ = manager.Close()
+		_ = manager.Start()
 	}
 	render.NoContent(w, r)
 }
