@@ -59,7 +59,15 @@ func (h *Http) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
 
 // DialContext implements C.ProxyAdapter
 func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (_ C.Conn, err error) {
-	c, err := dialer.DialContext(ctx, "tcp", h.addr, h.Base.DialOptions(opts...)...)
+	var c net.Conn
+	// Use plain net.Dial for loopback to avoid interface binding issues
+	host, _, _ := net.SplitHostPort(h.addr)
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		c, err = net.DialTimeout("tcp", h.addr, C.DefaultTCPTimeout)
+	} else {
+		c, err = dialer.DialContext(ctx, "tcp", h.addr, h.Base.DialOptions(opts...)...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", h.addr, err)
 	}

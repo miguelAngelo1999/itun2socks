@@ -90,7 +90,9 @@ func dialContext(ctx context.Context, network string, destination net.IP, port s
 	}
 
 	dialer := &net.Dialer{}
-	if opt.interfaceName != "" {
+	// Skip interface binding for loopback addresses - binding loopback to a
+	// physical interface causes connection failures (can't assign requested address)
+	if opt.interfaceName != "" && !destination.IsLoopback() {
 		if opt.fallbackBind {
 			if err := fallbackBindIfaceToDialer(opt.interfaceName, dialer, network, destination); err != nil {
 				return nil, err
