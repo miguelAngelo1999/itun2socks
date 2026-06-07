@@ -110,6 +110,9 @@ func StopMonitor() error {
 func update(name string) {
 	defaultInterfaceName.Store(name)
 	dialer.DefaultInterface.Store(name)
+	// Use fallback bind (LocalAddr) instead of IP_BOUND_IF to avoid
+	// 'can't assign requested address' errors on macOS with TUN interfaces
+	dialer.DefaultOptions = []dialer.Option{dialer.WithFallbackBind(true)}
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "update default interface: %v"), name)
 }
 
