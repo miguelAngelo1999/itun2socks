@@ -80,6 +80,9 @@ func ParseProxy(mapping map[string]any) (C.Proxy, error) {
 			break
 		}
 		proxy, err = outbound.NewTrojan(*trojanOption)
+	case "direct":
+		// Built-in direct proxy
+		return NewProxy(outbound.NewDirect()), nil
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
