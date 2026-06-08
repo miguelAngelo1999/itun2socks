@@ -39,6 +39,13 @@ type proxySettings struct {
 }
 
 func SetWebProxy(host string, port string, activeInterface string) error {
+	if activeInterface == "" {
+		var err error
+		activeInterface, err = getActiveNetworkInterface()
+		if err != nil {
+			return fmt.Errorf("failed to detect active network interface: %w", err)
+		}
+	}
 	// Set the web proxy and secure web proxy
 	if err := setProxySettings(proxyTypeHTTP, activeInterface, host, port); err != nil {
 		return err
@@ -52,7 +59,13 @@ func SetWebProxy(host string, port string, activeInterface string) error {
 }
 
 func DisableWebProxy(activeInterface string) error {
-
+	if activeInterface == "" {
+		var err error
+		activeInterface, err = getActiveNetworkInterface()
+		if err != nil {
+			return fmt.Errorf("failed to detect active network interface: %w", err)
+		}
+	}
 	// disable the web proxy and secure web proxy
 	errHTTP := disableProxy(proxyTypeHTTP, activeInterface)
 	errHTTPs := disableProxy(proxyTypeHTTPS, activeInterface)
