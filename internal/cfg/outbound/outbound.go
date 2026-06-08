@@ -8,6 +8,7 @@ import (
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outboundgroup"
 	"github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/clash/constant/provider"
+	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outbound"
 )
 
 type Option struct {
@@ -34,6 +35,11 @@ func New(option Option) (constant.Proxy, error) {
 				proxyMap[v["id"].(string)] = p
 				ids = append(ids, v["id"].(string))
 			}
+			// Add DIRECT as fallback: when all proxies unreachable (home network),
+			// auto-mode selects DIRECT and traffic goes out without a proxy
+			proxyMap["DIRECT"] = adapter.NewProxy(outbound.NewDirect())
+			ids = append(ids, "DIRECT")
+
 			proxyGroupConfig := map[string]any{
 				"name":     "auto",
 				"proxies":  ids,
@@ -49,6 +55,11 @@ func New(option Option) (constant.Proxy, error) {
 			proxy = adapter.NewProxy(proxyGroup)
 		}
 	} else {
+		// Built-in DIRECT profile: routes all traffic directly, no proxy
+		if option.SelectedProxy == "DIRECT" {
+			return adapter.NewProxy(outbound.NewDirect()), nil
+		}
+
 		var selectedProxy map[string]any
 		for _, v := range option.Proxies {
 			if v["id"] == option.SelectedProxy {

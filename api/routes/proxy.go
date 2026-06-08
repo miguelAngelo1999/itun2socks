@@ -147,6 +147,12 @@ func getProxies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxies := make([]any, 0)
+	// Add built-in DIRECT proxy at the top
+	proxies = append(proxies, map[string]any{
+		"id":   "DIRECT",
+		"name": "Direct (No Proxy)",
+		"type": "direct",
+	})
 	for _, proxy := range proxiesMap {
 		// Strip passwords from the list — use getProxy/:id to retrieve them
 		proxies = append(proxies, configuration.StripProxyPasswords(proxy))
@@ -371,6 +377,12 @@ func getProxyNames(w http.ResponseWriter, r *http.Request) {
 	}
 	selected, _ := configuration.GetSelectedId("proxy")
 	names := make([]map[string]any, 0)
+	// Built-in DIRECT proxy
+	directEntry := map[string]any{"id": "DIRECT", "name": "Direct (No Proxy)"}
+	if selected == "DIRECT" {
+		directEntry["selected"] = true
+	}
+	names = append(names, directEntry)
 	for _, proxy := range proxiesMap {
 		entry := map[string]any{
 			"id":   proxy["id"],
