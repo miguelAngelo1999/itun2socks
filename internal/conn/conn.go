@@ -45,6 +45,12 @@ func UpdateProxy(remoteProxy C.Proxy) {
 	proxies[constants.PolicyProxy] = remoteProxy
 	proxies[constants.PolicyDirect] = adapter.NewProxy(outbound.NewDirect())
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
+
+	// Check if selected proxy is DIRECT - if so, all named proxy policies
+	// should also route direct (home mode: no proxy for anything)
+	selectedId, _ := configuration.GetSelectedId("proxy")
+	isDirectMode := selectedId == "DIRECT"
+
 	// Register named proxies for per-profile rule routing
 	if config, err := configuration.Read(); err == nil {
 		for _, proxyConfig := range config.Proxy {
@@ -53,8 +59,16 @@ func UpdateProxy(remoteProxy C.Proxy) {
 			if name == "" && id == "" {
 				continue
 			}
-			if p, err := adapter.ParseProxy(proxyConfig); err == nil {
-				proxy := adapter.NewProxy(p)
+			var proxy C.Proxy
+			if isDirectMode {
+				// In direct mode, all named proxies route directly
+				proxy = adapter.NewProxy(outbound.NewDirect())
+			} else {
+				if p, err := adapter.ParseProxy(proxyConfig); err == nil {
+					proxy = adapter.NewProxy(p)
+				}
+			}
+			if proxy != nil {
 				if name != "" {
 					proxies[constants.Policy(name)] = proxy
 				}
