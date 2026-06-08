@@ -2,6 +2,8 @@ package routes
 
 import (
 	"net"
+	"os/exec"
+	"strings"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,8 +31,39 @@ func getInterfaces(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, NewError(err.Error()))
 		return
 	}
+
+	// Build friendly name map from networksetup on macOS
+	friendlyNames := map[string]string{}
+	if out, err := exec.Command("networksetup", "-listallhardwareports").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		var currentName string
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Hardware Port:") {
+				currentName = strings.TrimSpace(strings.TrimPrefix(line, "Hardware Port:"))
+			} else if strings.HasPrefix(line, "Device:") && currentName != "" {
+				device := strings.TrimSpace(strings.TrimPrefix(line, "Device:"))
+				friendlyNames[device] = currentName
+				currentName = ""
+			}
+		}
+	}
+
+	// Enrich interfaces with friendly names
+	type enrichedIface struct {
+		net.Interface
+		FriendlyName string `json:"FriendlyName,omitempty"`
+	}
+	enriched := make([]enrichedIface, 0, len(interfaces))
+	for _, iface := range interfaces {
+		enriched = append(enriched, enrichedIface{
+			Interface:    iface,
+			FriendlyName: friendlyNames[iface.Name],
+		})
+	}
+
 	render.JSON(w, r, render.M{
-		"interfaces": interfaces,
+		"interfaces": enriched,
 	})
 }
 
