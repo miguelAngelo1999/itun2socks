@@ -16,6 +16,14 @@ func GetSelectedProxy() (map[string]any, error) {
 	return GetProxy(data.Selected.Proxy)
 }
 func GetProxy(id string) (map[string]any, error) {
+	// Built-in DIRECT proxy - not stored in config
+	if id == "DIRECT" {
+		return map[string]any{
+			"id":   "DIRECT",
+			"name": "Direct (No Proxy)",
+			"type": "direct",
+		}, nil
+	}
 	data, err := Read()
 	if err != nil {
 		return nil, err
