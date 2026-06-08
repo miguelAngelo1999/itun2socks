@@ -11,6 +11,8 @@ import (
 	"github.com/igoogolx/itun2socks/internal/manager"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
+	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outbound"
+	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 )
 
 func selectedRouter() http.Handler {
@@ -62,17 +64,24 @@ func setProxySelectedId(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if manager.GetIsStarted() {
-		rawProxy, err := configuration2.GetSelectedProxy()
-		if err != nil {
-			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, ErrBadRequest)
-			return
-		}
-		proxy, err := adapter.ParseProxy(rawProxy)
-		if err != nil {
-			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, ErrBadRequest)
-			return
+		var proxy C.Proxy
+		if proxySelectedId == "DIRECT" {
+			// Built-in DIRECT proxy - create directly without ParseProxy
+			proxy = adapter.NewProxy(outbound.NewDirect())
+		} else {
+			rawProxy, err := configuration2.GetSelectedProxy()
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+			p, err := adapter.ParseProxy(rawProxy)
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+			proxy = p
 		}
 		conn.UpdateProxy(proxy)
 	}
