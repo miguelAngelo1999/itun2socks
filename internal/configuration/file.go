@@ -145,6 +145,10 @@ func getSudoUser() (int, int) {
 	gid := 0
 	fmt.Sscanf(uidStr, "%d", &uid)
 	fmt.Sscanf(gidStr, "%d", &gid)
+	// Never chown to root (uid 0) — only restore to real users
+	if uid <= 0 {
+		return -1, -1
+	}
 	return uid, gid
 }
 
