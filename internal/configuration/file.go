@@ -125,7 +125,27 @@ func write(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("fail to write file:%v, err:%v", configFilePath.Load(), err)
 	}
+	// When running as root (setuid/sudo), restore ownership to the original user
+	// so the Flutter app (running as normal user) can read/write the config.
+	if uid, gid := getSudoUser(); uid >= 0 {
+		_ = os.Chown(configFilePath.Load(), uid, gid)
+	}
 	return nil
+}
+
+// getSudoUser returns the original user's uid/gid from SUDO_UID/SUDO_GID env vars.
+// Returns -1,-1 if not running under sudo or vars not set.
+func getSudoUser() (int, int) {
+	uidStr := os.Getenv("SUDO_UID")
+	gidStr := os.Getenv("SUDO_GID")
+	if uidStr == "" || gidStr == "" {
+		return -1, -1
+	}
+	uid := 0
+	gid := 0
+	fmt.Sscanf(uidStr, "%d", &uid)
+	fmt.Sscanf(gidStr, "%d", &gid)
+	return uid, gid
 }
 
 func fileExists(filename string) bool {
