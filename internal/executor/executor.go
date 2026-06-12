@@ -72,7 +72,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		MTU:              uint32(config.Device.Mtu),
 		Inet4Address:     []netip.Prefix{config.Device.Gateway},
 		AutoRoute:        true,
-		StrictRoute:      false, // false allows PROCESS,App,DIRECT rules to bypass TUN via physical interface
+		StrictRoute:      true,
 		Logger:           logrus.StandardLogger(),
 		InterfaceMonitor: network_iface.GetDefaultInterfaceMonitor(),
 	}
