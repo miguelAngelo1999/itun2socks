@@ -67,14 +67,25 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Exclude known IMAP server ranges from TUN so Mail.app connects directly.
+	// These IPs bypass TUN and use the physical interface (same as system mode).
+	// Mail.app uses Network.framework which doesn't work through the TUN local server.
+	imapExcludes := []netip.Prefix{
+		netip.MustParsePrefix("64.233.160.0/19"), // Gmail IMAP (imap.gmail.com)
+		netip.MustParsePrefix("108.177.96.0/19"), // Gmail IMAP alt range
+		netip.MustParsePrefix("142.250.0.0/15"),  // Google mail servers
+		netip.MustParsePrefix("189.44.180.162/32"), // mail.congregatio.info
+	}
+
 	tunOptions := sTun.Options{
-		Name:             config.Device.Name,
-		MTU:              uint32(config.Device.Mtu),
-		Inet4Address:     []netip.Prefix{config.Device.Gateway},
-		AutoRoute:        true,
-		StrictRoute:      true,
-		Logger:           logrus.StandardLogger(),
-		InterfaceMonitor: network_iface.GetDefaultInterfaceMonitor(),
+		Name:                     config.Device.Name,
+		MTU:                      uint32(config.Device.Mtu),
+		Inet4Address:             []netip.Prefix{config.Device.Gateway},
+		AutoRoute:                true,
+		StrictRoute:              false,
+		Inet4RouteExcludeAddress: imapExcludes,
+		Logger:                   logrus.StandardLogger(),
+		InterfaceMonitor:         network_iface.GetDefaultInterfaceMonitor(),
 	}
 	tun, err := sTun.New(tunOptions)
 	if err != nil {
