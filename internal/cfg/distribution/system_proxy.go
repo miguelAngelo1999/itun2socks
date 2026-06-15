@@ -15,17 +15,26 @@ type SystemProxyConfig struct {
 }
 
 func (c SystemProxyConfig) ConnMatcher(metadata *C.Metadata, _ rule_engine.Rule) (rule_engine.Rule, error) {
+	proto := networkToProtocol(metadata.NetWork)
 
 	if metadata.Host != "" {
-		var rule, err = matcher.GetRuleEngine().Match(metadata.Host, constants.DomainRuleTypes)
+		var rule, err = matcher.GetRuleEngine().MatchWithProtocol(metadata.Host, constants.DomainRuleTypes, proto)
 		if err == nil {
 			return rule, nil
 		}
 	}
 
 	if metadata.DstIP.String() != "" {
-		rule, err := matcher.GetRuleEngine().Match(metadata.DstIP.String(), constants.IpRuleTypes)
+		rule, err := matcher.GetRuleEngine().MatchWithProtocol(metadata.DstIP.String(), constants.IpRuleTypes, proto)
 		if err == nil {
+			return rule, nil
+		}
+	}
+
+	// DST-PORT matching (Requirement 2.4, 2.5).
+	port := metadata.DstPort.String()
+	if port != "" && port != "0" {
+		if rule, err := matcher.GetRuleEngine().MatchWithProtocol(port, constants.DstPortRuleTypes, proto); err == nil {
 			return rule, nil
 		}
 	}
