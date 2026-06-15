@@ -152,6 +152,7 @@ func ToggleCustomizedRule(rule string) error {
 
 // GetCustomizedRulesRaw returns all customized rules as structured items,
 // including disabled ones (prefixed with #) with a disabled flag.
+// Supports both 3-field (TYPE,MATCH,ACTION) and 4-field (TYPE,MATCH,ACTION,PROTOCOL) rules.
 func GetCustomizedRulesRaw() ([]map[string]any, error) {
 	c, err := Read()
 	if err != nil {
@@ -163,16 +164,24 @@ func GetCustomizedRulesRaw() ([]map[string]any, error) {
 		disabled := strings.HasPrefix(trimmed, "#")
 		rawRule := strings.TrimLeft(trimmed, "#") // strip ALL leading #s
 		chunks := strings.Split(rawRule, ",")
-		if len(chunks) != 3 {
-			continue // skip built-in rule names (no commas)
+		if len(chunks) < 3 {
+			continue // skip built-in rule names (no commas) or malformed rules
 		}
-		items = append(items, map[string]any{
+		item := map[string]any{
 			"ruleType": strings.TrimSpace(chunks[0]),
 			"payload":  strings.TrimSpace(chunks[1]),
 			"policy":   strings.TrimSpace(chunks[2]),
 			"disabled": disabled,
 			"raw":      trimmed,
-		})
+		}
+		// Include optional 4th field as "network" (protocol filter: "tcp" or "udp")
+		if len(chunks) >= 4 {
+			proto := strings.ToLower(strings.TrimSpace(chunks[3]))
+			if proto == "tcp" || proto == "udp" {
+				item["network"] = proto
+			}
+		}
+		items = append(items, item)
 	}
 	return items, nil
 }

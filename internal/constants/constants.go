@@ -18,6 +18,7 @@ const (
 	RuleDomainSuffix  RuleType = "DOMAIN-SUFFIX"
 	RuleProcess       RuleType = "PROCESS"
 	RuleDnsMap        RuleType = "DNS-MAP"
+	RuleDstPort       RuleType = "DST-PORT"
 	RuleBuiltIn       RuleType = "BUILT-IN"
 )
 
@@ -25,6 +26,7 @@ var (
 	IpRuleTypes      = []RuleType{RuleIpCidr}
 	DomainRuleTypes  = []RuleType{RuleDomain, RuleDomainSuffix, RuleDomainRegex, RuleDomainKeyword, RuleDnsMap}
 	ProcessRuleTypes = []RuleType{RuleProcess}
+	DstPortRuleTypes = []RuleType{RuleDstPort}
 )
 
 const DnsPort = "53"

@@ -15,24 +15,44 @@ type Config struct {
 	Dns DnsDistribution
 }
 
+// networkToProtocol converts the clash NetWork enum to the RuleProtocol
+// used by the rule engine protocol filter (Requirements 7.1, 7.2, 7.3).
+func networkToProtocol(network C.NetWork) constants.RuleProtocol {
+	if network == C.UDP {
+		return constants.RuleProtocolUDP
+	}
+	return constants.RuleProtocolTCP
+}
+
 func (c Config) ConnMatcher(metadata *C.Metadata, _ rule_engine.Rule) (rule_engine.Rule, error) {
+	proto := networkToProtocol(metadata.NetWork)
+
 	processPath := metadata.ProcessPath
 	if len(processPath) != 0 {
-		if rule, err := matcher.GetRuleEngine().Match(processPath, constants.ProcessRuleTypes); err == nil {
+		if rule, err := matcher.GetRuleEngine().MatchWithProtocol(processPath, constants.ProcessRuleTypes, proto); err == nil {
 			return rule, nil
 		}
 	}
 
 	ip := metadata.DstIP.String()
 	if len(ip) != 0 {
-		if rule, err := matcher.GetRuleEngine().Match(ip, constants.IpRuleTypes); err == nil {
+		if rule, err := matcher.GetRuleEngine().MatchWithProtocol(ip, constants.IpRuleTypes, proto); err == nil {
+			return rule, nil
+		}
+	}
+
+	// DST-PORT matching: evaluate rules whose type is DST-PORT against the
+	// destination port number (Requirement 2.4, 2.5).
+	port := metadata.DstPort.String()
+	if port != "" && port != "0" {
+		if rule, err := matcher.GetRuleEngine().MatchWithProtocol(port, constants.DstPortRuleTypes, proto); err == nil {
 			return rule, nil
 		}
 	}
 
 	host := metadata.Host
 	if len(host) != 0 {
-		var rule, err = matcher.GetRuleEngine().Match(host, constants.DomainRuleTypes)
+		var rule, err = matcher.GetRuleEngine().MatchWithProtocol(host, constants.DomainRuleTypes, proto)
 		if err == nil {
 			return rule, nil
 		}

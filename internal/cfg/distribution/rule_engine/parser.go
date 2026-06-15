@@ -34,32 +34,60 @@ func GetRuleIds() ([]string, error) {
 	return rules, err
 }
 
-func Parse(name string, extraRules []string) ([]Rule, error) {
-	var err error
-	var rules []Rule
+// ParseToParsedRules builds the ordered []ParsedRule list used by Engine.
+// Extra (customized) rules are prepended so they take priority over
+// built-in rules, preserving first-match-wins semantics (Req 4.1, 4.4).
+// Each rule is parsed via ParseRawValueWithProtocol so the optional
+// protocol field (4th comma field) is captured (Req 1.1-1.4).
+// Invalid rules are silently skipped with a logged warning (Req 6.1, 6.2).
+func ParseToParsedRules(name string, extraRules []string) ([]ParsedRule, error) {
+	var rules []ParsedRule
 	builtInItems, err := readFile("rules/" + name)
 	if err != nil {
 		return nil, err
 	}
 	for _, line := range extraRules {
-		rule, err := ParseRawValue(line)
+		parsed, err := ParseRawValueWithProtocol(line)
 		if err == nil {
-			rules = append(rules, rule)
+			rules = append(rules, parsed)
 		}
 	}
 	for _, line := range builtInItems {
-		rule, err := ParseRawValue(line)
+		parsed, err := ParseRawValueWithProtocol(line)
 		if err == nil {
-			rules = append(rules, rule)
+			rules = append(rules, parsed)
 		}
+	}
+	return rules, nil
+}
+
+// Parse retains backward compatibility for callers that only need []Rule
+// (e.g. configuration.GetBuiltInRules used for display/validation).
+// It wraps ParseToParsedRules and strips the protocol wrapper.
+func Parse(name string, extraRules []string) ([]Rule, error) {
+	parsed, err := ParseToParsedRules(name, extraRules)
+	if err != nil {
+		return nil, err
+	}
+	var rules []Rule
+	for _, p := range parsed {
+		rules = append(rules, p.Rule)
 	}
 	return rules, nil
 }
 
 func ParseRawValue(line string) (Rule, error) {
 	chunks := trimArr(strings.Split(strings.TrimSpace(line), ","))
-	if len(chunks) != 3 {
+	// Allow 3-field (TYPE,MATCH,ACTION) and 4-field (TYPE,MATCH,ACTION,PROTOCOL) rules.
+	// The optional 4th protocol field is validated but not used here — it is stored as-is.
+	if len(chunks) < 3 || len(chunks) > 4 {
 		return nil, fmt.Errorf("invald rule line")
+	}
+	if len(chunks) == 4 {
+		proto := strings.ToLower(chunks[3])
+		if proto != "tcp" && proto != "udp" {
+			return nil, fmt.Errorf("invalid protocol field %q: must be tcp or udp", chunks[3])
+		}
 	}
 	return ParseItem(chunks[0], chunks[1], chunks[2])
 
@@ -72,10 +100,10 @@ func ParseItem(rawRuleType, value, rawPolicy string) (Rule, error) {
 	var err error
 	policy := constants.Policy(rawPolicy)
 	// Allow standard policies AND named proxy IDs for per-profile routing
-		isStandardPolicy := slices.Contains([]constants.Policy{constants.PolicyDirect, constants.PolicyReject, constants.PolicyProxy}, policy)
-		if !isStandardPolicy && rawPolicy == "" {
-			return nil, fmt.Errorf("policy not match: %v", ruleType)
-		}
+	isStandardPolicy := slices.Contains([]constants.Policy{constants.PolicyDirect, constants.PolicyReject, constants.PolicyProxy}, policy)
+	if !isStandardPolicy && rawPolicy == "" {
+		return nil, fmt.Errorf("policy not match: %v", ruleType)
+	}
 
 	switch ruleType {
 	case constants.RuleIpCidr:
@@ -98,6 +126,9 @@ func ParseItem(rawRuleType, value, rawPolicy string) (Rule, error) {
 		break
 	case constants.RuleDnsMap:
 		rule, err = NewDnsMapRule(value, policy)
+		break
+	case constants.RuleDstPort:
+		rule, err = NewDstPortRule(value, policy)
 		break
 	default:
 		err = fmt.Errorf("rule type not match: %v", ruleType)
