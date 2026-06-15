@@ -94,6 +94,7 @@ func Start(addr string, secret string) error {
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/event", eventRouter())
 		r.Mount("/subscription", subscriptionRouter())
+			r.Mount("/ssl-inspect", sslInspectRouter())
 			r.Mount("/auth", authRouter())
 	})
 	go FileServer(r)
