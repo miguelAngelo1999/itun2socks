@@ -27,6 +27,7 @@ func proxyRouter() http.Handler {
 	r.Get("/", getProxies)
 	r.Get("/cur-proxy", handleGetProxy)
 	r.Get("/names", getProxyNames) // Proxy id+name list for rule routing
+	r.Get("/detect", handleDetectProxy) // Auto-detect upstream/corporate proxy
 	r.Get("/{proxyId}", getProxy) // get single proxy with password
 	r.Put("/", addProxy)
 	r.Delete("/all", deleteAllProxies)
