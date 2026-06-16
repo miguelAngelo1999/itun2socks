@@ -95,6 +95,7 @@ func Start(addr string, secret string) error {
 		r.Mount("/event", eventRouter())
 		r.Mount("/subscription", subscriptionRouter())
 			r.Mount("/ssl-inspect", sslInspectRouter())
+r.Mount("/ssl-inspection", sslInspectionRouter())
 			r.Mount("/auth", authRouter())
 	})
 	go FileServer(r)
@@ -118,3 +119,4 @@ func FileServer(router *chi.Mux) {
 		}
 	})
 }
+

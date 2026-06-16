@@ -352,3 +352,16 @@ func ClearOneTimePassword(proxyId string) error {
 	}
 	return nil
 }
+
+
+// EncryptData is the exported wrapper around encryptPassword for use by other packages
+// such as internal/mitm. It encrypts plaintext using AES-256-GCM with the machine key.
+func EncryptData(plaintext string) string {
+return encryptPassword(plaintext)
+}
+
+// DecryptData is the exported wrapper around decryptPassword for use by other packages
+// such as internal/mitm. It decrypts an "enc:<base64>" value using the machine key.
+func DecryptData(encrypted string) string {
+return decryptPassword(encrypted)
+}

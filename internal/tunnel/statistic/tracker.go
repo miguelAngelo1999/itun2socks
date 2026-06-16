@@ -27,6 +27,8 @@ type trackerInfo struct {
 	Start         int64            `json:"start"`
 	Rule          rule_engine.Rule `json:"rule"`
 	Domain        string           `json:"domain"`
+	Inspected     bool             `json:"inspected,omitempty"`
+	FullURL        string           `json:"fullUrl,omitempty"`
 }
 
 type TcpTracker struct {
@@ -58,6 +60,13 @@ func (tt *TcpTracker) Write(b []byte) (int, error) {
 func (tt *TcpTracker) Close() error {
 	tt.manager.Leave(tt)
 	return tt.Conn.Close()
+}
+
+// SetInspectedMeta annotates the tracker with MITM inspection metadata.
+// Call this after NewTCPTracker when the connection is being TLS-inspected.
+func (tt *TcpTracker) SetInspectedMeta(inspected bool, fullURL string) {
+	tt.trackerInfo.Inspected = inspected
+	tt.trackerInfo.FullURL = fullURL
 }
 
 func NewTCPTracker(conn net.Conn, manager *Manager, metadata *C.Metadata, rule rule_engine.Rule) *TcpTracker {
