@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/igoogolx/itun2socks/internal/conn"
+	"github.com/igoogolx/itun2socks/internal/dns"
+	"github.com/igoogolx/itun2socks/internal/mitm"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
@@ -14,14 +16,52 @@ import (
 
 var (
 	tcpQueue = make(chan conn.TcpConnContext, 1024)
+
+	globalMitmMu sync.RWMutex
+	globalMitm   *mitm.MitmInterceptor
 )
+
+// SetMitmInterceptor registers the MITM interceptor consulted for every port-443 TCP connection.
+func SetMitmInterceptor(m *mitm.MitmInterceptor) {
+	globalMitmMu.Lock()
+	defer globalMitmMu.Unlock()
+	globalMitm = m
+}
+
+func getMitmInterceptor() *mitm.MitmInterceptor {
+	globalMitmMu.RLock()
+	defer globalMitmMu.RUnlock()
+	return globalMitm
+}
 
 func TcpQueue() chan conn.TcpConnContext {
 	return tcpQueue
 }
 
 func handleTCPConn(ct conn.TcpConnContext) {
-	remoteConn, err := conn.NewTcpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), network_iface.GetDefaultInterfaceName())
+	metadata := ct.Metadata()
+
+	// MITM interception hook — only for port-443 connections with a resolvable hostname.
+	if metadata.DstPort.String() == "443" {
+		if interceptor := getMitmInterceptor(); interceptor != nil {
+			host := metadata.Host
+			if host == "" {
+				if cached, ok := dns.GetCachedDnsItem(metadata.DstIP.String()); ok {
+					host = cached
+				}
+			}
+			if host != "" && interceptor.ShouldIntercept(host) {
+				defer ct.Wg().Done()
+				dialAddr := net.JoinHostPort(host, "443")
+				if err := interceptor.Intercept(ct.Conn(), dialAddr, statistic.DefaultManager, ct.Rule()); err != nil {
+					log.Debugln(log.FormatLog(log.TcpPrefix, "mitm intercept %s: %v"), dialAddr, err)
+				}
+				return
+			}
+		}
+	}
+
+	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), network_iface.GetDefaultInterfaceName())
 	defer func() {
 		ct.Wg().Done()
 		if err := closeConn(ct.Conn()); err != nil {

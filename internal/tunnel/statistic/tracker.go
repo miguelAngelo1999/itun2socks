@@ -27,6 +27,8 @@ type trackerInfo struct {
 	Start         int64            `json:"start"`
 	Rule          rule_engine.Rule `json:"rule"`
 	Domain        string           `json:"domain"`
+	Inspected     bool             `json:"inspected,omitempty"`
+	FullURL       string           `json:"fullUrl,omitempty"`
 }
 
 type TcpTracker struct {
@@ -60,6 +62,12 @@ func (tt *TcpTracker) Close() error {
 	return tt.Conn.Close()
 }
 
+// SetInspectedMeta annotates the tracker with MITM inspection metadata.
+func (tt *TcpTracker) SetInspectedMeta(inspected bool, fullURL string) {
+	tt.trackerInfo.Inspected = inspected
+	tt.trackerInfo.FullURL = fullURL
+}
+
 func NewTCPTracker(conn net.Conn, manager *Manager, metadata *C.Metadata, rule rule_engine.Rule) *TcpTracker {
 	uid, _ := uuid.NewV4()
 
@@ -76,12 +84,14 @@ func NewTCPTracker(conn net.Conn, manager *Manager, metadata *C.Metadata, rule r
 		},
 	}
 
-	if cachedDomain, ok := dns.GetCachedDnsItem(metadata.DstIP.String()); ok {
-		t.trackerInfo.Domain = cachedDomain
-	} else if metadata.Host != "" {
-		t.trackerInfo.Domain = metadata.Host
-	} else {
-		t.trackerInfo.Domain = "unknown"
+	if metadata != nil {
+		if cachedDomain, ok := dns.GetCachedDnsItem(metadata.DstIP.String()); ok {
+			t.trackerInfo.Domain = cachedDomain
+		} else if metadata.Host != "" {
+			t.trackerInfo.Domain = metadata.Host
+		} else {
+			t.trackerInfo.Domain = "unknown"
+		}
 	}
 	manager.Join(t)
 	return t

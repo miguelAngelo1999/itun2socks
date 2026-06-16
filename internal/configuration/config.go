@@ -7,8 +7,19 @@ type Config struct {
 		Proxy string `json:"proxy"`
 		Rule  string `json:"rule"`
 	} `json:"selected"`
-	Setting SettingCfg `json:"setting"`
-	Rules   []string   `json:"rules"`
+	Setting       SettingCfg       `json:"setting"`
+	Rules         []string         `json:"rules"`
+	SslInspection SslInspectionCfg `json:"sslInspection,omitempty"`
+}
+
+type SslInspectionCfg struct {
+	Enabled        bool                 `json:"enabled"`
+	InspectionList []SslInspectionEntry `json:"inspectionList,omitempty"`
+}
+
+type SslInspectionEntry struct {
+	Pattern string `json:"pattern"`
+	Enabled bool   `json:"enabled"`
 }
 
 type SubscriptionCfg struct {

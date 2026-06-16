@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/igoogolx/itun2socks/internal/executor"
+	"github.com/igoogolx/itun2socks/internal/mitm"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -45,6 +46,14 @@ func Start() error {
 func Close() error {
 	mux.Lock()
 	defer mux.Unlock()
+
+	// Disable SSL inspection before stopping the client.
+	if i := mitm.GetGlobalInterceptor(); i != nil {
+		if interceptor, ok := i.(*mitm.MitmInterceptor); ok {
+			interceptor.SetEnabled(false)
+		}
+	}
+
 	if client != nil {
 		err := client.Close()
 		client = nil
