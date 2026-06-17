@@ -13,7 +13,7 @@ type InspectionListEntry struct {
 }
 
 // InspectionList is a thread-safe in-memory set of domain patterns subject to TLS inspection.
-// Patterns can be exact hostnames ("example.com") or wildcards ("*.example.com").
+// Patterns can be exact hostnames ("example.com") or wildcards ("*.example.com", "*.google.*").
 type InspectionList struct {
 	exact     map[string]bool
 	wildcards []InspectionListEntry
@@ -41,12 +41,50 @@ func (il *InspectionList) Contains(domain string) bool {
 		if !entry.Enabled {
 			continue
 		}
-		suffix := strings.ToLower(entry.Pattern[2:])
-		if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
+		if wildcardMatch(strings.ToLower(entry.Pattern), domain) {
 			return true
 		}
 	}
 	return false
+}
+
+// wildcardMatch matches a domain against a glob pattern that may contain * wildcards.
+// Examples:
+//
+//	"*.example.com"  matches "foo.example.com"
+//	"*.google.*"     matches "mail.google.com", "apis.google.co.uk"
+//	"example.*"      matches "example.com", "example.co.uk"
+func wildcardMatch(pattern, s string) bool {
+	if pattern == "*" {
+		return true
+	}
+	// Fast path: standard *.suffix with single wildcard
+	if strings.HasPrefix(pattern, "*.") && strings.Count(pattern, "*") == 1 {
+		suffix := pattern[2:]
+		return s == suffix || strings.HasSuffix(s, "."+suffix)
+	}
+	// General multi-wildcard glob
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(s[pos:], part)
+		if idx == -1 {
+			return false
+		}
+		// First part must anchor to start if pattern doesn't start with *
+		if i == 0 && !strings.HasPrefix(pattern, "*") && idx != 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+	// Last part must anchor to end if pattern doesn't end with *
+	if !strings.HasSuffix(pattern, "*") && pos != len(s) {
+		return false
+	}
+	return true
 }
 
 // Add adds pattern as an enabled entry (re-enables if already present).
@@ -54,7 +92,7 @@ func (il *InspectionList) Add(pattern string) {
 	il.mu.Lock()
 	defer il.mu.Unlock()
 
-	if strings.HasPrefix(pattern, "*.") {
+	if strings.Contains(pattern, "*") {
 		for i, e := range il.wildcards {
 			if e.Pattern == pattern {
 				il.wildcards[i].Enabled = true
@@ -72,7 +110,7 @@ func (il *InspectionList) Remove(pattern string) {
 	il.mu.Lock()
 	defer il.mu.Unlock()
 
-	if strings.HasPrefix(pattern, "*.") {
+	if strings.Contains(pattern, "*") {
 		filtered := il.wildcards[:0]
 		for _, e := range il.wildcards {
 			if e.Pattern != pattern {
@@ -90,7 +128,7 @@ func (il *InspectionList) Toggle(pattern string) {
 	il.mu.Lock()
 	defer il.mu.Unlock()
 
-	if strings.HasPrefix(pattern, "*.") {
+	if strings.Contains(pattern, "*") {
 		for i, e := range il.wildcards {
 			if e.Pattern == pattern {
 				il.wildcards[i].Enabled = !e.Enabled
@@ -128,7 +166,7 @@ func (il *InspectionList) LoadFrom(entries []InspectionListEntry) {
 	il.exact = make(map[string]bool, len(entries))
 	il.wildcards = il.wildcards[:0]
 	for _, e := range entries {
-		if strings.HasPrefix(e.Pattern, "*.") {
+		if strings.Contains(e.Pattern, "*") {
 			il.wildcards = append(il.wildcards, e)
 		} else {
 			il.exact[e.Pattern] = e.Enabled

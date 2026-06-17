@@ -178,6 +178,8 @@ func New() (Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Initialise MITM SSL inspection engine from persisted config
+	initMitmInterceptor()
 	if rawConfig.Setting.Mode == "tun" {
 		return newTun(true)
 	}
