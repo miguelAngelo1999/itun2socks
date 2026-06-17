@@ -50,7 +50,6 @@ func handleTCPConn(ct conn.TcpConnContext) {
 					host = cached
 				}
 			}
-			log.Debugln(log.FormatLog(log.TcpPrefix, "mitm check: host=%s enabled=%v shouldIntercept=%v"), host, interceptor.IsEnabled(), host != "" && interceptor.ShouldIntercept(host))
 			if host != "" && interceptor.ShouldIntercept(host) {
 				defer ct.Wg().Done()
 				dialAddr := net.JoinHostPort(host, "443")

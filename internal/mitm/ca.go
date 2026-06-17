@@ -157,8 +157,10 @@ func generateCA(configDir, certPath, keyPath string) (*CA, error) {
 }
 
 // TLSConfig returns a *tls.Config with GetCertificate set to serve per-domain leaf certs.
+// MinVersion is set to TLS 1.0 so we can intercept legacy clients.
 func (ca *CA) TLSConfig() *tls.Config {
 	return &tls.Config{
+		MinVersion: tls.VersionTLS10, // accept legacy TLS 1.0/1.1 clients
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			domain := hello.ServerName
 			if domain == "" {
