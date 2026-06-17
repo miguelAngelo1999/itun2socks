@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -19,6 +20,16 @@ import (
 	"github.com/igoogolx/itun2socks/pkg/log"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 )
+
+// patchedConn wraps a net.Conn and replaces its Read source with a patched reader.
+type patchedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *patchedConn) Read(b []byte) (int, error) {
+	return c.reader.Read(b)
+}
 // MitmInterceptor performs selective TLS interception on CONNECT tunnels.
 type MitmInterceptor struct {
 	ca             *CA
@@ -109,6 +120,27 @@ func (m *MitmInterceptor) Intercept(
 	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		upstreamTCP.Close()
 		return fmt.Errorf("mitm: write 200 to client: %w", err)
+	}
+
+	// Peek the first 3 bytes of the client's TLS record to check the version.
+	// Some clients (e.g. TLS 1.0 clients) send record header version 0x0301
+	// which Go's TLS stack rejects since Go 1.18. We patch it to 0x0303
+	// (TLS 1.2) so Go accepts it; the inner ClientHello version is unaffected.
+	br := bufio.NewReader(clientConn)
+	header, err := br.Peek(3)
+	if err == nil && len(header) == 3 && header[0] == 0x16 {
+		// It's a TLS handshake record. If the record-layer version is 0x0301
+		// (TLS 1.0), rewrite it to 0x0303 so Go's TLS stack accepts it.
+		if header[1] == 0x03 && header[2] == 0x01 {
+			// Consume the 3 bytes from the buffer and re-inject them patched.
+			peeked := make([]byte, 3)
+			_, _ = br.Read(peeked)
+			peeked[2] = 0x03 // change version to 0x0303
+			clientConn = &patchedConn{
+				Conn:   clientConn,
+				reader: io.MultiReader(bytes.NewReader(peeked), br),
+			}
+		}
 	}
 
 	// TLS handshake with client.
