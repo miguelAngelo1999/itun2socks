@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -58,8 +60,20 @@ func sslInspectRouter() chi.Router {
 // sslInspectStatus probes for SSL bumping and returns JSON including cert metadata.
 func sslInspectStatus(w http.ResponseWriter, r *http.Request) {
 	const minInterval = 30 * time.Second
-	if time.Since(lastSslCheck) > minInterval {
-		status := ssl.Detect()
+	// ?fresh=true forces a new probe regardless of cache age
+	fresh := r.URL.Query().Get("fresh") == "true"
+	// ?proxy=host:port routes the probe through a specific upstream proxy
+	proxyParam := r.URL.Query().Get("proxy")
+
+	if fresh || time.Since(lastSslCheck) > minInterval {
+		var proxyURL *url.URL
+		if proxyParam != "" {
+			if !strings.Contains(proxyParam, "://") {
+				proxyParam = "http://" + proxyParam
+			}
+			proxyURL, _ = url.Parse(proxyParam)
+		}
+		status := ssl.DetectVia(proxyURL)
 		if status.Detected && len(status.InterceptCA) > 0 {
 			ssl.Cache(status.InterceptCA)
 		}

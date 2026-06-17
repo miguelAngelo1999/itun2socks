@@ -9,35 +9,66 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unsafe"
 
-	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows"
 )
 
-// detectNetworkProxy discovers upstream proxies on Windows using three
-// strategies, tried in order:
+var (
+	modWinHTTP = windows.NewLazySystemDLL("winhttp.dll")
+	modKernel  = windows.NewLazySystemDLL("kernel32.dll")
+
+	procWinHttpOpen                      = modWinHTTP.NewProc("WinHttpOpen")
+	procWinHttpCloseHandle               = modWinHTTP.NewProc("WinHttpCloseHandle")
+	procWinHttpDetectAutoProxyConfigUrl  = modWinHTTP.NewProc("WinHttpDetectAutoProxyConfigUrl")
+	procWinHttpGetIEProxyConfigForCurUsr = modWinHTTP.NewProc("WinHttpGetIEProxyConfigForCurrentUser")
+	procGlobalFree                       = modKernel.NewProc("GlobalFree")
+)
+
+// WINHTTP constants
+const (
+	winHTTPAccessTypeNoProxy         = 1
+	winHTTPAutoDetectTypeDHCP        = 0x00000001
+	winHTTPAutoDetectTypeDNSA        = 0x00000002
+	winHTTPFlagAsync                 = 0x10000000
+)
+
+// WINHTTP_CURRENT_USER_IE_PROXY_CONFIG mirrors the WinAPI struct.
+// All string fields are pointers to wide-char strings allocated by WinHTTP —
+// caller must free them with GlobalFree.
+type winHTTPCurrentUserIEProxyConfig struct {
+	fAutoDetect       uint32
+	lpszAutoConfigUrl uintptr // LPWSTR
+	lpszProxy         uintptr // LPWSTR
+	lpszProxyBypass   uintptr // LPWSTR
+}
+
+// detectNetworkProxy discovers upstream proxies on Windows using the WinHTTP
+// auto-proxy API — the same mechanism used by Internet Explorer / Edge.
 //
-//  1. DHCP Option 252 (proxy auto-discovery URL) read from the registry key
-//     populated by the DHCP client service.
-//  2. WPAD DNS lookup (http://wpad/wpad.dat).
-//  3. Manual proxy settings from Internet Settings registry.
+// Detection order (mirrors what Windows itself does for "Automatically detect
+// settings"):
+//
+//  1. WinHttpDetectAutoProxyConfigUrl — queries DHCP (option 252) then DNS
+//     (wpad.<domain>) to discover a PAC/WPAD URL.
+//  2. WinHttpGetIEProxyConfigForCurrentUser — reads the user's Internet
+//     Options (auto-config URL or manual proxy).
+//
+// We intentionally do NOT read the raw WinInet ProxyServer registry value,
+// because lux itself writes 127.0.0.1:1090 there while running.
 func detectNetworkProxy() ProxyDetectResult {
 	var proxies []DetectedProxy
 
-	// ── 1. DHCP Option 252 ─────────────────────────────────────────────────
-	if p := detectDHCPOption252(); p != nil {
+	// ── 1. OS auto-detection via DHCP + DNS ───────────────────────────────
+	if p := detectViaWinHTTPAutoDetect(); p != nil {
 		proxies = append(proxies, *p)
 	}
 
-	// ── 2. WPAD DNS fallback ────────────────────────────────────────────────
+	// ── 2. IE/Edge proxy config (AutoConfigURL only — skip manual proxy) ──
 	if len(proxies) == 0 {
-		if p := detectWPADDNS(); p != nil {
+		if p := detectViaIEProxyConfig(); p != nil {
 			proxies = append(proxies, *p)
 		}
-	}
-
-	// ── 3. Internet Settings manual/PAC proxy ──────────────────────────────
-	if p := detectInetSettingsProxy(); p != nil {
-		proxies = append(proxies, *p)
 	}
 
 	return ProxyDetectResult{
@@ -46,188 +77,92 @@ func detectNetworkProxy() ProxyDetectResult {
 	}
 }
 
-// ── DHCP Option 252 ───────────────────────────────────────────────────────────
-
-// detectDHCPOption252 reads the WPAD/PAC URL delivered via DHCP Option 252.
-//
-// The Windows DHCP client stores received options under:
-//
-//	HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}\DhcpInterfaceOptions
-//
-// Option 252 (0xFC) is the "Web Proxy Auto-Discovery" option. When present, its
-// value is a UTF-8 / ASCII URL string.
-//
-// We also check the simpler "DhcpNameServer" adjacent key as a sanity check
-// that we are reading the right adapter.
-func detectDHCPOption252() *DetectedProxy {
-	const baseKey = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, baseKey, registry.ENUMERATE_SUB_KEYS)
-	if err != nil {
+// detectViaWinHTTPAutoDetect calls WinHttpDetectAutoProxyConfigUrl which
+// performs DHCP option-252 and DNS wpad.<domain> discovery and returns the
+// PAC URL if one is found on the network.
+func detectViaWinHTTPAutoDetect() *DetectedProxy {
+	// Open a WinHTTP session handle (required before any WinHTTP call)
+	hSession, _, _ := procWinHttpOpen.Call(
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("lux/proxy-detect"))),
+		uintptr(winHTTPAccessTypeNoProxy),
+		0, 0, 0,
+	)
+	if hSession == 0 {
 		return nil
 	}
-	defer key.Close()
+	defer procWinHttpCloseHandle.Call(hSession)
 
-	subkeys, err := key.ReadSubKeyNames(-1)
-	if err != nil {
+	// dwAutoDetectFlags: try DHCP first, fall back to DNS
+	const flags = winHTTPAutoDetectTypeDHCP | winHTTPAutoDetectTypeDNSA
+	var pURL uintptr // LPWSTR — allocated by WinHTTP, freed by us
+	ret, _, _ := procWinHttpDetectAutoProxyConfigUrl.Call(
+		uintptr(flags),
+		uintptr(unsafe.Pointer(&pURL)),
+	)
+	if ret == 0 || pURL == 0 {
+		// No WPAD/PAC URL found on this network — that's normal
 		return nil
 	}
+	// Convert the UTF-16 string and free the memory
+	pacURL := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(pURL)))
+	procGlobalFree.Call(pURL)
 
-	for _, guid := range subkeys {
-		subKey, err := registry.OpenKey(registry.LOCAL_MACHINE,
-			baseKey+`\`+guid, registry.QUERY_VALUE)
-		if err != nil {
-			continue
-		}
-
-		// Only look at adapters with a DHCP-assigned server (active DHCP lease)
-		_, _, err = subKey.GetStringValue("DhcpNameServer")
-		if err != nil {
-			subKey.Close()
-			continue
-		}
-
-		// DhcpInterfaceOptions is a REG_BINARY blob containing packed DHCP options.
-		blob, _, err := subKey.GetBinaryValue("DhcpInterfaceOptions")
-		subKey.Close()
-		if err != nil || len(blob) == 0 {
-			continue
-		}
-
-		url := parseDHCPOption252FromBlob(blob)
-		if url == "" {
-			continue
-		}
-		return parsePACURL(url, "dhcp_option252")
+	if pacURL == "" {
+		return nil
 	}
+	return parsePACURL(pacURL, "dhcp_wpad")
+}
+
+// detectViaIEProxyConfig reads the current user's Internet Options proxy
+// config (the same data shown in Control Panel → Internet Options → Connections
+// → LAN Settings). We only act on an AutoConfigURL (PAC file) — we skip the
+// manual ProxyServer value because lux writes itself there.
+func detectViaIEProxyConfig() *DetectedProxy {
+	var cfg winHTTPCurrentUserIEProxyConfig
+	ret, _, _ := procWinHttpGetIEProxyConfigForCurUsr.Call(
+		uintptr(unsafe.Pointer(&cfg)),
+	)
+	if ret == 0 {
+		return nil
+	}
+	defer func() {
+		if cfg.lpszAutoConfigUrl != 0 {
+			procGlobalFree.Call(cfg.lpszAutoConfigUrl)
+		}
+		if cfg.lpszProxy != 0 {
+			procGlobalFree.Call(cfg.lpszProxy)
+		}
+		if cfg.lpszProxyBypass != 0 {
+			procGlobalFree.Call(cfg.lpszProxyBypass)
+		}
+	}()
+
+	// Prefer AutoConfigURL (PAC file) — skip manual proxy (likely lux itself)
+	if cfg.lpszAutoConfigUrl != 0 {
+		autoURL := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(cfg.lpszAutoConfigUrl)))
+		if autoURL != "" {
+			return parsePACURL(autoURL, "pac")
+		}
+	}
+
+	// fAutoDetect=1 means "Automatically detect settings" is ticked but
+	// WinHttpDetectAutoProxyConfigUrl already covered that above — skip.
+
 	return nil
-}
-
-// parseDHCPOption252FromBlob walks the DhcpInterfaceOptions binary blob and
-// extracts the value for option 252 (0xFC).
-//
-// The blob format used by the Windows DHCP client for DhcpInterfaceOptions is:
-//
-//	[option_code: uint32 LE][unknown: uint32 LE][length: uint32 LE][data: length bytes][padding to 4-byte boundary]...
-//
-// This is undocumented but consistent across Windows 7–11.
-func parseDHCPOption252FromBlob(blob []byte) string {
-	const option252 = 0xFC
-	i := 0
-	for i+12 <= len(blob) {
-		// Read option code (4 bytes LE)
-		code := uint32(blob[i]) | uint32(blob[i+1])<<8 | uint32(blob[i+2])<<16 | uint32(blob[i+3])<<24
-		// Skip 4 bytes of unknown field
-		length := uint32(blob[i+8]) | uint32(blob[i+9])<<8 | uint32(blob[i+10])<<16 | uint32(blob[i+11])<<24
-		i += 12
-		if int(length) > len(blob)-i {
-			break
-		}
-		data := blob[i : i+int(length)]
-		// Advance past data, aligned to 4 bytes
-		advance := int(length)
-		if advance%4 != 0 {
-			advance += 4 - (advance % 4)
-		}
-		i += advance
-
-		if code == option252 {
-			// Value is a null-terminated ASCII string
-			s := strings.TrimRight(string(data), "\x00")
-			if s != "" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
-// ── WPAD DNS fallback ─────────────────────────────────────────────────────────
-
-// detectWPADDNS tries to resolve "wpad" via DNS and fetches /wpad.dat.
-func detectWPADDNS() *DetectedProxy {
-	addrs, err := net.LookupHost("wpad")
-	if err != nil || len(addrs) == 0 {
-		return nil
-	}
-	wpadURL := fmt.Sprintf("http://%s/wpad.dat", addrs[0])
-	return parsePACURL(wpadURL, "wpad_dns")
-}
-
-// ── Internet Settings manual / PAC proxy ──────────────────────────────────────
-
-// detectInetSettingsProxy reads the WinInet proxy settings from the registry.
-// This covers:
-//   - A manually configured ProxyServer
-//   - An AutoConfigURL (PAC file)
-func detectInetSettingsProxy() *DetectedProxy {
-	const keyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	key, err := registry.OpenKey(registry.CURRENT_USER, keyPath, registry.QUERY_VALUE)
-	if err != nil {
-		return nil
-	}
-	defer key.Close()
-
-	// Check for PAC/AutoConfig URL first
-	autoURL, _, err := key.GetStringValue("AutoConfigURL")
-	if err == nil && autoURL != "" {
-		return parsePACURL(autoURL, "pac")
-	}
-
-	// Check for manual proxy
-	enabled, _, err := key.GetIntegerValue("ProxyEnable")
-	if err != nil || enabled == 0 {
-		return nil
-	}
-	proxyServer, _, err := key.GetStringValue("ProxyServer")
-	if err != nil || proxyServer == "" {
-		return nil
-	}
-
-	host, port := splitProxyServer(proxyServer)
-	if host == "" {
-		return nil
-	}
-	d := &DetectedProxy{
-		Source: "manual",
-		Host:   host,
-		Port:   port,
-	}
-	probeProxy(d)
-	return d
-}
-
-// splitProxyServer handles the various formats used by WinInet:
-//   - "host:port"          — plain HTTP proxy
-//   - "socks=host:port"    — SOCKS proxy
-//   - "http=h:p;https=h:p" — per-protocol list
-func splitProxyServer(s string) (host, port string) {
-	// Per-protocol: pick http= first, fall back to first entry
-	if strings.Contains(s, "=") {
-		for _, part := range strings.Split(s, ";") {
-			part = strings.TrimSpace(part)
-			kv := strings.SplitN(part, "=", 2)
-			if len(kv) == 2 {
-				h, p, err := net.SplitHostPort(kv[1])
-				if err == nil {
-					return h, p
-				}
-			}
-		}
-		return "", ""
-	}
-	h, p, err := net.SplitHostPort(s)
-	if err != nil {
-		return "", ""
-	}
-	return h, p
 }
 
 // ── PAC file fetching & parsing ───────────────────────────────────────────────
 
-// parsePACURL fetches a PAC file at the given URL, extracts the first PROXY
-// directive, and probes it for connectivity / 407 auth.
+// parsePACURL fetches a PAC/WPAD file, extracts the first non-loopback PROXY
+// directive, probes for 407 auth, and returns a DetectedProxy.
 func parsePACURL(pacURL string, source string) *DetectedProxy {
-	client := &http.Client{Timeout: 5 * time.Second}
+	// Use a transport that bypasses the system proxy — the system proxy at this
+	// point may already be set to lux itself (127.0.0.1), which would cause
+	// the PAC fetch to loop or fail.
+	transport := &http.Transport{
+		Proxy: nil, // explicit no-proxy
+	}
+	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
 	resp, err := client.Get(pacURL) //nolint:noctx
 	if err != nil {
 		return &DetectedProxy{
@@ -250,6 +185,10 @@ func parsePACURL(pacURL string, source string) *DetectedProxy {
 			Error:  "no PROXY directive found in PAC",
 		}
 	}
+	// Don't report lux itself (127.x / localhost) as an upstream proxy
+	if isLoopback(host) {
+		return nil
+	}
 	d := &DetectedProxy{
 		Source: source,
 		Host:   host,
@@ -260,20 +199,28 @@ func parsePACURL(pacURL string, source string) *DetectedProxy {
 	return d
 }
 
-// extractFirstProxyFromPAC uses a simple regex to find the first
-// "PROXY host:port" directive in PAC JavaScript text.
+// extractFirstProxyFromPAC finds the first "PROXY host:port" directive in PAC
+// JavaScript. Handles both bare (PROXY host:port) and quoted ("PROXY host:port")
+// forms as produced by various PAC generators.
 func extractFirstProxyFromPAC(pac string) (host, port string) {
-	re := regexp.MustCompile(`(?i)\bPROXY\s+([\w.\-]+):(\d+)`)
+	// Matches PROXY keyword optionally preceded/followed by quotes or spaces
+	re := regexp.MustCompile(`(?i)PROXY\s+([\w.\-]+):(\d+)`)
 	if m := re.FindStringSubmatch(pac); len(m) == 3 {
 		return m[1], m[2]
 	}
 	return "", ""
 }
 
-// ── Proxy probe ───────────────────────────────────────────────────────────────
+// isLoopback returns true for 127.x.x.x, ::1, and "localhost".
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
-// probeProxy dials the proxy and sends an HTTP CONNECT to detect 407 auth
-// requirements.
+// probeProxy dials the proxy and sends an HTTP CONNECT to detect 407 auth.
 func probeProxy(d *DetectedProxy) {
 	if d.Host == "" || d.Port == "" {
 		return
@@ -287,16 +234,15 @@ func probeProxy(d *DetectedProxy) {
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-	_, err = fmt.Fprintf(conn, "CONNECT www.msftconnecttest.com:443 HTTP/1.1\r\nHost: www.msftconnecttest.com:443\r\n\r\n")
+	// Use a target that is NOT typically whitelisted by proxy ACLs.
+	// Many proxies whitelist captive portal domains; use a generic target instead.
+	_, err = fmt.Fprintf(conn, "CONNECT google.com:443 HTTP/1.1\r\nHost: google.com:443\r\n\r\n")
 	if err != nil {
 		return
 	}
 	buf := make([]byte, 256)
 	n, _ := conn.Read(buf)
-	resp := string(buf[:n])
-	if strings.Contains(resp, "407") {
+	if strings.Contains(string(buf[:n]), "407") {
 		d.RequiresAuth = true
 	}
 }
-
-
