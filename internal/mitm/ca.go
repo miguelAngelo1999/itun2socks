@@ -156,17 +156,33 @@ func generateCA(configDir, certPath, keyPath string) (*CA, error) {
 	}, nil
 }
 
-// TLSConfig returns a *tls.Config with GetCertificate set to serve per-domain leaf certs.
-// MinVersion is set to TLS 1.0 so we can intercept legacy clients.
+// TLSConfig returns a *tls.Config that uses GetConfigForClient to negotiate
+// per-connection TLS settings after reading the ClientHello.
+// This properly handles clients sending legacy TLS record headers (e.g. TLS 1.0).
 func (ca *CA) TLSConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion: tls.VersionTLS10, // accept legacy TLS 1.0/1.1 clients
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			domain := hello.ServerName
+		SessionTicketsDisabled: true, // ensures GetConfigForClient is always called
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			domain := chi.ServerName
 			if domain == "" {
 				return nil, fmt.Errorf("mitm: no SNI in ClientHello")
 			}
-			return ca.GetOrCreateLeafCert(domain)
+			cert, err := ca.GetOrCreateLeafCert(domain)
+			if err != nil {
+				return nil, err
+			}
+			cfg := &tls.Config{
+				SessionTicketsDisabled: true,
+				Certificates:           []tls.Certificate{*cert},
+				MinVersion:             tls.VersionTLS10,
+			}
+			// Mirror the client's supported next-protocols (h2, http/1.1)
+			if len(chi.SupportedProtos) > 0 {
+				cfg.NextProtos = chi.SupportedProtos
+			} else {
+				cfg.NextProtos = []string{"http/1.1"}
+			}
+			return cfg, nil
 		},
 	}
 }
