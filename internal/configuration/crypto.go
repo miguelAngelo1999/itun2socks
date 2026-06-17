@@ -197,6 +197,18 @@ func StripProxyPasswords(proxy map[string]any) map[string]any {
 	return stripProxyPasswords(proxy)
 }
 
+// EncryptData encrypts arbitrary data using the machine-derived AES-GCM key.
+// Returns "enc:<base64>" or the original string on error.
+func EncryptData(plaintext string) string {
+	return encryptPassword(plaintext)
+}
+
+// DecryptData decrypts an "enc:<base64>" value using the machine-derived AES-GCM key.
+// Returns the original string if not encrypted or on error.
+func DecryptData(encrypted string) string {
+	return decryptPassword(encrypted)
+}
+
 // LockProxyPassword sets the passwordLocked flag on a proxy.
 // The password is kept intact (encrypted on disk) so the proxy still works,
 // but the API will refuse to reveal it until unlocked.
