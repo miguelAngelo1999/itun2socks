@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
+	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
@@ -153,6 +154,23 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	}
 	rawConn, err := connDialer.ListenPacketContext(ctx, metadata, dialer.WithInterface(defaultInterface), dialer.WithAddrReuse(true))
 	if err != nil {
+		// If the proxy doesn't support UDP (e.g. HTTP proxy), fall back to DIRECT.
+		// This allows QUIC to gracefully fail (browser retries via TCP) and
+		// WebRTC/UDP traffic to go direct instead of being dropped entirely.
+		if err.Error() == "no support" && rule.GetPolicy() != constants.PolicyDirect {
+			directDialer, dErr := GetProxy(constants.PolicyDirect)
+			if dErr == nil {
+				// Use WithFallbackBind so the socket binds to the physical interface IP
+				// instead of [::] which causes "invalid argument" on macOS TUN.
+				rawConn, err = directDialer.ListenPacketContext(ctx, metadata,
+					dialer.WithInterface(defaultInterface),
+					dialer.WithAddrReuse(true),
+					dialer.WithFallbackBind(true))
+				if err == nil {
+					return &CopyablePacketConn{rawConn}, nil
+				}
+			}
+		}
 		return nil, err
 	}
 	return &CopyablePacketConn{rawConn}, nil
