@@ -14,6 +14,7 @@ import (
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
+	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
 // MitmInterceptor performs selective TLS interception on CONNECT tunnels.
@@ -116,6 +117,7 @@ func (m *MitmInterceptor) Intercept(
 		}
 
 		fullURL := "https://" + sniHost + req.URL.RequestURI()
+		log.Infoln("[MITM], %s %s", req.Method, fullURL)
 		req.URL.Scheme = "https"
 		req.URL.Host = sniHost
 		req.RequestURI = ""
