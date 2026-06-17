@@ -46,12 +46,17 @@ func initMitmInterceptor() {
 	mitm.SetGlobalInterceptor(interceptor)
 	tunnel.SetMitmInterceptor(interceptor)
 
+	entryCount := len(mitmEntries)
 	if cfg.Enabled {
-		log.Infoln("[MITM] SSL inspection enabled, " +
-			"inspection list loaded (" + itoa(len(mitmEntries)) + " entries)")
+		log.Infoln("[MITM] SSL inspection enabled, inspection list: " + itoa(entryCount) + " entries, ca_nil=" + boolStr(ca == nil))
 	} else {
-		log.Debugln("[MITM] SSL inspection initialised (disabled)")
+		log.Debugln("[MITM] SSL inspection initialised (disabled), entries=" + itoa(entryCount))
 	}
+}
+
+func boolStr(b bool) string {
+	if b { return "true" }
+	return "false"
 }
 
 func itoa(n int) string {

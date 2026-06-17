@@ -2,21 +2,23 @@ package mitm
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
-	"time"
 
 	"go.uber.org/atomic"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
+	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/log"
+	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 )
-
 // MitmInterceptor performs selective TLS interception on CONNECT tunnels.
 type MitmInterceptor struct {
 	ca             *CA
@@ -42,34 +44,48 @@ func (m *MitmInterceptor) IsEnabled() bool { return m.enabled.Load() }
 // InspectionList returns the underlying InspectionList (satisfies InterceptorWithList).
 func (m *MitmInterceptor) InspectionList() *InspectionList { return m.inspectionList }
 
-// ShouldIntercept returns true when SSL inspection is enabled, the domain is not
-// in the bypass list, and the domain is in the inspection list.
+// ShouldIntercept returns true when SSL inspection is enabled and the domain is
+// in the inspection list. User-configured inspection entries take precedence
+// over the bypass list.
 func (m *MitmInterceptor) ShouldIntercept(domain string) bool {
 	if !m.enabled.Load() {
 		return false
 	}
-	if IsBypassed(domain) {
-		return false
+	// Check inspection list first — explicit user entries override bypass
+	if m.inspectionList.Contains(domain) {
+		return true
 	}
-	return m.inspectionList.Contains(domain)
+	return false
 }
 
 // Intercept performs full MITM TLS interception for an HTTP CONNECT tunnel.
 // clientConn is the raw TCP connection from the client; host is the CONNECT target.
 // The caller must NOT have replied 200 to the client yet.
 func (m *MitmInterceptor) Intercept(
+	ctx context.Context,
 	clientConn net.Conn,
 	host string,
 	statsManager *statistic.Manager,
 	rule rule_engine.Rule,
+	defaultInterface string,
 ) error {
 	sniHost, port := splitHostPort(host)
-	dialAddr := net.JoinHostPort(sniHost, port)
 
-	// Dial upstream TCP.
-	upstreamTCP, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	// Build metadata for the upstream connection — use the real hostname so the
+	// proxy dialer resolves it properly (avoids fake-IP issues in TUN mode).
+	metadata := &C.Metadata{
+		NetWork: C.TCP,
+		Host:    sniHost,
+		DstPort: func() C.Port {
+			p, _ := strconv.ParseUint(port, 10, 16)
+			return C.Port(p)
+		}(),
+	}
+
+	// Dial upstream through the proxy (same path as regular TCP connections).
+	upstreamTCP, err := conn.NewTcpConn(ctx, metadata, rule, defaultInterface)
 	if err != nil {
-		return fmt.Errorf("mitm: dial upstream %s: %w", dialAddr, err)
+		return fmt.Errorf("mitm: dial upstream %s via proxy: %w", net.JoinHostPort(sniHost, port), err)
 	}
 
 	// TLS handshake with upstream (normal cert verification, force HTTP/1.1).
