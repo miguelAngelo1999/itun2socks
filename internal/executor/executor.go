@@ -102,6 +102,9 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Enable loopback for all UWP apps so their UDP traffic routes through TUN.
+	// Without this, WhatsApp calls and similar UWP UDP traffic bypass the TUN.
+	enableUWPLoopback()
 	stack, err := sTun.NewStack("gvisor", sTun.StackOptions{
 		Context:    context.Background(),
 		Handler:    proxy_handler.New(tunnel.TcpQueue(), tunnel.UdpQueue()),
