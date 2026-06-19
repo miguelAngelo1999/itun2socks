@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"os/exec"
+	"runtime"
 	"time"
 
 "github.com/igoogolx/itun2socks/internal/cfg"
@@ -48,6 +50,20 @@ func UpdateRule() (string, error) {
 	return selectedRule, nil
 }
 
+// cleanupTunAdapter removes any stale TUN adapter with the given name.
+// This handles the "set IPv4 address: The object already exists" error
+// that occurs when a previous lux_core was killed without proper cleanup.
+func cleanupTunAdapter(name string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	// Remove the stale interface IP assignment
+	_ = exec.Command("netsh", "interface", "ip", "delete", "address",
+		name, "10.255.0.1").Run()
+	// Brief pause for the OS to release the adapter state
+	time.Sleep(200 * time.Millisecond)
+}
+
 func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	err := network_iface.StartMonitor()
 	if err != nil {
@@ -76,6 +92,8 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		Logger:           logrus.StandardLogger(),
 		InterfaceMonitor: network_iface.GetDefaultInterfaceMonitor(),
 	}
+	// Clean up any stale adapter from a previous session before creating a new one.
+	cleanupTunAdapter(config.Device.Name)
 	tun, err := sTun.New(tunOptions)
 	if err != nil {
 		return nil, err
