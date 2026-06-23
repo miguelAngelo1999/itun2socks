@@ -49,6 +49,33 @@ func sslInspectRouter() chi.Router {
 // sslInspectStatus probes whether an upstream proxy is intercepting HTTPS.
 func sslInspectStatus(w http.ResponseWriter, r *http.Request) {
 	const minInterval = 30 * time.Second
+
+	// If a specific proxyAddr is given, always probe through it (bypass cache)
+	proxyAddr := r.URL.Query().Get("proxyAddr")
+	fresh := r.URL.Query().Get("fresh") == "true"
+
+	if proxyAddr != "" && fresh {
+		// Probe through the specified upstream proxy
+		status := ssl.DetectViaProxy(proxyAddr)
+		if status.Detected && len(status.InterceptCA) > 0 {
+			ssl.Cache(status.InterceptCA)
+		}
+		resp := map[string]interface{}{
+			"detected":  status.Detected,
+			"checkedAt": time.Now().Format(time.RFC3339),
+			"error":     status.Error,
+			"hasCert":   len(ssl.PEM()) > 0,
+		}
+		if der, _ := ssl.Cached(); len(der) > 0 {
+			if info := parseSslCertInfo(der); info != nil {
+				resp["certInfo"] = info
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
 	if time.Since(lastSslCheck) > minInterval {
 		status := ssl.Detect()
 		if status.Detected && len(status.InterceptCA) > 0 {

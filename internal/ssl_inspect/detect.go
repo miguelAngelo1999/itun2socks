@@ -26,18 +26,58 @@ type BumpStatus struct {
 // whether the certificate chain contains an unexpected root CA, which
 // indicates SSL bumping / interception.
 func Detect() BumpStatus {
+	return detectTLS("", "")
+}
+
+// DetectViaProxy probes through an HTTP CONNECT proxy (host:port or user:pass@host:port).
+// This is needed when the direct connection doesn't go through the upstream proxy.
+func DetectViaProxy(proxyAddr string) BumpStatus {
+	return detectTLS(proxyAddr, "")
+}
+
+func detectTLS(proxyAddr, _ string) BumpStatus {
 	systemRoots, err := x509.SystemCertPool()
 	if err != nil {
 		systemRoots = x509.NewCertPool()
 	}
 
-	rawConn, err := net.DialTimeout("tcp", net.JoinHostPort(probeHost, probePort), 8*time.Second)
-	if err != nil {
-		return BumpStatus{Error: fmt.Sprintf("dial failed: %v", err)}
+	var rawConn net.Conn
+	target := net.JoinHostPort(probeHost, probePort)
+
+	if proxyAddr != "" {
+		// Connect through HTTP proxy via CONNECT
+		rawConn, err = net.DialTimeout("tcp", proxyAddr, 8*time.Second)
+		if err != nil {
+			return BumpStatus{Error: fmt.Sprintf("dial proxy failed: %v", err)}
+		}
+		// Send HTTP CONNECT
+		rawConn.SetDeadline(time.Now().Add(8 * time.Second))
+		fmt.Fprintf(rawConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+		// Read response (may be 200, 407, etc.)
+		buf := make([]byte, 512)
+		n, readErr := rawConn.Read(buf)
+		if readErr != nil {
+			rawConn.Close()
+			return BumpStatus{Error: fmt.Sprintf("read proxy response failed: %v", readErr)}
+		}
+		resp := string(buf[:n])
+		if len(resp) < 12 || resp[:12] != "HTTP/1.1 200" && resp[:12] != "HTTP/1.0 200" {
+			rawConn.Close()
+			// 407 = auth required — can't probe without credentials
+			if len(resp) > 12 && resp[9:12] == "407" {
+				return BumpStatus{Error: "407"}
+			}
+			return BumpStatus{Error: fmt.Sprintf("proxy CONNECT failed: %s", resp[:min(len(resp), 64)])}
+		}
+	} else {
+		rawConn, err = net.DialTimeout("tcp", target, 8*time.Second)
+		if err != nil {
+			return BumpStatus{Error: fmt.Sprintf("dial failed: %v", err)}
+		}
 	}
 	defer rawConn.Close()
 
-	// InsecureSkipVerify so we capture the chain even when it's untrusted
+	// TLS handshake
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		ServerName:         probeHost,
 		InsecureSkipVerify: true, //nolint:gosec
@@ -77,4 +117,11 @@ func Detect() BumpStatus {
 		}
 	}
 	return BumpStatus{Detected: false}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
