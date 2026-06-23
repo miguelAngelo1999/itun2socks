@@ -32,6 +32,10 @@ func (c *SystemProxyClient) Start() error {
 	}
 
 	addr := "127.0.0.1:" + strconv.Itoa(c.localserver.Port)
+
+	// On Windows, save the original proxy BEFORE overwriting it so detection works later
+	saveOriginalWindowsProxy()
+
 	err = sysproxy.Set(addr, c.activeInterface)
 	if err != nil {
 		return err

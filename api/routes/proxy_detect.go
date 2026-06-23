@@ -182,7 +182,9 @@ func probeWpadViaDhcpDns() DetectedProxy {
 }
 
 // getDhcpDnsServers returns real (non-fake-IP) DNS servers from scutil --dns.
-func getDhcpDnsServers() []string {
+// macOS only — Windows has its own implementation in proxy_detect_dns_windows.go.
+//
+func getDhcpDnsServersDarwin() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "scutil", "--dns").Output()
@@ -262,3 +264,4 @@ func detectProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	render.JSON(w, r, result)
 }
+
