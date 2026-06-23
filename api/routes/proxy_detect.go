@@ -23,10 +23,6 @@ type DetectedProxy struct {
 }
 
 // detectNetworkProxy probes the current network for an upstream proxy.
-// Uses the same detection order as Windows:
-//  1. DHCP Option 252 (proxy_auto_discovery_url) — most reliable
-//  2. scutil --proxy (system proxy if set by MDM/admin, skipping Lux's own)
-//  3. DNS WPAD lookup using real DHCP DNS servers
 func detectNetworkProxy() DetectedProxy {
 	if runtime.GOOS == "darwin" {
 		// Step 1: DHCP Option 252 — read from all active interfaces
@@ -38,6 +34,19 @@ func detectNetworkProxy() DetectedProxy {
 			return d
 		}
 		// Step 3: DNS WPAD via real DHCP DNS servers
+		if d := probeWpadViaDhcpDns(); d.Found {
+			return d
+		}
+	} else if runtime.GOOS == "windows" {
+		// Step 1: Internet Explorer/Edge system proxy from registry
+		if d := probeWindowsRegistry(); d.Found {
+			return d
+		}
+		// Step 2: WinHTTP proxy (set by GPO/DHCP, independent of IE settings)
+		if d := probeNetshWinhttp(); d.Found {
+			return d
+		}
+		// Step 3: WPAD via DNS
 		if d := probeWpadViaDhcpDns(); d.Found {
 			return d
 		}
