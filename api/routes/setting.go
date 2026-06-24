@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	configuration2 "github.com/igoogolx/itun2socks/internal/configuration"
 )
 
@@ -17,6 +18,7 @@ func settingRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getSetting)
 	r.Get("/interfaces", getInterfaces)
+	r.Get("/load-balance", getLoadBalanceStatus)
 	r.Get("/config-file-dir-path", getConfigDirPath)
 	r.Get("/executable-path", getExecutablePath)
 	r.Put("/", setSetting)
@@ -64,6 +66,15 @@ func getInterfaces(w http.ResponseWriter, r *http.Request) {
 
 	render.JSON(w, r, render.M{
 		"interfaces": enriched,
+	})
+}
+
+func getLoadBalanceStatus(w http.ResponseWriter, r *http.Request) {
+	interfaces, healthy, enabled := balancer.GetStatus()
+	render.JSON(w, r, render.M{
+		"enabled":    enabled,
+		"interfaces": interfaces,
+		"healthy":    healthy,
 	})
 }
 

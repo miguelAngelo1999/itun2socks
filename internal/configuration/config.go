@@ -32,6 +32,10 @@ type SubscriptionCfg struct {
 type SettingCfg struct {
 	Mode             string `json:"mode"`
 	DefaultInterface string `json:"defaultInterface"`
+	LoadBalance      struct {
+		Enabled    bool     `json:"enabled"`
+		Interfaces []string `json:"interfaces"`
+	} `json:"loadBalance,omitempty"`
 	LocalServer      `json:"localServer"`
 	AutoMode         `json:"autoMode"`
 	HijackDns        `json:"hijackDns"`

@@ -13,6 +13,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/cfg/local_server"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/conn"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
@@ -77,6 +78,14 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		}
 		log.Infoln("%s", log.FormatLog(log.InitPrefix, "waiting for default interface name"))
 		time.Sleep(1 * time.Second)
+	}
+
+	// Initialize load balancer if configured
+	setting, _ := configuration.GetSetting()
+	if setting.LoadBalance.Enabled && len(setting.LoadBalance.Interfaces) >= 2 {
+		balancer.Configure(setting.LoadBalance.Interfaces)
+	} else {
+		balancer.Configure(nil) // disable
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())

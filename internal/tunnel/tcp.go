@@ -8,6 +8,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/internal/mitm"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
@@ -61,7 +62,7 @@ func handleTCPConn(ct conn.TcpConnContext) {
 		}
 	}
 
-	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), network_iface.GetDefaultInterfaceName())
+	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), pickInterface())
 	defer func() {
 		ct.Wg().Done()
 		if err := closeConn(ct.Conn()); err != nil {
@@ -114,4 +115,14 @@ func closeConn(conn CloseableConn) error {
 		return conn.Close()
 	}
 	return nil
+}
+
+// pickInterface returns the interface to use for the next DIRECT connection.
+// If load balancing is enabled, rotates across healthy interfaces.
+// Otherwise returns the default interface.
+func pickInterface() string {
+	if iface := balancer.Pick(); iface != "" {
+		return iface
+	}
+	return network_iface.GetDefaultInterfaceName()
 }
