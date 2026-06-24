@@ -35,6 +35,7 @@ type SettingCfg struct {
 	LoadBalance      struct {
 		Enabled    bool     `json:"enabled"`
 		Interfaces []string `json:"interfaces"`
+		Strategy   string   `json:"strategy"` // "least-conn" | "round-robin" | "failover"
 	} `json:"loadBalance,omitempty"`
 	LocalServer      `json:"localServer"`
 	AutoMode         `json:"autoMode"`

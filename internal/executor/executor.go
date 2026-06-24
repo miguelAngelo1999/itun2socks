@@ -107,12 +107,12 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 			}
 		}
 		if len(rawIfaces) >= 2 {
-			balancer.Configure(rawIfaces)
+			balancer.Configure(rawIfaces, setting.LoadBalance.Strategy)
 		} else {
-			balancer.Configure(nil)
+			balancer.Configure(nil, "")
 		}
 	} else {
-		balancer.Configure(nil)
+		balancer.Configure(nil, "")
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
