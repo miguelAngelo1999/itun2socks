@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
-	"strings"
 	"time"
 
 "github.com/igoogolx/itun2socks/internal/cfg"
@@ -33,17 +32,9 @@ type Client interface {
 	RuntimeDetail(hubAddress string) (any, error)
 }
 
-// extractRawInterfaceName extracts the OS interface name from a friendly
-// name string. Flutter formats them as "Friendly Name (en0)" — we need "en0".
-// If no parentheses, the string itself is returned as-is.
+// extractRawInterfaceName delegates to balancer.ExtractRawName.
 func extractRawInterfaceName(name string) string {
-	// Look for "(rawname)" at the end
-	start := strings.LastIndex(name, "(")
-	end := strings.LastIndex(name, ")")
-	if start != -1 && end != -1 && end > start {
-		return strings.TrimSpace(name[start+1 : end])
-	}
-	return strings.TrimSpace(name)
+	return balancer.ExtractRawName(name)
 }
 
 func UpdateRule() (string, error) {

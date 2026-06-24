@@ -133,6 +133,25 @@ func setSetting(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, NewError(err.Error()))
 		return
 	}
+
+	// Atomically reconfigure the load balancer — no restart needed.
+	// Reads the freshly-saved config and applies it immediately.
+	if req.LoadBalance.Enabled && len(req.LoadBalance.Interfaces) >= 2 {
+		rawIfaces := make([]string, 0, len(req.LoadBalance.Interfaces))
+		for _, iface := range req.LoadBalance.Interfaces {
+			if raw := balancer.ExtractRawName(iface); raw != "" {
+				rawIfaces = append(rawIfaces, raw)
+			}
+		}
+		if len(rawIfaces) >= 2 {
+			balancer.Configure(rawIfaces, req.LoadBalance.Strategy)
+		} else {
+			balancer.Configure(nil, "")
+		}
+	} else {
+		balancer.Configure(nil, "")
+	}
+
 	render.NoContent(w, r)
 }
 

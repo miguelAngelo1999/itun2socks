@@ -14,6 +14,7 @@ package balancer
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -417,7 +418,22 @@ func measureLatency(ifaceName string) int64 {
 	return ms
 }
 
-// checkInterface returns true if the interface is Up with a routable IPv4.
+// ExtractRawName extracts the OS interface name from a friendly-format string.
+// Flutter stores interfaces as "Friendly Name (en0)" — we need "en0".
+func ExtractRawName(name string) string {
+	start := len(name) - 1
+	for start >= 0 && name[start] != '(' {
+		start--
+	}
+	end := len(name) - 1
+	for end >= 0 && name[end] != ')' {
+		end--
+	}
+	if start >= 0 && end > start {
+		return strings.TrimSpace(name[start+1 : end])
+	}
+	return strings.TrimSpace(name)
+}
 func checkInterface(ifaceName string) bool {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
