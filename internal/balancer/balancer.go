@@ -21,20 +21,26 @@ import (
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
-const healthCheckInterval = 20 * time.Second
+const (
+	healthCheckInterval = 20 * time.Second
+	latencyTarget       = "8.8.8.8:53" // TCP connect to measure RTT per interface
+	latencyTimeout      = 2 * time.Second
+)
 
 // Strategy constants.
 const (
 	StrategyLeastConn  = "least-conn"
 	StrategyRoundRobin = "round-robin"
 	StrategyFailover   = "failover"
+	StrategyWeighted   = "weighted" // proportional to measured latency (faster = more load)
 )
 
-// ifaceState tracks health and active connection count for one interface.
+// ifaceState tracks health, active connection count, and latency for one interface.
 type ifaceState struct {
-	name    string
-	healthy atomic.Bool
-	active  atomic.Int64 // active connections (used by least-conn)
+	name      string
+	healthy   atomic.Bool
+	active    atomic.Int64 // active connections (least-conn)
+	latencyMs atomic.Int64 // measured RTT in ms (weighted); 0 = not yet measured
 }
 
 // Balancer holds configuration and runtime state.
@@ -105,6 +111,8 @@ func Pick() string {
 		return b.pickRoundRobin()
 	case StrategyFailover:
 		return b.pickFailover()
+	case StrategyWeighted:
+		return b.pickWeighted()
 	default: // least-conn
 		return b.pickLeastConn()
 	}
@@ -135,29 +143,32 @@ func IsEnabled() bool {
 	return instance != nil
 }
 
-// GetStatus returns interface names, healthy subset, next pick, strategy, and enabled.
-func GetStatus() (interfaces []string, healthy []string, nextIface string, strategy string, enabled bool) {
+// GetStatus returns interface names, healthy subset, next pick, strategy, latencies, and enabled.
+func GetStatus() (interfaces []string, healthy []string, nextIface string, strategy string, latencies map[string]int64, enabled bool) {
 	instMu.Lock()
 	b := instance
 	instMu.Unlock()
 	if b == nil {
-		return nil, nil, "", "", false
+		return nil, nil, "", "", nil, false
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	all := make([]string, 0, len(b.ifaces))
 	hlth := make([]string, 0, len(b.ifaces))
+	lats := make(map[string]int64)
 	for _, s := range b.ifaces {
 		all = append(all, s.name)
 		if s.healthy.Load() {
 			hlth = append(hlth, s.name)
 		}
+		lat := s.latencyMs.Load()
+		if lat > 0 {
+			lats[s.name] = lat
+		}
 	}
-
-	// Compute next without mutating state
 	next := b.peekNext()
-	return all, hlth, next, b.strategy, true
+	return all, hlth, next, b.strategy, lats, true
 }
 
 // ── Strategy implementations ──────────────────────────────────────────────
@@ -197,6 +208,76 @@ func (b *Balancer) pickFailover() string {
 	return b.fallback()
 }
 
+// pickWeighted selects proportionally to inverse latency:
+// lower latency → more connections. Uses weighted random selection.
+// Falls back to least-conn if no latency data yet.
+func (b *Balancer) pickWeighted() string {
+	healthy := b.healthyList()
+	if len(healthy) == 0 {
+		return b.fallback()
+	}
+	// Build weights: weight = 1000 / latencyMs (lower latency = higher weight)
+	// If latency not measured yet, use weight=1 for all (equal distribution)
+	weights := make([]int64, len(healthy))
+	hasData := false
+	for i, s := range healthy {
+		lat := s.latencyMs.Load()
+		if lat > 0 {
+			weights[i] = 1000 / lat
+			if weights[i] < 1 {
+				weights[i] = 1
+			}
+			hasData = true
+		} else {
+			weights[i] = 1
+		}
+	}
+	if !hasData {
+		// No latency data yet — fall back to least-conn
+		return b.pickLeastConn()
+	}
+	// Weighted selection using counter mod total weight
+	total := int64(0)
+	for _, w := range weights {
+		total += w
+	}
+	idx := b.rrIdx.Add(1) - 1
+	pos := int64(idx) % total
+	cum := int64(0)
+	for i, w := range weights {
+		cum += w
+		if pos < cum {
+			healthy[i].active.Add(1)
+			return healthy[i].name
+		}
+	}
+	// Fallback
+	healthy[0].active.Add(1)
+	return healthy[0].name
+}
+
+func (b *Balancer) peekWeighted() string {
+	healthy := b.healthyList()
+	if len(healthy) == 0 {
+		return b.fallback()
+	}
+	// Show the interface with highest weight (lowest latency)
+	var best *ifaceState
+	for _, s := range healthy {
+		lat := s.latencyMs.Load()
+		if lat == 0 {
+			continue
+		}
+		if best == nil || lat < best.latencyMs.Load() {
+			best = s
+		}
+	}
+	if best != nil {
+		return best.name
+	}
+	return healthy[0].name
+}
+
 func (b *Balancer) peekNext() string {
 	switch b.strategy {
 	case StrategyRoundRobin:
@@ -213,6 +294,8 @@ func (b *Balancer) peekNext() string {
 			}
 		}
 		return b.fallback()
+	case StrategyWeighted:
+		return b.peekWeighted()
 	default: // least-conn
 		var best *ifaceState
 		for _, s := range b.ifaces {
@@ -278,10 +361,60 @@ func (b *Balancer) checkAll() {
 	for _, s := range ifaces {
 		h := checkInterface(s.name)
 		s.healthy.Store(h)
-		if !h {
+		if h {
+			// Measure latency for weighted strategy
+			ms := measureLatency(s.name)
+			if ms > 0 {
+				s.latencyMs.Store(ms)
+			}
+		} else {
 			log.Debugln("[balancer] %s: unhealthy", s.name)
 		}
 	}
+}
+
+// measureLatency measures TCP connect RTT to latencyTarget bound to ifaceName.
+// Returns milliseconds, or 0 on failure.
+// Note: in TUN/mixed mode this may not work (traffic captured by TUN).
+// That's acceptable — weighted strategy degrades to least-conn if no data.
+func measureLatency(ifaceName string) int64 {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return 0
+	}
+	addrs, _ := iface.Addrs()
+	var localIP net.IP
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+			localIP = ip
+			break
+		}
+	}
+	if localIP == nil {
+		return 0
+	}
+	d := net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: localIP, Port: 0},
+		Timeout:   latencyTimeout,
+	}
+	start := time.Now()
+	conn, err := d.Dial("tcp4", latencyTarget)
+	if err != nil {
+		return 0
+	}
+	ms := time.Since(start).Milliseconds()
+	conn.Close()
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
 }
 
 // checkInterface returns true if the interface is Up with a routable IPv4.
