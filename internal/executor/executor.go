@@ -37,6 +37,17 @@ func extractRawInterfaceName(name string) string {
 	return balancer.ExtractRawName(name)
 }
 
+// UpdateDns rebuilds DNS resolvers from the current saved config and applies them live.
+func UpdateDns() error {
+	newCfg, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
+	if err != nil {
+		return err
+	}
+	dns.UpdateDnsMap(newCfg.Rule.Dns.Local.Client, newCfg.Rule.Dns.Remote.Client)
+	dns.ResetCache()
+	return nil
+}
+
 func UpdateRule() (string, error) {
 	rawConfig, err := configuration.Read()
 	if err != nil {
@@ -155,6 +166,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	tunnel.UpdateShouldFindProcess(config.ShouldFindProcess)
 	conn.UpdateConnMatcher(matchers)
 	conn.UpdateIsFakeIpEnabled(config.FakeIp)
+	conn.UpdateBlockQuic(config.BlockQuic)
 	conn.UpdateProxy(config.Proxy)
 
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())

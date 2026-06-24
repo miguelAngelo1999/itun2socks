@@ -2,6 +2,7 @@ package conn
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/constants"
@@ -12,6 +13,13 @@ import (
 
 var defaultConnMatchers []Matcher
 var matcherMux sync.RWMutex
+var blockQuicEnabled atomic.Bool // hot-reloadable; checked by RejectQuicMather
+
+// UpdateBlockQuic sets whether QUIC connections should be rejected.
+// Takes effect immediately without restarting lux_core.
+func UpdateBlockQuic(enabled bool) {
+	blockQuicEnabled.Store(enabled)
+}
 
 func UpdateConnMatcher(matchers []Matcher) {
 	matcherMux.Lock()

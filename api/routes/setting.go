@@ -11,7 +11,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 	"github.com/igoogolx/itun2socks/internal/balancer"
+	"github.com/igoogolx/itun2socks/internal/conn"
 	configuration2 "github.com/igoogolx/itun2socks/internal/configuration"
+	"github.com/igoogolx/itun2socks/internal/executor"
+	"github.com/igoogolx/itun2socks/internal/manager"
+	"github.com/igoogolx/itun2socks/internal/tunnel"
+	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
 func settingRouter() http.Handler {
@@ -134,8 +139,25 @@ func setSetting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Atomically reconfigure the load balancer — no restart needed.
-	// Reads the freshly-saved config and applies it immediately.
+	// Hot-apply settings that don't require a full restart.
+	// Only applies when lux is currently running.
+	if manager.GetIsStarted() {
+		// Block QUIC — atomic flag checked inside RejectQuicMather
+		conn.UpdateBlockQuic(req.BlockQuic)
+
+		// Find process — atomic global flag
+		tunnel.UpdateShouldFindProcess(req.ShouldFindProcess)
+
+		// Fake IP — atomic flag
+		conn.UpdateIsFakeIpEnabled(req.Dns.FakeIp)
+
+		// DNS servers — rebuild resolvers from current saved config
+		if dnsErr := executor.UpdateDns(); dnsErr != nil {
+			log.Warnln("[setting] hot-apply DNS failed: %v", dnsErr)
+		}
+	}
+
+	// 5. Load balance — always atomic regardless of running state
 	if req.LoadBalance.Enabled && len(req.LoadBalance.Interfaces) >= 2 {
 		rawIfaces := make([]string, 0, len(req.LoadBalance.Interfaces))
 		for _, iface := range req.LoadBalance.Interfaces {
