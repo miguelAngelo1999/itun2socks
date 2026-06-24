@@ -97,11 +97,12 @@ func getInterfaces(w http.ResponseWriter, r *http.Request) {
 }
 
 func getLoadBalanceStatus(w http.ResponseWriter, r *http.Request) {
-	interfaces, healthy, enabled := balancer.GetStatus()
+	interfaces, healthy, next, enabled := balancer.GetStatus()
 	render.JSON(w, r, render.M{
 		"enabled":    enabled,
 		"interfaces": interfaces,
 		"healthy":    healthy,
+		"next":       next,
 	})
 }
 

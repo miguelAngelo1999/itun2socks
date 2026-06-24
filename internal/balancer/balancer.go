@@ -91,17 +91,22 @@ func IsEnabled() bool {
 }
 
 // GetStatus returns the current interfaces and their health status.
-func GetStatus() (interfaces []string, healthy []string, enabled bool) {
+func GetStatus() (interfaces []string, healthy []string, nextIface string, enabled bool) {
 	instMu.Lock()
 	b := instance
 	instMu.Unlock()
 
 	if b == nil {
-		return nil, nil, false
+		return nil, nil, "", false
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return append([]string{}, b.interfaces...), append([]string{}, b.healthy...), true
+	next := ""
+	if len(b.healthy) > 0 {
+		idx := atomic.LoadUint64(&b.counter)
+		next = b.healthy[idx%uint64(len(b.healthy))]
+	}
+	return append([]string{}, b.interfaces...), append([]string{}, b.healthy...), next, true
 }
 
 func (b *Balancer) pick() string {
@@ -176,23 +181,23 @@ func (b *Balancer) checkAll() {
 	log.Debugln("[balancer] healthy: %v (%d/%d)", ordered, len(ordered), len(b.interfaces))
 }
 
-// checkInterface tests whether the named interface can reach the internet
-// by attempting a TCP dial to the health check target bound to that interface.
+// checkInterface tests whether the named interface is up and has a routable
+// IPv4 address. We don't attempt a TCP dial because in TUN/mixed mode all
+// outbound traffic is captured by the TUN stack regardless of LocalAddr binding,
+// making external health checks unreliable. Interface presence + address is
+// sufficient — the OS routing table handles actual packet delivery.
 func checkInterface(ifaceName string) bool {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return false
 	}
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		return false
-	}
-	// Must be up and not loopback
 	if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 		return false
 	}
-	// Find a usable IPv4 address
-	var localIP net.IP
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
 	for _, a := range addrs {
 		var ip net.IP
 		switch v := a.(type) {
@@ -202,22 +207,8 @@ func checkInterface(ifaceName string) bool {
 			ip = v.IP
 		}
 		if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
-			localIP = ip
-			break
+			return true
 		}
 	}
-	if localIP == nil {
-		return false
-	}
-
-	d := net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: localIP, Port: 0},
-		Timeout:   healthCheckTimeout,
-	}
-	conn, err := d.DialContext(context.Background(), "tcp4", healthCheckTarget)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+	return false
 }

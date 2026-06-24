@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 "github.com/igoogolx/itun2socks/internal/cfg"
@@ -30,6 +31,19 @@ type Client interface {
 	Start() error
 	Close() error
 	RuntimeDetail(hubAddress string) (any, error)
+}
+
+// extractRawInterfaceName extracts the OS interface name from a friendly
+// name string. Flutter formats them as "Friendly Name (en0)" — we need "en0".
+// If no parentheses, the string itself is returned as-is.
+func extractRawInterfaceName(name string) string {
+	// Look for "(rawname)" at the end
+	start := strings.LastIndex(name, "(")
+	end := strings.LastIndex(name, ")")
+	if start != -1 && end != -1 && end > start {
+		return strings.TrimSpace(name[start+1 : end])
+	}
+	return strings.TrimSpace(name)
 }
 
 func UpdateRule() (string, error) {
@@ -80,12 +94,25 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Initialize load balancer if configured
+	// Initialize load balancer if configured.
+	// Interface names from Flutter may be "Friendly Name (en0)" format —
+	// extract the raw OS name in parentheses.
 	setting, _ := configuration.GetSetting()
 	if setting.LoadBalance.Enabled && len(setting.LoadBalance.Interfaces) >= 2 {
-		balancer.Configure(setting.LoadBalance.Interfaces)
+		rawIfaces := make([]string, 0, len(setting.LoadBalance.Interfaces))
+		for _, iface := range setting.LoadBalance.Interfaces {
+			raw := extractRawInterfaceName(iface)
+			if raw != "" {
+				rawIfaces = append(rawIfaces, raw)
+			}
+		}
+		if len(rawIfaces) >= 2 {
+			balancer.Configure(rawIfaces)
+		} else {
+			balancer.Configure(nil)
+		}
 	} else {
-		balancer.Configure(nil) // disable
+		balancer.Configure(nil)
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
