@@ -51,13 +51,40 @@ func getInterfaces(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Enrich interfaces with friendly names
+	// Enrich interfaces with friendly names, filtering to useful ones only:
+	// must be Up, non-loopback, and have at least one non-loopback IPv4 address.
 	type enrichedIface struct {
 		net.Interface
 		FriendlyName string `json:"FriendlyName,omitempty"`
 	}
 	enriched := make([]enrichedIface, 0, len(interfaces))
 	for _, iface := range interfaces {
+		// Must be up and not loopback
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// Must have at least one routable IPv4 address
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		hasIPv4 := false
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+				hasIPv4 = true
+				break
+			}
+		}
+		if !hasIPv4 {
+			continue
+		}
 		enriched = append(enriched, enrichedIface{
 			Interface:    iface,
 			FriendlyName: friendlyNames[iface.Name],
