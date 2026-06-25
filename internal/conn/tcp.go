@@ -5,9 +5,12 @@ import (
 	"net"
 	"sync"
 
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
+	"github.com/igoogolx/itun2socks/pkg/log"
+	"github.com/igoogolx/itun2socks/pkg/network_iface"
 )
 
 type TcpConnContext struct {
@@ -58,5 +61,24 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	if err != nil {
 		return nil, err
 	}
-	return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+	conn, dialErr := connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+	if dialErr != nil && defaultInterface != "" {
+		// Connection failed on the chosen interface — mark it unhealthy immediately
+		// and retry with the other interface (instant failover).
+		balancer.MarkUnhealthy(defaultInterface)
+		balancer.Release(defaultInterface) // release the counter we incremented in Pick()
+		fallbackIface := balancer.Pick()   // picks the next healthy interface
+		if fallbackIface != "" && fallbackIface != defaultInterface {
+			log.Debugln(log.FormatLog(log.TcpPrefix, "failover: %s → %s"), defaultInterface, fallbackIface)
+			conn, dialErr = connDialer.DialContext(ctx, metadata, dialer.WithInterface(fallbackIface))
+			if dialErr != nil {
+				balancer.Release(fallbackIface)
+			}
+			return conn, dialErr
+		}
+		// No fallback available — try with no binding (OS default routing)
+		conn, dialErr = connDialer.DialContext(ctx, metadata, dialer.WithInterface(network_iface.GetDefaultInterfaceName()))
+		return conn, dialErr
+	}
+	return conn, dialErr
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/cfg/local_server"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/conn"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
@@ -29,6 +30,22 @@ type Client interface {
 	Start() error
 	Close() error
 	RuntimeDetail(hubAddress string) (any, error)
+}
+
+// extractRawInterfaceName delegates to balancer.ExtractRawName.
+func extractRawInterfaceName(name string) string {
+	return balancer.ExtractRawName(name)
+}
+
+// UpdateDns rebuilds DNS resolvers from the current saved config and applies them live.
+func UpdateDns() error {
+	newCfg, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
+	if err != nil {
+		return err
+	}
+	dns.UpdateDnsMap(newCfg.Rule.Dns.Local.Client, newCfg.Rule.Dns.Remote.Client)
+	dns.ResetCache()
+	return nil
 }
 
 func UpdateRule() (string, error) {
@@ -77,6 +94,27 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		}
 		log.Infoln("%s", log.FormatLog(log.InitPrefix, "waiting for default interface name"))
 		time.Sleep(1 * time.Second)
+	}
+
+	// Initialize load balancer if configured.
+	// Interface names from Flutter may be "Friendly Name (en0)" format —
+	// extract the raw OS name in parentheses.
+	setting, _ := configuration.GetSetting()
+	if setting.LoadBalance.Enabled && len(setting.LoadBalance.Interfaces) >= 2 {
+		rawIfaces := make([]string, 0, len(setting.LoadBalance.Interfaces))
+		for _, iface := range setting.LoadBalance.Interfaces {
+			raw := extractRawInterfaceName(iface)
+			if raw != "" {
+				rawIfaces = append(rawIfaces, raw)
+			}
+		}
+		if len(rawIfaces) >= 2 {
+			balancer.Configure(rawIfaces, setting.LoadBalance.Strategy)
+		} else {
+			balancer.Configure(nil, "")
+		}
+	} else {
+		balancer.Configure(nil, "")
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
@@ -128,6 +166,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	tunnel.UpdateShouldFindProcess(config.ShouldFindProcess)
 	conn.UpdateConnMatcher(matchers)
 	conn.UpdateIsFakeIpEnabled(config.FakeIp)
+	conn.UpdateBlockQuic(config.BlockQuic)
 	conn.UpdateProxy(config.Proxy)
 
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())

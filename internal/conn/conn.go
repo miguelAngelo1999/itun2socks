@@ -31,6 +31,9 @@ var (
 type Matcher func(metadata *C.Metadata, rule rule_engine.Rule) (rule_engine.Rule, error)
 
 func RejectQuicMather(metadata *C.Metadata, prevRule rule_engine.Rule) (rule_engine.Rule, error) {
+	if !blockQuicEnabled.Load() {
+		return nil, fmt.Errorf("block quic disabled")
+	}
 	if prevRule.GetPolicy() == constants.PolicyProxy && strings.Contains(metadata.NetWork.String(), "udp") && metadata.DstPort.String() == "443" {
 		log.Debugln("reject quic conn:%v", metadata.RemoteAddress())
 		return rule_engine.BuiltInRejectRule, nil

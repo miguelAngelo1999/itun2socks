@@ -8,6 +8,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/internal/mitm"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
@@ -61,7 +62,14 @@ func handleTCPConn(ct conn.TcpConnContext) {
 		}
 	}
 
-	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), network_iface.GetDefaultInterfaceName())
+	// Load-balance all connections (PROXY + DIRECT) across interfaces.
+	// Instant failover in NewTcpConn handles dead interfaces — if the dial
+	// fails on the chosen NIC, it retries on the next healthy one.
+	chosenIface := pickInterface()
+	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), chosenIface)
+	if chosenIface != "" {
+		defer balancer.Release(chosenIface)
+	}
 	defer func() {
 		ct.Wg().Done()
 		if err := closeConn(ct.Conn()); err != nil {
@@ -114,4 +122,19 @@ func closeConn(conn CloseableConn) error {
 		return conn.Close()
 	}
 	return nil
+}
+
+func pickInterface() string {
+	if iface := balancer.Pick(); iface != "" {
+		log.Debugln(log.FormatLog(log.TcpPrefix, "load balance pick: %s"), iface)
+		return iface
+	}
+	return network_iface.GetDefaultInterfaceName()
+}
+
+func pickUdpInterface() string {
+	if iface := balancer.Pick(); iface != "" {
+		return iface
+	}
+	return network_iface.GetDefaultInterfaceName()
 }
