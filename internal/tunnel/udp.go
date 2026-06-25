@@ -9,7 +9,6 @@ import (
 	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/log"
-	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	"github.com/igoogolx/itun2socks/pkg/pool"
 	D "github.com/miekg/dns"
 	"github.com/sagernet/sing/common/bufio"
@@ -52,7 +51,11 @@ func handleUdpConn(ct conn.UdpConnContext) {
 		once.Do(cleanConn)
 	}()
 
-	localConn, err := conn.NewUdpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), pickUdpInterface())
+	chosenUdpIface := pickUdpInterface()
+	localConn, err := conn.NewUdpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), chosenUdpIface)
+	if chosenUdpIface != "" {
+		defer balancer.Release(chosenUdpIface)
+	}
 	if err != nil {
 		log.Warnln(log.FormatLog(log.UdpPrefix, "fail to get udp conn, err: %v, remote address: %v"), err, ct.Metadata().RemoteAddress())
 		return
@@ -140,10 +143,4 @@ func processUDP() {
 	}
 }
 
-// pickUdpInterface returns the interface to use for the next UDP connection.
-func pickUdpInterface() string {
-	if iface := balancer.Pick(); iface != "" {
-		return iface
-	}
-	return network_iface.GetDefaultInterfaceName()
-}
+// pickUdpInterface is defined in tcp.go (shared with TCP balancer).

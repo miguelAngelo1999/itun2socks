@@ -62,7 +62,14 @@ func handleTCPConn(ct conn.TcpConnContext) {
 		}
 	}
 
-	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), pickInterface())
+	// Load-balance all connections (PROXY + DIRECT) across interfaces.
+	// Instant failover in NewTcpConn handles dead interfaces — if the dial
+	// fails on the chosen NIC, it retries on the next healthy one.
+	chosenIface := pickInterface()
+	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), chosenIface)
+	if chosenIface != "" {
+		defer balancer.Release(chosenIface)
+	}
 	defer func() {
 		ct.Wg().Done()
 		if err := closeConn(ct.Conn()); err != nil {
@@ -117,10 +124,15 @@ func closeConn(conn CloseableConn) error {
 	return nil
 }
 
-// pickInterface returns the interface to use for the next DIRECT connection.
-// If load balancing is enabled, rotates across healthy interfaces.
-// Otherwise returns the default interface.
 func pickInterface() string {
+	if iface := balancer.Pick(); iface != "" {
+		log.Debugln(log.FormatLog(log.TcpPrefix, "load balance pick: %s"), iface)
+		return iface
+	}
+	return network_iface.GetDefaultInterfaceName()
+}
+
+func pickUdpInterface() string {
 	if iface := balancer.Pick(); iface != "" {
 		return iface
 	}
