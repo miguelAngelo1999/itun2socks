@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	healthCheckInterval = 20 * time.Second
-	latencyTarget       = "8.8.8.8:53" // TCP connect to measure RTT per interface
+	healthCheckInterval = 5 * time.Second
+	latencyTarget       = "8.8.8.8:53"
 	latencyTimeout      = 2 * time.Second
 )
 
@@ -132,6 +132,25 @@ func Release(ifaceName string) {
 	for _, s := range b.ifaces {
 		if s.name == ifaceName && s.active.Load() > 0 {
 			s.active.Add(-1)
+			return
+		}
+	}
+}
+
+// MarkUnhealthy immediately marks an interface as unhealthy (used for instant failover).
+func MarkUnhealthy(ifaceName string) {
+	instMu.Lock()
+	b := instance
+	instMu.Unlock()
+	if b == nil || ifaceName == "" {
+		return
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, s := range b.ifaces {
+		if s.name == ifaceName {
+			s.healthy.Store(false)
+			log.Warnln("[balancer] %s marked unhealthy (connection failed)", ifaceName)
 			return
 		}
 	}
