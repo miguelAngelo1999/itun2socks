@@ -2,14 +2,19 @@ package executor
 
 import (
 	"fmt"
+	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/igoogolx/itun2socks/internal/cfg"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/iface"
+	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	sTun "github.com/sagernet/sing-tun"
 )
@@ -80,11 +85,17 @@ func (c *TunClient) Start() error {
 		}
 	}
 
+	// Auto-detect and apply PAC rules from WPAD/DHCP in background
+	go detectAndApplyPac()
+
 	return nil
 }
 
 func (c *TunClient) Close() error {
 	var err error
+
+	// Clear PAC rules on disconnect
+	pac.Clear()
 
 	if c.config.HijackDns.Enabled {
 		err := dns.Resume(c.config.HijackDns.NetworkService, c.config.HijackDns.AlwaysReset)
@@ -108,4 +119,41 @@ func (c *TunClient) Close() error {
 	}
 
 	return nil
+}
+
+// detectAndApplyPac finds the WPAD/DHCP PAC URL for the current network
+// and applies its DIRECT rules so internal resources bypass the proxy.
+func detectAndApplyPac() {
+	var pacURL string
+
+	if runtime.GOOS == "darwin" {
+		// Check DHCP option 252 (proxy_auto_discovery_url) on the default interface
+		defaultIface := network_iface.GetDefaultInterfaceName()
+		if defaultIface != "" {
+			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
+			if err == nil {
+				for _, line := range strings.Split(string(out), "\n") {
+					if strings.Contains(line, "proxy_auto_discovery_url") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) == 2 {
+							pacURL = strings.TrimSpace(parts[1])
+						}
+					}
+				}
+			}
+		}
+	}
+	// TODO: Windows — check registry for AutoConfigURL
+
+	if pacURL == "" {
+		log.Debugln("[pac] no PAC URL detected on this network")
+		return
+	}
+
+	rules, err := pac.Apply(pacURL)
+	if err != nil {
+		log.Warnln("[pac] failed to apply PAC from %s: %v", pacURL, err)
+		return
+	}
+	log.Infoln("[pac] auto-applied %d DIRECT rules from %s", len(rules), pacURL)
 }

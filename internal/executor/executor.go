@@ -158,6 +158,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	newLocalServer := localserver.NewListener(config.LocalServer.Addr, config.LocalServer.Port)
 	var matchers = []conn.Matcher{
 		config.Rule.ConnMatcher,
+		conn.PacMatcher, // PAC DIRECT rules (no-op when no PAC is active)
 	}
 	if config.BlockQuic {
 		matchers = append(matchers, conn.RejectQuicMather)
