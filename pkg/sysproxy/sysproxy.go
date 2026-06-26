@@ -20,6 +20,10 @@ func Set(addr string, activeInterface string) error {
 	for _, svc := range services {
 		// Ignore errors on individual services (some may not support proxy)
 		_ = SetWebProxy(host, port, svc)
+		// Disable auto-proxy discovery (WPAD/PAC) so the OS uses our explicit proxy
+		// instead of fetching a PAC file that could override our settings
+		_ = exec.Command("networksetup", "-setproxyautodiscovery", svc, "off").Run()
+		_ = exec.Command("networksetup", "-setautoproxystate", svc, "off").Run()
 	}
 	return nil
 }
@@ -32,6 +36,8 @@ func Clear(activeInterface string) error {
 	}
 	for _, svc := range services {
 		_ = DisableWebProxy(svc)
+		// Restore auto-proxy discovery when lux disconnects
+		_ = exec.Command("networksetup", "-setproxyautodiscovery", svc, "on").Run()
 	}
 	return nil
 }
