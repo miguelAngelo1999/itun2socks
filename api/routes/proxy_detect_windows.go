@@ -4,7 +4,10 @@ package routes
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -101,4 +104,32 @@ func probeNetshWinhttp() DetectedProxy {
 		return parseProxyServer(server, "winhttp")
 	}
 	return DetectedProxy{Found: false}
+}
+
+// probeWpad fetches http://wpad/wpad.dat directly and parses the first PROXY entry.
+// This works on fresh machines that have never had a proxy configured manually,
+// as long as the network broadcasts WPAD via DNS.
+func probeWpad() DetectedProxy {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://wpad/wpad.dat")
+	if err != nil {
+		return DetectedProxy{Found: false}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil || resp.StatusCode != 200 {
+		return DetectedProxy{Found: false}
+	}
+	// Parse first PROXY host:port from PAC file
+	// e.g. return "PROXY 10.8.0.1:8082; DIRECT";
+	re := regexp.MustCompile(`(?i)\bPROXY\s+([\w.\-]+:\d+)`)
+	matches := re.FindStringSubmatch(string(body))
+	if len(matches) < 2 {
+		return DetectedProxy{Found: false}
+	}
+	server := strings.TrimSpace(matches[1])
+	if strings.HasPrefix(server, "127.0.0.1") || strings.HasPrefix(server, "localhost") {
+		return DetectedProxy{Found: false}
+	}
+	return parseProxyServer(server, "wpad")
 }

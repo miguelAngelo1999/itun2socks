@@ -46,8 +46,13 @@ func detectNetworkProxy() DetectedProxy {
 		if d := probeNetshWinhttp(); d.Found {
 			return d
 		}
-		// Step 3: WPAD via DNS
+		// Step 3: WPAD via DNS (using DHCP DNS servers)
 		if d := probeWpadViaDhcpDns(); d.Found {
+			return d
+		}
+		// Step 4: Direct WPAD HTTP fetch — works on fresh machines with no proxy configured
+		// as long as the network has wpad DNS entry (most corporate networks do)
+		if d := probeWpad(); d.Found {
 			return d
 		}
 	}
