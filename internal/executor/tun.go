@@ -85,17 +85,12 @@ func (c *TunClient) Start() error {
 		}
 	}
 
-	// Auto-detect and apply PAC rules from WPAD/DHCP in background
-	go detectAndApplyPac()
-
-	// Register route-change handler: flush stale connections when
-	// WireGuard/VPN reconnects or default interface changes.
-	// This prevents lux_core from getting stuck with dead connections
-	// after a routing table update.
+	// Register route-change handler: re-detect PAC and flush stale connections
+	// when network interface changes (WireGuard/VPN reconnect, WiFi switch, etc.)
 	network_iface.SetRouteChangeHandler(func(newIface string) {
 		log.Infoln("[network] route changed to %s — flushing stale connections", newIface)
 		statistic.DefaultManager.CloseAllConnections()
-		// Re-apply PAC rules for the new network
+		// Re-apply PAC rules for the new network (runs in background, TUN is up)
 		go detectAndApplyPac()
 	})
 
@@ -155,6 +150,18 @@ func detectAndApplyPac() {
 		}
 	}
 	// TODO: Windows — check registry for AutoConfigURL
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("powershell.exe",
+			"-noprofile", "-NonInteractive", "-command",
+			`(Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue).AutoConfigURL`,
+		).Output()
+		if err == nil {
+			url := strings.TrimSpace(string(out))
+			if url != "" && strings.HasPrefix(url, "http") {
+				pacURL = url
+			}
+		}
+	}
 
 	if pacURL == "" {
 		log.Debugln("[pac] no PAC URL detected on this network")

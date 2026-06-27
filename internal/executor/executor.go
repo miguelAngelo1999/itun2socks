@@ -130,6 +130,11 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		Logger:           logrus.StandardLogger(),
 		InterfaceMonitor: network_iface.GetDefaultInterfaceMonitor(),
 	}
+	// Detect and apply PAC rules BEFORE TUN starts — at this point the network
+	// is still in its original state (no TUN interception), so wpad DNS resolution
+	// and HTTP fetch work correctly without routing issues.
+	detectAndApplyPac()
+
 	// Clean up any stale adapter from a previous session before creating a new one.
 	cleanupTunAdapter(config.Device.Name)
 	tun, err := sTun.New(tunOptions)

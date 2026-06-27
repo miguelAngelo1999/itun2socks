@@ -38,12 +38,20 @@ func (r Rule) String() string {
 }
 
 // FetchAndParse downloads a PAC file from the given URL and parses it into rules.
+// Uses a direct dialer that bypasses the TUN interface — necessary in Mixed/TUN mode
+// where lux intercepts all traffic but the PAC URL must be reached without the proxy
+// (because the PAC file IS what tells us where the proxy is).
 func FetchAndParse(pacURL string) ([]Rule, error) {
+	// Custom dialer: resolve DNS using system resolver directly (not lux's TUN DNS)
+	// and connect directly to the IP, bypassing the TUN interface.
+	directDialer := &net.Dialer{
+		Timeout: 8 * time.Second,
+	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			// Bypass system proxy for PAC fetch — PAC tells us what the proxy is
-			Proxy: nil,
+			Proxy:       nil, // bypass system proxy
+			DialContext: directDialer.DialContext,
 		},
 	}
 	resp, err := client.Get(pacURL)
