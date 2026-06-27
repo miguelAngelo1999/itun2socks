@@ -88,6 +88,17 @@ func (c *TunClient) Start() error {
 	// Auto-detect and apply PAC rules from WPAD/DHCP in background
 	go detectAndApplyPac()
 
+	// Register route-change handler: flush stale connections when
+	// WireGuard/VPN reconnects or default interface changes.
+	// This prevents lux_core from getting stuck with dead connections
+	// after a routing table update.
+	network_iface.SetRouteChangeHandler(func(newIface string) {
+		log.Infoln("[network] route changed to %s — flushing stale connections", newIface)
+		statistic.DefaultManager.CloseAllConnections()
+		// Re-apply PAC rules for the new network
+		go detectAndApplyPac()
+	})
+
 	return nil
 }
 

@@ -137,10 +137,26 @@ func StopMonitor() error {
 	return nil
 }
 
+// onRouteChange is called when the default network interface changes.
+// Register a handler to be notified (e.g. to flush stale connections).
+var onRouteChange func(newIface string)
+
+// SetRouteChangeHandler registers a callback for default interface changes.
+// The callback is called with the new interface name whenever routing changes
+// (e.g. WireGuard reconnect, WiFi switch, Ethernet plug/unplug).
+func SetRouteChangeHandler(fn func(string)) {
+	onRouteChange = fn
+}
+
 func update(name string) {
+	prev := defaultInterfaceName.Load()
 	defaultInterfaceName.Store(name)
 	dialer.DefaultInterface.Store(name)
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "update default interface: %v"), name)
+	// Notify route change handler if the interface actually changed
+	if prev != name && onRouteChange != nil {
+		go onRouteChange(name)
+	}
 }
 
 func getLocalIp() (net.IP, error) {
