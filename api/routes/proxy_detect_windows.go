@@ -15,7 +15,8 @@ import (
 // probeWindowsRegistry detects the corporate proxy on Windows using multiple methods:
 // 1. Saved pre-lux proxy (from HKCU:\Software\LuxProxy if previously saved)
 // 2. Manual proxy in registry (if not lux's own 127.0.0.1)
-// 3. Windows auto-detect / PAC via GetSystemWebProxy (handles WPAD/PAC exactly like Windows)
+// 3. Windows auto-detect (WPAD/PAC) via GetSystemWebProxy
+// 4. Temporarily enable AutoDetect, query, restore — catches fresh machines
 func probeWindowsRegistry() DetectedProxy {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -37,6 +38,18 @@ func probeWindowsRegistry() DetectedProxy {
 			`if ($proxyUri -ne $null -and $proxyUri.Host -ne $uri.Host -and `+
 			`-not $proxyUri.Host.StartsWith("127.0.0.1") -and -not $proxyUri.Host.StartsWith("localhost")) `+
 			`{ Write-Output "$($proxyUri.Host):$($proxyUri.Port)"; exit 0 };`+
+			// Method 4: temporarily enable AutoDetect, probe, restore
+			// This detects WPAD even on machines where AutoDetect is currently off
+			`$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings";`+
+			`$origDetect = $k.AutoDetect;`+
+			`Set-ItemProperty $regPath -Name AutoDetect -Value 1 -Force;`+
+			`[System.Net.WebRequest]::DefaultWebProxy = $null;`+ // flush .NET proxy cache
+			`$proxy2 = [System.Net.WebRequest]::GetSystemWebProxy();`+
+			`$proxyUri2 = $proxy2.GetProxy($uri);`+
+			`Set-ItemProperty $regPath -Name AutoDetect -Value $origDetect -Force;`+ // restore
+			`if ($proxyUri2 -ne $null -and $proxyUri2.Host -ne $uri.Host -and `+
+			`-not $proxyUri2.Host.StartsWith("127.0.0.1") -and -not $proxyUri2.Host.StartsWith("localhost")) `+
+			`{ Write-Output "$($proxyUri2.Host):$($proxyUri2.Port)"; exit 0 };`+
 			`Write-Output ""`,
 	).Output()
 	if err != nil {
