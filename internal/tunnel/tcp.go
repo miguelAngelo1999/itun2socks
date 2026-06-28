@@ -54,7 +54,7 @@ func handleTCPConn(ct conn.TcpConnContext) {
 			if host != "" && interceptor.ShouldIntercept(host) {
 				defer ct.Wg().Done()
 				dialAddr := net.JoinHostPort(host, "443")
-				if err := interceptor.Intercept(ct.Conn(), dialAddr, statistic.DefaultManager, ct.Rule()); err != nil {
+				if err := interceptor.InterceptRaw(ct.Ctx(), ct.Conn(), dialAddr, statistic.DefaultManager, ct.Rule(), network_iface.GetDefaultInterfaceName()); err != nil {
 					log.Debugln(log.FormatLog(log.TcpPrefix, "mitm intercept %s: %v"), dialAddr, err)
 				}
 				return
