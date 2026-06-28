@@ -77,6 +77,11 @@ func Start(addr string, secret string) error {
 	}))
 	r.Use(middleware.Heartbeat("/ping"))
 	r.Mount("/debug", middleware.Profiler())
+	// CRL and OCSP endpoints must be public — schannel/WinHTTP calls them directly
+	// without any auth token when verifying MITM leaf certificates.
+	r.Get("/crl.der", sslInspectCRLDer)
+	r.Get("/crl.pem", sslInspectCRLPem)
+	r.Get("/ocsp", sslInspectOCSP)
 	r.Group(func(r chi.Router) {
 		r.Use(authentication)
 		r.Mount("/traffic", trafficRouter())

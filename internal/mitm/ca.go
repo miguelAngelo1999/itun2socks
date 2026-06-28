@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -25,6 +26,17 @@ const (
 	caKeyFile  = "mitm_ca_key.enc"
 )
 
+// crlDPBase is the base URL for CRL Distribution Points in leaf certs.
+// Port is set at runtime via SetCRLPort.
+var crlDPBase = "http://127.0.0.1:1090"
+
+// SetCRLPort sets the local port used for CRL Distribution Points and OCSP URIs
+// in generated leaf certificates. Call this once on startup with the API server port.
+// The CRL endpoint is served at http://127.0.0.1:<port>/crl.der (no auth required).
+func SetCRLPort(port int) {
+	crlDPBase = fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
 // CA holds the Root CA certificate and key, plus an in-memory leaf cert cache.
 type CA struct {
 	cert      *x509.Certificate
@@ -32,6 +44,9 @@ type CA struct {
 	certPEM   []byte
 	leafCache map[string]*tls.Certificate
 	cacheMu   sync.RWMutex
+	// cachedCRL is a pre-built empty (valid) CRL in DER format.
+	cachedCRL    []byte
+	cachedCRLMu  sync.RWMutex
 }
 
 // Init loads an existing Root CA from configDir, or generates a new one if absent.
@@ -156,15 +171,33 @@ func generateCA(configDir, certPath, keyPath string) (*CA, error) {
 	}, nil
 }
 
-// TLSConfig returns a *tls.Config with GetCertificate set to serve per-domain leaf certs.
+// TLSConfig returns a *tls.Config that uses GetConfigForClient to negotiate
+// per-connection TLS settings after reading the ClientHello.
+// This properly handles clients sending legacy TLS record headers (e.g. TLS 1.0).
 func (ca *CA) TLSConfig() *tls.Config {
 	return &tls.Config{
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			domain := hello.ServerName
+		SessionTicketsDisabled: true, // ensures GetConfigForClient is always called
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			domain := chi.ServerName
 			if domain == "" {
 				return nil, fmt.Errorf("mitm: no SNI in ClientHello")
 			}
-			return ca.GetOrCreateLeafCert(domain)
+			cert, err := ca.GetOrCreateLeafCert(domain)
+			if err != nil {
+				return nil, err
+			}
+			cfg := &tls.Config{
+				SessionTicketsDisabled: true,
+				Certificates:           []tls.Certificate{*cert},
+				MinVersion:             tls.VersionTLS10,
+			}
+			// Mirror the client's supported next-protocols (h2, http/1.1)
+			if len(chi.SupportedProtos) > 0 {
+				cfg.NextProtos = chi.SupportedProtos
+			} else {
+				cfg.NextProtos = []string{"http/1.1"}
+			}
+			return cfg, nil
 		},
 	}
 }
@@ -204,6 +237,9 @@ func (ca *CA) generateLeafCert(domain string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("mitm: generate leaf serial: %w", err)
 	}
 
+	crlURL := crlDPBase + "/crl.der"
+	ocspURL := crlDPBase + "/ocsp"
+
 	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber: serial,
@@ -213,6 +249,11 @@ func (ca *CA) generateLeafCert(domain string) (*tls.Certificate, error) {
 		NotAfter:     now.Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		// CRL Distribution Points — schannel requires at least one to perform
+		// revocation check; we serve a valid empty CRL at this endpoint.
+		CRLDistributionPoints: []string{crlURL},
+		// OCSP — advertised so schannel can also try OCSP stapling path.
+		OCSPServer: []string{ocspURL},
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
@@ -231,6 +272,50 @@ func (ca *CA) generateLeafCert(domain string) (*tls.Certificate, error) {
 		Leaf:        leaf,
 	}, nil
 }
+
+// BuildCRL generates a valid empty CRL signed by the CA and caches it.
+// The CRL is valid for 24 hours. Call periodically to refresh.
+func (ca *CA) BuildCRL() ([]byte, error) {
+	ca.cachedCRLMu.RLock()
+	if ca.cachedCRL != nil {
+		ca.cachedCRLMu.RUnlock()
+		return ca.cachedCRL, nil
+	}
+	ca.cachedCRLMu.RUnlock()
+
+	return ca.refreshCRL()
+}
+
+func (ca *CA) refreshCRL() ([]byte, error) {
+	now := time.Now()
+	// x509.RevocationList is the modern API (Go 1.19+)
+	template := &x509.RevocationList{
+		SignatureAlgorithm:  x509.SHA256WithRSA,
+		Number:              big.NewInt(1),
+		ThisUpdate:          now,
+		NextUpdate:          now.Add(24 * time.Hour),
+		RevokedCertificates: []pkix.RevokedCertificate{}, // empty — no revoked certs
+	}
+
+	rsaKey, ok := ca.key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("mitm: CA key is not RSA, cannot sign CRL")
+	}
+
+	crlDER, err := x509.CreateRevocationList(rand.Reader, template, ca.cert, rsaKey)
+	if err != nil {
+		return nil, fmt.Errorf("mitm: create CRL: %w", err)
+	}
+
+	ca.cachedCRLMu.Lock()
+	ca.cachedCRL = crlDER
+	ca.cachedCRLMu.Unlock()
+
+	return crlDER, nil
+}
+
+// ensure asn1 is imported (used indirectly by x509 pkix types)
+var _ = asn1.Marshal
 
 func (ca *CA) evictExpiredLocked() {
 	now := time.Now()

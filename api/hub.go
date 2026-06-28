@@ -8,6 +8,7 @@ import (
 
 	"github.com/igoogolx/itun2socks/api/routes"
 	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/internal/mitm"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -46,6 +47,8 @@ func Start(port int, secret string) {
 			hubAddress = fmt.Sprintf("%v?token=%v", hubAddress, secret)
 		}
 		constants.SetHubAddress(hubAddress)
+		// Set the CRL port so MITM leaf certs embed the correct CRL Distribution Point URL
+		mitm.SetCRLPort(availablePort)
 		log.Infoln("%s", log.FormatLog(log.ExecutorPrefix, hubAddress))
 		err := routes.Start("localhost:"+strconv.Itoa(availablePort), secret)
 		if err != nil {
