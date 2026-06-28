@@ -180,6 +180,12 @@ func sslInspectPutSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Update the live interceptor's enabled state
+	if interceptor := mitm.GetGlobalInterceptor(); interceptor != nil {
+		if m, ok := interceptor.(*mitm.MitmInterceptor); ok {
+			m.SetEnabled(req.Enabled)
+		}
+	}
 	render.NoContent(w, r)
 }
 
