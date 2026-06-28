@@ -10,3 +10,6 @@ func probeNetshWinhttp() DetectedProxy { return DetectedProxy{Found: false} }
 
 // getDhcpDnsServers delegates to the Darwin-specific implementation on macOS/Linux.
 func getDhcpDnsServers() []string { return getDhcpDnsServersDarwin() }
+
+// probeWpad is a no-op on non-Windows — macOS uses ipconfig getpacket instead.
+func probeWpad() DetectedProxy { return DetectedProxy{Found: false} }
