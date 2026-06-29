@@ -14,6 +14,8 @@ package balancer
 
 import (
 	"net"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,6 +140,7 @@ func Release(ifaceName string) {
 }
 
 // MarkUnhealthy immediately marks an interface as unhealthy (used for instant failover).
+// Also flushes all active connections so stale sockets on the dead interface are dropped.
 func MarkUnhealthy(ifaceName string) {
 	instMu.Lock()
 	b := instance
@@ -149,11 +152,26 @@ func MarkUnhealthy(ifaceName string) {
 	defer b.mu.RUnlock()
 	for _, s := range b.ifaces {
 		if s.name == ifaceName {
-			s.healthy.Store(false)
-			log.Warnln("[balancer] %s marked unhealthy (connection failed)", ifaceName)
+			wasHealthy := s.healthy.Swap(false)
+			if wasHealthy {
+				log.Warnln("[balancer] %s marked unhealthy — flushing connections", ifaceName)
+				// Trigger connection flush via the route change handler
+				// This ensures all existing connections on the dead interface get dropped
+				if onFlush != nil {
+					go onFlush()
+				}
+			}
 			return
 		}
 	}
+}
+
+// onFlush is called when an interface becomes unhealthy to flush stale connections.
+var onFlush func()
+
+// SetFlushHandler registers a callback to flush connections when failover triggers.
+func SetFlushHandler(fn func()) {
+	onFlush = fn
 }
 
 // IsEnabled reports whether balancing is active.
@@ -380,15 +398,29 @@ func (b *Balancer) checkAll() {
 	b.mu.RUnlock()
 	for _, s := range ifaces {
 		h := checkInterface(s.name)
-		s.healthy.Store(h)
+		if !h && isInterfacePhysicallyPresent(s.name) {
+			// Interface is physically present (Up+Running) but has no IPv4.
+			// Attempt automatic recovery: bounce the interface + renew DHCP.
+			log.Infoln("[balancer] %s: up but no IPv4 — attempting DHCP recovery", s.name)
+			recoverInterface(s.name)
+			// Re-check after recovery attempt
+			h = checkInterface(s.name)
+		}
 		if h {
 			// Measure latency for weighted strategy
 			ms := measureLatency(s.name)
 			if ms > 0 {
 				s.latencyMs.Store(ms)
 			}
-		} else {
-			log.Debugln("[balancer] %s: unhealthy", s.name)
+		}
+		wasHealthy := s.healthy.Swap(h)
+		if !h && wasHealthy {
+			log.Warnln("[balancer] %s: became unhealthy", s.name)
+			if onFlush != nil {
+				go onFlush()
+			}
+		} else if h && !wasHealthy {
+			log.Infoln("[balancer] %s: recovered — back in rotation", s.name)
 		}
 	}
 }
@@ -435,6 +467,36 @@ func measureLatency(ifaceName string) int64 {
 		ms = 1
 	}
 	return ms
+}
+
+// isInterfacePhysicallyPresent checks if the interface is Up+Running (cable connected)
+// but just lacks an IP address (DHCP failed).
+func isInterfacePhysicallyPresent(ifaceName string) bool {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return false
+	}
+	// Must be Up AND Running (Running means link is established)
+	return iface.Flags&net.FlagUp != 0 &&
+		iface.Flags&net.FlagRunning != 0 &&
+		iface.Flags&net.FlagLoopback == 0
+}
+
+// recoverInterface attempts to bounce the interface and renew DHCP.
+// This handles the case where a USB ethernet adapter loses its DHCP lease
+// but is still physically connected (Up+Running, no IPv4).
+func recoverInterface(ifaceName string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	// ifconfig down/up + DHCP renewal
+	_ = exec.Command("sudo", "-n", "ifconfig", ifaceName, "down").Run()
+	time.Sleep(1 * time.Second)
+	_ = exec.Command("sudo", "-n", "ifconfig", ifaceName, "up").Run()
+	time.Sleep(2 * time.Second)
+	_ = exec.Command("sudo", "-n", "ipconfig", "set", ifaceName, "DHCP").Run()
+	time.Sleep(3 * time.Second) // give DHCP time to assign
+	log.Infoln("[balancer] %s: DHCP recovery attempt completed", ifaceName)
 }
 
 // ExtractRawName extracts the OS interface name from a friendly-format string.

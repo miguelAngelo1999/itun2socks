@@ -11,6 +11,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
+	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/iface"
@@ -92,6 +93,13 @@ func (c *TunClient) Start() error {
 		statistic.DefaultManager.CloseAllConnections()
 		// Re-apply PAC rules for the new network (runs in background, TUN is up)
 		go detectAndApplyPac()
+	})
+
+	// Register flush handler for load balancer failover: when an interface becomes
+	// unhealthy, all existing connections are flushed so apps reconnect on the healthy interface.
+	balancer.SetFlushHandler(func() {
+		log.Infoln("[balancer] failover flush — closing all connections")
+		statistic.DefaultManager.CloseAllConnections()
 	})
 
 	return nil
