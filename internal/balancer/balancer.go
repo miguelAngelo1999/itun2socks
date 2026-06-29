@@ -138,6 +138,7 @@ func Release(ifaceName string) {
 }
 
 // MarkUnhealthy immediately marks an interface as unhealthy (used for instant failover).
+// Also flushes all active connections so stale sockets on the dead interface are dropped.
 func MarkUnhealthy(ifaceName string) {
 	instMu.Lock()
 	b := instance
@@ -149,11 +150,26 @@ func MarkUnhealthy(ifaceName string) {
 	defer b.mu.RUnlock()
 	for _, s := range b.ifaces {
 		if s.name == ifaceName {
-			s.healthy.Store(false)
-			log.Warnln("[balancer] %s marked unhealthy (connection failed)", ifaceName)
+			wasHealthy := s.healthy.Swap(false)
+			if wasHealthy {
+				log.Warnln("[balancer] %s marked unhealthy — flushing connections", ifaceName)
+				// Trigger connection flush via the route change handler
+				// This ensures all existing connections on the dead interface get dropped
+				if onFlush != nil {
+					go onFlush()
+				}
+			}
 			return
 		}
 	}
+}
+
+// onFlush is called when an interface becomes unhealthy to flush stale connections.
+var onFlush func()
+
+// SetFlushHandler registers a callback to flush connections when failover triggers.
+func SetFlushHandler(fn func()) {
+	onFlush = fn
 }
 
 // IsEnabled reports whether balancing is active.
