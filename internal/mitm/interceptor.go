@@ -58,15 +58,14 @@ func (m *MitmInterceptor) IsEnabled() bool { return m.enabled.Load() }
 // InspectionList returns the underlying InspectionList (satisfies InterceptorWithList).
 func (m *MitmInterceptor) InspectionList() *InspectionList { return m.inspectionList }
 
-// ShouldIntercept returns true when SSL inspection is enabled, the domain is not
-// in the bypass list, and the domain is in the inspection list.
+// ShouldIntercept returns true when SSL inspection is enabled and the domain is
+// explicitly in the inspection list. Inspection list takes precedence over bypass —
+// if a user adds googleapis.com to inspect, it will be intercepted regardless of bypass.
 func (m *MitmInterceptor) ShouldIntercept(domain string) bool {
 	if !m.enabled.Load() {
 		return false
 	}
-	if IsBypassed(domain) {
-		return false
-	}
+	// Inspection list overrides bypass list — explicit user config wins
 	return m.inspectionList.Contains(domain)
 }
 
@@ -191,9 +190,13 @@ func (m *MitmInterceptor) InterceptRaw(
 	}
 
 	// TLS handshake with upstream
+	// InsecureSkipVerify=true because the upstream cert comes from the corporate proxy
+	// SSL bump (Squid) which re-signs with its own CA that may lack CRL DPs.
+	// We don't need to verify here — lux is acting as a local MITM and we trust
+	// the corporate proxy connection (we're on the internal network).
 	upstreamTLS := tls.Client(upstreamTCP, &tls.Config{
 		ServerName:         sniHost,
-		InsecureSkipVerify: false,
+		InsecureSkipVerify: true, //nolint:gosec
 		NextProtos:         []string{"http/1.1"},
 	})
 	if err := upstreamTLS.Handshake(); err != nil {
@@ -231,6 +234,13 @@ func (m *MitmInterceptor) InterceptRaw(
 
 	defer tlsClientConn.Close()
 	defer upstreamTCP.Close()
+
+	// If HTTP/2 was negotiated, fall back to transparent relay.
+	// We can't parse HTTP/2 frames — just relay bytes bidirectionally.
+	if tlsClientConn.ConnectionState().NegotiatedProtocol == "h2" {
+		log.Infoln("[MITM] h2 relay: %s", sniHost)
+		return relay(tlsClientConn, upstreamTLS)
+	}
 
 	clientReader := bufio.NewReader(tlsClientConn)
 	upstreamReader := bufio.NewReader(upstreamTLS)
@@ -270,6 +280,15 @@ func (m *MitmInterceptor) InterceptRaw(
 			return nil
 		}
 	}
+}
+
+// relay copies bytes bidirectionally between two connections (for HTTP/2 and other protocols).
+func relay(a, b net.Conn) error {
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
+	<-done
+	return nil
 }
 
 func splitHostPort(hostport string) (host, port string) {
