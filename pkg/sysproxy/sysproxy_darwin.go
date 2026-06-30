@@ -55,6 +55,11 @@ func SetWebProxy(host string, port string, activeInterface string) error {
 		return err
 	}
 
+	// Always bypass localhost — OAuth callbacks, local dev servers, and app-internal
+	// HTTP servers (e.g. Anti-gravity IDE port 52484) must not go through the proxy.
+	_ = exec.Command("networksetup", "-setproxybypassdomains", activeInterface,
+		"localhost", "127.0.0.1", "10.255.0.1", "*.local", "169.254/16").Run()
+
 	return nil
 }
 
