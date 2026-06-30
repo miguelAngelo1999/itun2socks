@@ -30,6 +30,10 @@ type proxySettings struct {
 	proxyOverride string
 }
 
+// savedAutoDetect stores the AutoDetect value present BEFORE lux enabled its proxy,
+// so we can restore it exactly on disable rather than hard-coding 0.
+var savedAutoDetect *uint32
+
 var (
 	modwininet            = windows.NewLazySystemDLL("wininet.dll")
 	procInternetSetOption = modwininet.NewProc("InternetSetOptionW")
@@ -79,16 +83,34 @@ func DisableSOCKSProxy() error {
 }
 
 func setProxySettings(settings *proxySettings) error {
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
 		return err
 	}
 	defer key.Close()
 
+	// Save the current AutoDetect value before we touch anything,
+	// so we can restore it exactly on disable.
+	if savedAutoDetect == nil {
+		if val, _, e := key.GetIntegerValue("AutoDetect"); e == nil {
+			v := uint32(val)
+			savedAutoDetect = &v
+		} else {
+			// Value absent — treat as 0 (off)
+			v := uint32(0)
+			savedAutoDetect = &v
+		}
+	}
+
 	if err = key.SetStringValue("ProxyServer", settings.proxyServer); err != nil {
 		return err
 	}
 	if err = key.SetStringValue("ProxyOverride", settings.proxyOverride); err != nil {
+		return err
+	}
+	// Disable AutoDetect while our explicit proxy is active — prevents Windows
+	// from overriding our proxy with a WPAD-discovered one.
+	if err = key.SetDWordValue("AutoDetect", 0); err != nil {
 		return err
 	}
 	// Finally, enable the proxy
@@ -111,6 +133,13 @@ func disableProxy() error {
 	err = key.SetDWordValue("ProxyEnable", 0)
 	if err != nil {
 		return err
+	}
+
+	// Restore AutoDetect to whatever it was before lux enabled the proxy.
+	// If we never saved it, leave it untouched.
+	if savedAutoDetect != nil {
+		_ = key.SetDWordValue("AutoDetect", *savedAutoDetect)
+		savedAutoDetect = nil
 	}
 
 	// Refresh the settings

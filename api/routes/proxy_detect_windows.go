@@ -16,7 +16,12 @@ import (
 // 1. Saved pre-lux proxy (from HKCU:\Software\LuxProxy if previously saved)
 // 2. Manual proxy in registry (if not lux's own 127.0.0.1)
 // 3. Windows auto-detect (WPAD/PAC) via GetSystemWebProxy
-// 4. Temporarily enable AutoDetect, query, restore — catches fresh machines
+//
+// NOTE: we intentionally do NOT toggle AutoDetect on/off — that would leave
+// the setting in a wrong state if the process is killed mid-execution, and
+// it modifies settings the user never configured. WPAD detection is handled
+// separately by probeWpad() (direct HTTP fetch of wpad.dat) and
+// probeNetshWinhttp() (reads WinHTTP settings set by GPO/DHCP).
 func probeWindowsRegistry() DetectedProxy {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -32,24 +37,13 @@ func probeWindowsRegistry() DetectedProxy {
 			`-not $k.ProxyServer.StartsWith("127.0.0.1") -and -not $k.ProxyServer.StartsWith("localhost")) `+
 			`{ Write-Output $k.ProxyServer; exit 0 };`+
 			// Method 3: Windows auto-detect (WPAD/PAC) - GetSystemWebProxy resolves it
+			// Only uses whatever AutoDetect/PAC state the user already had — never modifies it.
 			`$proxy = [System.Net.WebRequest]::GetSystemWebProxy();`+
 			`$uri = [Uri]"https://www.microsoft.com";`+
 			`$proxyUri = $proxy.GetProxy($uri);`+
 			`if ($proxyUri -ne $null -and $proxyUri.Host -ne $uri.Host -and `+
 			`-not $proxyUri.Host.StartsWith("127.0.0.1") -and -not $proxyUri.Host.StartsWith("localhost")) `+
 			`{ Write-Output "$($proxyUri.Host):$($proxyUri.Port)"; exit 0 };`+
-			// Method 4: temporarily enable AutoDetect, probe, restore
-			// This detects WPAD even on machines where AutoDetect is currently off
-			`$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings";`+
-			`$origDetect = $k.AutoDetect;`+
-			`Set-ItemProperty $regPath -Name AutoDetect -Value 1 -Force;`+
-			`[System.Net.WebRequest]::DefaultWebProxy = $null;`+ // flush .NET proxy cache
-			`$proxy2 = [System.Net.WebRequest]::GetSystemWebProxy();`+
-			`$proxyUri2 = $proxy2.GetProxy($uri);`+
-			`Set-ItemProperty $regPath -Name AutoDetect -Value $origDetect -Force;`+ // restore
-			`if ($proxyUri2 -ne $null -and $proxyUri2.Host -ne $uri.Host -and `+
-			`-not $proxyUri2.Host.StartsWith("127.0.0.1") -and -not $proxyUri2.Host.StartsWith("localhost")) `+
-			`{ Write-Output "$($proxyUri2.Host):$($proxyUri2.Port)"; exit 0 };`+
 			`Write-Output ""`,
 	).Output()
 	if err != nil {
