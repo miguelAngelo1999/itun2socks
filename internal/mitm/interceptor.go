@@ -252,7 +252,7 @@ func (m *MitmInterceptor) InterceptRaw(
 		}
 
 		fullURL := "https://" + sniHost + req.URL.RequestURI()
-		log.Infoln("[MITM], " + req.Method + " " + fullURL)
+		log.Infoln("%s", "[MITM], "+req.Method+" "+fullURL)
 		req.URL.Scheme = "https"
 		req.URL.Host = sniHost
 		req.RequestURI = ""

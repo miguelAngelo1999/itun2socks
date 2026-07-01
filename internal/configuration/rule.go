@@ -84,7 +84,7 @@ func EditCustomizedRule(oldRule string, newRule string) error {
 	}
 	targetIndex := slices.Index(c.Rules, oldRule)
 	if targetIndex != -1 {
-		slices.Replace(c.Rules, targetIndex, targetIndex+1, newRule)
+		c.Rules = slices.Replace(c.Rules, targetIndex, targetIndex+1, newRule)
 	}
 	return Write(c)
 }
