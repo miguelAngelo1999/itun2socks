@@ -476,10 +476,25 @@ func isInterfacePhysicallyPresent(ifaceName string) bool {
 	if err != nil {
 		return false
 	}
-	// Must be Up AND Running (Running means link is established)
-	return iface.Flags&net.FlagUp != 0 &&
-		iface.Flags&net.FlagRunning != 0 &&
-		iface.Flags&net.FlagLoopback == 0
+	// Must be Up AND Running flags
+	if iface.Flags&net.FlagUp == 0 ||
+		iface.Flags&net.FlagRunning == 0 ||
+		iface.Flags&net.FlagLoopback != 0 {
+		return false
+	}
+	// On macOS, also check ifconfig output for "status: active" — the kernel
+	// flags can show UP|RUNNING even when the physical link is down (inactive).
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("ifconfig", ifaceName).Output()
+		if err != nil {
+			return true // assume present if we can't check
+		}
+		// If status is explicitly "inactive", no physical link — don't attempt recovery
+		if strings.Contains(string(out), "status: inactive") {
+			return false
+		}
+	}
+	return true
 }
 
 // recoverInterface attempts to bounce the interface and renew DHCP.
