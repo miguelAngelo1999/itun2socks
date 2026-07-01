@@ -135,16 +135,24 @@ func disableProxy() error {
 		return err
 	}
 
-	// Restore AutoDetect to whatever it was before lux enabled the proxy.
-	// If we never saved it, leave it untouched.
-	if savedAutoDetect != nil {
+	// Default: always disable AutoDetect on exit.
+	// Users who need WPAD when lux is off can enable RestoreAutoDetect in settings.
+	if RestoreAutoDetectOnExit && savedAutoDetect != nil {
 		_ = key.SetDWordValue("AutoDetect", *savedAutoDetect)
-		savedAutoDetect = nil
+	} else {
+		_ = key.SetDWordValue("AutoDetect", 0)
 	}
+	savedAutoDetect = nil
 
 	// Refresh the settings
 	return notifyWinInetProxySettingsChanged()
 }
+
+// RestoreAutoDetectOnExit controls whether Windows proxy "Automatically detect settings"
+// is restored to its original state when lux disables its proxy.
+// Default is false — AutoDetect stays OFF when lux exits.
+// Set to true via the setting API to re-enable WPAD when lux turns off.
+var RestoreAutoDetectOnExit bool
 
 // https://learn.microsoft.com/en-us/windows/win32/api/wininet/nf-wininet-internetsetoptionw
 // internetSetOption sets an Internet option.

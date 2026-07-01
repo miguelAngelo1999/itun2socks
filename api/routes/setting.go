@@ -3,6 +3,7 @@ package routes
 import (
 	"net"
 	"os/exec"
+	"runtime"
 	"strings"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/manager"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	"github.com/igoogolx/itun2socks/pkg/log"
+	"github.com/igoogolx/itun2socks/pkg/sysproxy"
 )
 
 func settingRouter() http.Handler {
@@ -155,6 +157,11 @@ func setSetting(w http.ResponseWriter, r *http.Request) {
 		if dnsErr := executor.UpdateDns(); dnsErr != nil {
 			log.Warnln("[setting] hot-apply DNS failed: %v", dnsErr)
 		}
+	}
+
+	// Hot-apply RestoreAutoDetect on Windows
+	if runtime.GOOS == "windows" {
+		sysproxy.RestoreAutoDetectOnExit = req.RestoreAutoDetect
 	}
 
 	// 5. Load balance — always atomic regardless of running state

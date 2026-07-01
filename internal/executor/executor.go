@@ -22,6 +22,7 @@ import (
 	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
+	"github.com/igoogolx/itun2socks/pkg/sysproxy"
 	sTun "github.com/sagernet/sing-tun"
 	"github.com/sirupsen/logrus"
 )
@@ -100,6 +101,12 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	// Interface names from Flutter may be "Friendly Name (en0)" format —
 	// extract the raw OS name in parentheses.
 	setting, _ := configuration.GetSetting()
+
+	// Apply RestoreAutoDetect setting on Windows
+	if runtime.GOOS == "windows" {
+		sysproxy.RestoreAutoDetectOnExit = setting.RestoreAutoDetect
+	}
+
 	if setting.LoadBalance.Enabled && len(setting.LoadBalance.Interfaces) >= 2 {
 		rawIfaces := make([]string, 0, len(setting.LoadBalance.Interfaces))
 		for _, iface := range setting.LoadBalance.Interfaces {
