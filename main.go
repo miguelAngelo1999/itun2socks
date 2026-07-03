@@ -50,6 +50,7 @@ func main() {
 	constants.Path.SetHomeDir(homeDir)
 	log.InitLog()
 	log.Infoln(log.FormatLog(log.InitPrefix, "using config: %v"), constants.Path.ConfigFilePath())
+	log.Infoln(log.FormatLog(log.InitPrefix, "[STARTUP] pid=%d version=%v"), os.Getpid(), constants.Version)
 	configuration.SetConfigFilePath(constants.Path.ConfigFilePath())
 	configuration.Init()
 	executor.InitMitm()
@@ -66,5 +67,6 @@ func main() {
 	}()
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGHUP)
-	<-osSignals
+	sig := <-osSignals
+	log.Infoln(log.FormatLog(log.InitPrefix, "[SHUTDOWN] received signal: %v — clean exit"), sig)
 }
