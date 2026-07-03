@@ -43,16 +43,6 @@ func probeWindowsRegistry() DetectedProxy {
 	}
 	return parseProxyServer(server, "windows-registry")
 }
-	if err != nil {
-		return DetectedProxy{Found: false}
-	}
-
-	server := strings.TrimSpace(string(out))
-	if server == "" {
-		return DetectedProxy{Found: false}
-	}
-	return parseProxyServer(server, "windows-autodetect")
-}
 
 // parseProxyServer parses "host:port" or "http=host:port;https=..." into a DetectedProxy.
 func parseProxyServer(server, source string) DetectedProxy {
