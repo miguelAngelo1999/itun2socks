@@ -12,40 +12,37 @@ import (
 	"time"
 )
 
-// probeWindowsRegistry detects the corporate proxy on Windows using multiple methods:
-// 1. Saved pre-lux proxy (from HKCU:\Software\LuxProxy if previously saved)
+// probeWindowsRegistry detects the corporate proxy on Windows.
+// Priority:
+// 1. Pre-lux saved proxy (HKCU:\Software\LuxProxy\OriginalProxyServer) — fastest, most reliable
 // 2. Manual proxy in registry (if not lux's own 127.0.0.1)
-// 3. Windows auto-detect (WPAD/PAC) via GetSystemWebProxy
-//
-// NOTE: we intentionally do NOT toggle AutoDetect on/off — that would leave
-// the setting in a wrong state if the process is killed mid-execution, and
-// it modifies settings the user never configured. WPAD detection is handled
-// separately by probeWpad() (direct HTTP fetch of wpad.dat) and
-// probeNetshWinhttp() (reads WinHTTP settings set by GPO/DHCP).
+// 3. WinHTTP proxy (set independently of IE/Edge, survives lux setting system proxy)
 func probeWindowsRegistry() DetectedProxy {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx, "powershell.exe",
 		"-noprofile", "-NonInteractive", "-command",
-		// Method 1: saved original proxy
+		// Method 1: saved original proxy (written by lux before overwriting system proxy)
 		`$saved = (Get-ItemProperty "HKCU:\Software\LuxProxy" -EA SilentlyContinue).OriginalProxyServer;`+
 			`if ($saved -and -not $saved.StartsWith("127.0.0.1")) { Write-Output $saved; exit 0 };`+
-			// Method 2: manual registry proxy
+			// Method 2: manual registry proxy (if user bypassed lux somehow)
 			`$k = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue;`+
 			`if ($k.ProxyEnable -eq 1 -and $k.ProxyServer -and `+
 			`-not $k.ProxyServer.StartsWith("127.0.0.1") -and -not $k.ProxyServer.StartsWith("localhost")) `+
 			`{ Write-Output $k.ProxyServer; exit 0 };`+
-			// Method 3: Windows auto-detect (WPAD/PAC) - GetSystemWebProxy resolves it
-			// Only uses whatever AutoDetect/PAC state the user already had — never modifies it.
-			`$proxy = [System.Net.WebRequest]::GetSystemWebProxy();`+
-			`$uri = [Uri]"https://www.microsoft.com";`+
-			`$proxyUri = $proxy.GetProxy($uri);`+
-			`if ($proxyUri -ne $null -and $proxyUri.Host -ne $uri.Host -and `+
-			`-not $proxyUri.Host.StartsWith("127.0.0.1") -and -not $proxyUri.Host.StartsWith("localhost")) `+
-			`{ Write-Output "$($proxyUri.Host):$($proxyUri.Port)"; exit 0 };`+
 			`Write-Output ""`,
 	).Output()
+	if err != nil {
+		return DetectedProxy{Found: false}
+	}
+
+	server := strings.TrimSpace(string(out))
+	if server == "" {
+		return DetectedProxy{Found: false}
+	}
+	return parseProxyServer(server, "windows-registry")
+}
 	if err != nil {
 		return DetectedProxy{Found: false}
 	}
