@@ -84,14 +84,41 @@ func InitPasswordExpiryHandler() {
 }
 
 // findFallbackProxy returns the ID of the first non-expired proxy that has
-// working internet connectivity. Tests each candidate in parallel with a
-// short timeout. Returns empty string if none work.
+// working internet connectivity. Tries the previously-used proxy first,
+// then tests all others in parallel with a 5s timeout.
 func findFallbackProxy(excludeId string) string {
 	proxies, err := configuration.GetProxies()
 	if err != nil || len(proxies) == 0 {
 		return ""
 	}
 
+	// Build a map for quick lookup
+	proxyMap := map[string]map[string]any{}
+	for _, p := range proxies {
+		if id, _ := p["id"].(string); id != "" {
+			proxyMap[id] = p
+		}
+	}
+
+	// Try the previously-used proxy first (highest priority)
+	prevId := configuration.GetPreviousProxyId()
+	if prevId != "" && prevId != excludeId {
+		if p, ok := proxyMap[prevId]; ok && !configuration.CheckPasswordExpiry(p) {
+			parsed, err := adapter.ParseProxy(p)
+			if err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _, testErr := parsed.URLTest(ctx, "http://connectivitycheck.gstatic.com/generate_204")
+				cancel()
+				if testErr == nil {
+					log.Infoln(log.FormatLog(log.ExecutorPrefix, "fallback: previous proxy %v is working"), prevId)
+					return prevId
+				}
+				log.Debugln(log.FormatLog(log.ExecutorPrefix, "fallback: previous proxy %v failed: %v"), prevId, testErr)
+			}
+		}
+	}
+
+	// Test all remaining proxies in parallel
 	type result struct {
 		id    string
 		works bool
@@ -101,7 +128,7 @@ func findFallbackProxy(excludeId string) string {
 	tested := 0
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
-		if id == "" || id == excludeId {
+		if id == "" || id == excludeId || id == prevId {
 			continue
 		}
 		if configuration.CheckPasswordExpiry(p) {
@@ -125,8 +152,6 @@ func findFallbackProxy(excludeId string) string {
 		return ""
 	}
 
-	// Collect results — return the first one that works
-	// Maintain original order preference
 	working := map[string]bool{}
 	for range tested {
 		r := <-results

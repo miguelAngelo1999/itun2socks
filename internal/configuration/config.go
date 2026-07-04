@@ -4,8 +4,9 @@ type Config struct {
 	Proxy         []map[string]any  `json:"proxy"`
 	Subscriptions []SubscriptionCfg `json:"subscriptions,omitempty"`
 	Selected      struct {
-		Proxy string `json:"proxy"`
-		Rule  string `json:"rule"`
+		Proxy         string `json:"proxy"`
+		Rule          string `json:"rule"`
+		PreviousProxy string `json:"previousProxy,omitempty"`
 	} `json:"selected"`
 	Setting       SettingCfg       `json:"setting"`
 	Rules         []string         `json:"rules"`

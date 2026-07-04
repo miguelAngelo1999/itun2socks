@@ -17,6 +17,14 @@ func GetSelectedId(bucket string) (string, error) {
 	return "", fmt.Errorf("error gettting selected id,type:%v err: invalid field", bucket)
 }
 
+func GetPreviousProxyId() string {
+	c, err := Read()
+	if err != nil {
+		return ""
+	}
+	return c.Selected.PreviousProxy
+}
+
 func SetSelectedId(bucket, id string) error {
 	c, err := Read()
 	if err != nil {
@@ -28,6 +36,10 @@ func SetSelectedId(bucket, id string) error {
 	} else if bucket == "proxy" {
 		previousId = c.Selected.Proxy
 		c.Selected.Proxy = id
+		// Track previous proxy for expiry auto-fallback priority
+		if previousId != "" && previousId != id {
+			c.Selected.PreviousProxy = previousId
+		}
 	} else {
 		return fmt.Errorf("error seting selected id,type:%v err: invalid field", bucket)
 	}
