@@ -53,6 +53,7 @@ func main() {
 	log.Infoln(log.FormatLog(log.InitPrefix, "[STARTUP] pid=%d version=%v"), os.Getpid(), constants.Version)
 	configuration.SetConfigFilePath(constants.Path.ConfigFilePath())
 	configuration.Init()
+	executor.InitPasswordExpiryHandler()
 	executor.InitMitm()
 	api.Start(port, secret)
 

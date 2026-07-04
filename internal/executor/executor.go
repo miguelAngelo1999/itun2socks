@@ -8,18 +8,21 @@ import (
 	"runtime"
 	"time"
 
-"github.com/igoogolx/itun2socks/internal/cfg"
+	"github.com/igoogolx/itun2socks/internal/cfg"
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/cfg/local_server"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/dns"
+	"github.com/igoogolx/itun2socks/internal/events"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
 	"github.com/igoogolx/itun2socks/internal/proxy_handler"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
+	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
+	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	"github.com/igoogolx/itun2socks/pkg/sysproxy"
@@ -36,6 +39,99 @@ type Client interface {
 // extractRawInterfaceName delegates to balancer.ExtractRawName.
 func extractRawInterfaceName(name string) string {
 	return balancer.ExtractRawName(name)
+}
+
+// InitPasswordExpiryHandler registers the callback that fires when a timed proxy
+// password expires. If the expired proxy is currently selected, this automatically
+// switches to the first available non-expired proxy so internet is not interrupted.
+func InitPasswordExpiryHandler() {
+	configuration.SetOnPasswordExpired(func(expiredId, _ string) {
+		log.Infoln(log.FormatLog(log.ExecutorPrefix, "proxy password expired: %v"), expiredId)
+
+		// Check if the expired proxy is currently selected
+		selectedId, err := configuration.GetSelectedId("proxy")
+		if err != nil || selectedId != expiredId {
+			// Not selected — just broadcast the event, no switch needed
+			broadcastProxyExpiredEvent(expiredId, "")
+			return
+		}
+
+		// Find the first available proxy that isn't expired
+		fallbackId := findFallbackProxy(expiredId)
+		if fallbackId == "" {
+			log.Warnln(log.FormatLog(log.ExecutorPrefix, "no fallback proxy found after expiry of %v"), expiredId)
+			broadcastProxyExpiredEvent(expiredId, "")
+			return
+		}
+
+		// Switch to the fallback proxy
+		if err := configuration.SetSelectedId("proxy", fallbackId); err != nil {
+			log.Warnln(log.FormatLog(log.ExecutorPrefix, "failed to switch to fallback proxy: %v"), err)
+			broadcastProxyExpiredEvent(expiredId, "")
+			return
+		}
+
+		// If lux is running, hot-swap the active proxy
+		rawProxy, err := configuration.GetProxy(fallbackId)
+		if err == nil {
+			if p, err := adapter.ParseProxy(rawProxy); err == nil {
+				conn.UpdateProxy(p)
+			}
+		}
+
+		log.Infoln(log.FormatLog(log.ExecutorPrefix, "auto-switched from expired proxy %v to %v"), expiredId, fallbackId)
+		broadcastProxyExpiredEvent(expiredId, fallbackId)
+	})
+}
+
+// findFallbackProxy returns the ID of the first non-expired proxy that has a password.
+// Falls back to any available proxy if none have a valid password.
+func findFallbackProxy(excludeId string) string {
+	proxies, err := configuration.GetProxies()
+	if err != nil {
+		return ""
+	}
+	// First pass: prefer proxies with a working password
+	for _, p := range proxies {
+		id, _ := p["id"].(string)
+		if id == "" || id == excludeId {
+			continue
+		}
+		if configuration.CheckPasswordExpiry(p) {
+			continue
+		}
+		// Check if it has a password set
+		for _, field := range []string{"password", "passwd", "auth_str"} {
+			if val, _ := p[field].(string); val != "" {
+				return id
+			}
+		}
+	}
+	// Second pass: any non-expired proxy
+	for _, p := range proxies {
+		id, _ := p["id"].(string)
+		if id == "" || id == excludeId {
+			continue
+		}
+		if !configuration.CheckPasswordExpiry(p) {
+			return id
+		}
+	}
+	return ""
+}
+
+// parseProxyForConn parses a proxy config map into a C.Proxy for conn.UpdateProxy.
+func parseProxyForConn(rawProxy map[string]any) (C.Proxy, error) {
+	return adapter.ParseProxy(rawProxy)
+}
+
+// broadcastProxyExpiredEvent sends a proxy_expired event to all Flutter WebSocket clients.
+func broadcastProxyExpiredEvent(expiredId, fallbackId string) {
+	msg := fmt.Sprintf(
+		`{"type":"proxy_expired","expiredId":"%s","fallbackId":"%s"}`,
+		expiredId, fallbackId,
+	)
+	events.Broadcast([]byte(msg))
 }
 
 // UpdateDns rebuilds DNS resolvers from the current saved config and applies them live.

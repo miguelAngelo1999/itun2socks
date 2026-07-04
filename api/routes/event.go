@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	"github.com/igoogolx/itun2socks/internal/events"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -186,6 +187,20 @@ var hub = newHub()
 
 func init() {
 	go hub.run()
+	// Register the broadcast function so other packages can send events
+	// without importing api/routes (which would create import cycles).
+	events.Register(func(msg []byte) {
+		select {
+		case hub.broadcast <- msg:
+		default:
+		}
+	})
+}
+
+// BroadcastEvent sends a JSON message to all connected Flutter event WebSocket clients.
+// Deprecated: use events.Broadcast() directly to avoid import cycles.
+func BroadcastEvent(msg []byte) {
+	events.Broadcast(msg)
 }
 
 func eventRouter() http.Handler {

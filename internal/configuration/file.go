@@ -152,6 +152,19 @@ func getSudoUser() (int, int) {
 	return uid, gid
 }
 
+// OnPasswordExpiredFunc is called when a timed proxy password expires.
+// proxyId is the expired proxy's ID; fallbackId is the proxy ID that was
+// automatically switched to (empty string if no switch was needed).
+type OnPasswordExpiredFunc func(proxyId, fallbackId string)
+
+var onPasswordExpired OnPasswordExpiredFunc
+
+// SetOnPasswordExpired registers a callback to be called when a proxy password expires.
+// Used by the executor to auto-switch away from the expired proxy and notify Flutter.
+func SetOnPasswordExpired(f OnPasswordExpiredFunc) {
+	onPasswordExpired = f
+}
+
 func fileExists(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
@@ -166,7 +179,7 @@ func Init() {
 	if err := MigrateEncryptPasswords(); err != nil {
 		log.Warnln(log.FormatLog(log.ConfigurationPrefix, "failed to migrate passwords: %v"), err)
 	}
-	if err := ClearExpiredPasswords(); err != nil {
+	if _, err := ClearExpiredPasswords(); err != nil {
 		log.Warnln(log.FormatLog(log.ConfigurationPrefix, "failed to clear expired passwords: %v"), err)
 	}
 	// Background goroutine: check and clear expired timed passwords every minute
@@ -174,8 +187,15 @@ func Init() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := ClearExpiredPasswords(); err != nil {
+			expiredIds, err := ClearExpiredPasswords()
+			if err != nil {
 				log.Warnln(log.FormatLog(log.ConfigurationPrefix, "periodic expiry check failed: %v"), err)
+				continue
+			}
+			for _, id := range expiredIds {
+				if onPasswordExpired != nil {
+					onPasswordExpired(id, "")
+				}
 			}
 		}
 	}()

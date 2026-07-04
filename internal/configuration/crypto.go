@@ -317,28 +317,35 @@ func CheckPasswordExpiry(proxy map[string]any) bool {
 }
 
 // ClearExpiredPasswords checks all proxies and clears expired timed passwords.
-func ClearExpiredPasswords() error {
+// Returns a slice of proxy IDs whose passwords were cleared, so callers can
+// take action (e.g. auto-switch away from the expired proxy).
+func ClearExpiredPasswords() ([]string, error) {
 	config, err := Read()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	changed := false
+	var expiredIds []string
 	for i, proxy := range config.Proxy {
 		if CheckPasswordExpiry(proxy) {
+			id, _ := proxy["id"].(string)
 			for _, field := range passwordFields {
 				config.Proxy[i][field] = ""
 			}
 			delete(config.Proxy[i], "passwordSetAt")
 			config.Proxy[i]["passwordExpired"] = true
-			changed = true
+			if id != "" {
+				expiredIds = append(expiredIds, id)
+			}
 		}
 	}
 
-	if changed {
-		return Write(config)
+	if len(expiredIds) > 0 {
+		if err := Write(config); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return expiredIds, nil
 }
 
 // ClearOneTimePassword clears the password for a specific proxy if it's in one-time mode.
