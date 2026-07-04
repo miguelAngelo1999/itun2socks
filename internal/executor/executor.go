@@ -22,7 +22,6 @@ import (
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
-	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	"github.com/igoogolx/itun2socks/pkg/sysproxy"
@@ -84,14 +83,22 @@ func InitPasswordExpiryHandler() {
 	})
 }
 
-// findFallbackProxy returns the ID of the first non-expired proxy that has a password.
-// Falls back to any available proxy if none have a valid password.
+// findFallbackProxy returns the ID of the first non-expired proxy that has
+// working internet connectivity. Tests each candidate in parallel with a
+// short timeout. Returns empty string if none work.
 func findFallbackProxy(excludeId string) string {
 	proxies, err := configuration.GetProxies()
-	if err != nil {
+	if err != nil || len(proxies) == 0 {
 		return ""
 	}
-	// First pass: prefer proxies with a working password
+
+	type result struct {
+		id    string
+		works bool
+	}
+	results := make(chan result, len(proxies))
+
+	tested := 0
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
 		if id == "" || id == excludeId {
@@ -100,29 +107,42 @@ func findFallbackProxy(excludeId string) string {
 		if configuration.CheckPasswordExpiry(p) {
 			continue
 		}
-		// Check if it has a password set
-		for _, field := range []string{"password", "passwd", "auth_str"} {
-			if val, _ := p[field].(string); val != "" {
-				return id
+		tested++
+		go func(proxy map[string]any, proxyId string) {
+			parsed, err := adapter.ParseProxy(proxy)
+			if err != nil {
+				results <- result{proxyId, false}
+				return
 			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _, err = parsed.URLTest(ctx, "http://connectivitycheck.gstatic.com/generate_204")
+			results <- result{proxyId, err == nil}
+		}(p, id)
+	}
+
+	if tested == 0 {
+		return ""
+	}
+
+	// Collect results — return the first one that works
+	// Maintain original order preference
+	working := map[string]bool{}
+	for range tested {
+		r := <-results
+		if r.works {
+			working[r.id] = true
 		}
 	}
-	// Second pass: any non-expired proxy
+
+	// Return in original proxy list order
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
-		if id == "" || id == excludeId {
-			continue
-		}
-		if !configuration.CheckPasswordExpiry(p) {
+		if working[id] {
 			return id
 		}
 	}
 	return ""
-}
-
-// parseProxyForConn parses a proxy config map into a C.Proxy for conn.UpdateProxy.
-func parseProxyForConn(rawProxy map[string]any) (C.Proxy, error) {
-	return adapter.ParseProxy(rawProxy)
 }
 
 // broadcastProxyExpiredEvent sends a proxy_expired event to all Flutter WebSocket clients.
