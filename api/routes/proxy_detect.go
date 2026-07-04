@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/render"
+	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
 // DetectedProxy holds the result of a network proxy auto-detection probe.
@@ -38,21 +39,20 @@ func detectNetworkProxy() DetectedProxy {
 			return d
 		}
 	} else if runtime.GOOS == "windows" {
-		// Step 1: Internet Explorer/Edge system proxy from registry
-		if d := probeWindowsRegistry(); d.Found {
+		// Step 1: WPAD direct HTTP fetch — most authoritative, reflects current network
+		if d := probeWpad(); d.Found {
 			return d
 		}
 		// Step 2: WinHTTP proxy (set by GPO/DHCP, independent of IE settings)
 		if d := probeNetshWinhttp(); d.Found {
 			return d
 		}
-		// Step 3: WPAD via DNS (using DHCP DNS servers)
+		// Step 3: DNS WPAD via DHCP DNS servers
 		if d := probeWpadViaDhcpDns(); d.Found {
 			return d
 		}
-		// Step 4: Direct WPAD HTTP fetch — works on fresh machines with no proxy configured
-		// as long as the network has wpad DNS entry (most corporate networks do)
-		if d := probeWpad(); d.Found {
+		// Step 4: Saved pre-lux registry value (fallback — may be stale if network changed)
+		if d := probeWindowsRegistry(); d.Found {
 			return d
 		}
 	}
@@ -263,9 +263,13 @@ func testProxyAuth(host, port string) bool {
 
 // GET /proxies/detect
 func detectProxy(w http.ResponseWriter, r *http.Request) {
+	log.Infoln("[DETECT] detectProxy called")
 	result := detectNetworkProxy()
+	log.Infoln("[DETECT] detectNetworkProxy returned found=%v host=%q", result.Found, result.Host)
 	if result.Found && result.Port != "" {
+		log.Infoln("[DETECT] testing proxy auth for %s:%s", result.Host, result.Port)
 		result.NeedsAuth = testProxyAuth(result.Host, result.Port)
+		log.Infoln("[DETECT] needsAuth=%v", result.NeedsAuth)
 	}
 	render.JSON(w, r, result)
 }

@@ -5,11 +5,14 @@ package routes
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"os/exec"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
 // probeWindowsRegistry detects the corporate proxy on Windows.
@@ -20,6 +23,8 @@ import (
 func probeWindowsRegistry() DetectedProxy {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	log.Infoln("[DETECT] starting windows registry probe")
 
 	out, err := exec.CommandContext(ctx, "powershell.exe",
 		"-noprofile", "-NonInteractive", "-command",
@@ -33,6 +38,9 @@ func probeWindowsRegistry() DetectedProxy {
 			`{ Write-Output $k.ProxyServer; exit 0 };`+
 			`Write-Output ""`,
 	).Output()
+
+	log.Infoln("[DETECT] powershell exit err=%v output=%q", err, strings.TrimSpace(string(out)))
+
 	if err != nil {
 		return DetectedProxy{Found: false}
 	}
@@ -41,7 +49,24 @@ func probeWindowsRegistry() DetectedProxy {
 	if server == "" {
 		return DetectedProxy{Found: false}
 	}
-	return parseProxyServer(server, "windows-registry")
+
+	d := parseProxyServer(server, "network")
+	if !d.Found {
+		return d
+	}
+
+	// Verify the proxy is actually reachable before trusting the saved value.
+	// This prevents stale entries (e.g. from a different network) from being used.
+	conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(d.Host, d.Port), 2*time.Second)
+	if dialErr != nil {
+		log.Infoln("[DETECT] saved proxy %s:%s not reachable (%v), clearing and skipping", d.Host, d.Port, dialErr)
+		// Clear the stale saved value so next detection doesn't reuse it
+		_ = exec.Command("reg", "delete", `HKCU\Software\LuxProxy`, "/v", "OriginalProxyServer", "/f").Run()
+		return DetectedProxy{Found: false}
+	}
+	conn.Close()
+	log.Infoln("[DETECT] verified proxy %s:%s is reachable", d.Host, d.Port)
+	return d
 }
 
 // parseProxyServer parses "host:port" or "http=host:port;https=..." into a DetectedProxy.
