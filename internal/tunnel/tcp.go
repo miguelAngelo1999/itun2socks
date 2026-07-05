@@ -66,7 +66,23 @@ func handleTCPConn(ct conn.TcpConnContext) {
 	// Instant failover in NewTcpConn handles dead interfaces — if the dial
 	// fails on the chosen NIC, it retries on the next healthy one.
 	chosenIface := pickInterface()
-	remoteConn, err := conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), chosenIface)
+
+	// Retry the CONNECT tunnel up to 2 times — the upstream proxy may have
+	// dropped an idle keepalive connection. A fresh dial + CONNECT fixes it.
+	var remoteConn net.Conn
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		remoteConn, err = conn.NewTcpConn(ct.Ctx(), metadata, ct.Rule(), chosenIface)
+		if err == nil {
+			break
+		}
+		if attempt < 2 {
+			// "HTTP need auth" (407) or connection refused — retry with same iface
+			log.Warnln(log.FormatLog(log.TcpPrefix,
+				"tcp conn attempt %d failed: %v, remote: %v — retrying"),
+				attempt+1, err, ct.Metadata().RemoteAddress())
+		}
+	}
 	if chosenIface != "" {
 		defer balancer.Release(chosenIface)
 	}

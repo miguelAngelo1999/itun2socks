@@ -117,7 +117,7 @@ func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
 	}
 
 	if resp.StatusCode == http.StatusProxyAuthRequired {
-		return errors.New("HTTP need auth")
+		return errors.New("407 proxy auth required — check proxy username/password")
 	}
 
 	if resp.StatusCode == http.StatusMethodNotAllowed {
