@@ -51,6 +51,12 @@ func main() {
 	log.InitLog()
 	log.Infoln(log.FormatLog(log.InitPrefix, "using config: %v"), constants.Path.ConfigFilePath())
 	log.Infoln(log.FormatLog(log.InitPrefix, "[STARTUP] pid=%d version=%v"), os.Getpid(), constants.Version)
+
+	// Kill any stale lux_core process holding our proxy port before binding.
+	// This prevents "address already in use" when a previous instance wasn't
+	// cleaned up (e.g. killed externally during an update).
+	killStaleLuxCore()
+
 	configuration.SetConfigFilePath(constants.Path.ConfigFilePath())
 	configuration.Init()
 	executor.InitPasswordExpiryHandler()
