@@ -173,12 +173,12 @@ func setSetting(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(rawIfaces) >= 2 {
-			balancer.Configure(rawIfaces, req.LoadBalance.Strategy)
+			balancer.Configure(rawIfaces, req.LoadBalance.Strategy, configuration2.GetProxyProbeTarget())
 		} else {
-			balancer.Configure(nil, "")
+			balancer.Configure(nil, "", "")
 		}
 	} else {
-		balancer.Configure(nil, "")
+		balancer.Configure(nil, "", "")
 	}
 
 	render.NoContent(w, r)

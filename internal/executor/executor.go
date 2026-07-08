@@ -256,13 +256,16 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 				rawIfaces = append(rawIfaces, raw)
 			}
 		}
+		// Use the active upstream proxy as the latency probe target.
+		// Direct probes to 8.8.8.8 fail on corporate networks — the proxy is always reachable.
+		probeTarget := configuration.GetProxyProbeTarget()
 		if len(rawIfaces) >= 2 {
-			balancer.Configure(rawIfaces, setting.LoadBalance.Strategy)
+			balancer.Configure(rawIfaces, setting.LoadBalance.Strategy, probeTarget)
 		} else {
-			balancer.Configure(nil, "")
+			balancer.Configure(nil, "", "")
 		}
 	} else {
-		balancer.Configure(nil, "")
+		balancer.Configure(nil, "", "")
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
@@ -403,3 +406,4 @@ func New() (Client, error) {
 	}
 	return nil, fmt.Errorf("invalid proxy mode: %v", rawConfig.Setting.Mode)
 }
+

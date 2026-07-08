@@ -26,8 +26,15 @@ import (
 
 const (
 	healthCheckInterval = 5 * time.Second
-	latencyTarget       = "8.8.8.8:53"
-	latencyTimeout      = 2 * time.Second
+)
+
+var (
+	// latencyTarget is the TCP endpoint used to measure interface latency.
+	// Set to the upstream proxy address so health checks work on corporate
+	// networks where direct connections to external IPs are blocked.
+	// Updated dynamically by Configure() from the active proxy config.
+	latencyTarget  = ""
+	latencyTimeout = 3 * time.Second
 )
 
 // Strategy constants.
@@ -62,9 +69,16 @@ var (
 
 // Configure initialises the global balancer.
 // strategy should be one of the Strategy* constants; defaults to StrategyLeastConn.
-func Configure(ifaces []string, strategy string) {
+// probeTarget is the TCP host:port used for health/latency checks — should be the
+// upstream proxy address so checks work on corporate networks where 8.8.8.8 is blocked.
+func Configure(ifaces []string, strategy string, probeTarget string) {
 	instMu.Lock()
 	defer instMu.Unlock()
+
+	// Update the latency target if a valid probe address was given
+	if probeTarget != "" {
+		latencyTarget = probeTarget
+	}
 
 	if instance != nil {
 		close(instance.done)
