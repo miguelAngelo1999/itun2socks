@@ -37,6 +37,13 @@ func (e ErrorHandler) NewError(_ context.Context, err error) {
 var monitorCallback *list.Element[tun.DefaultInterfaceUpdateCallback]
 
 func StartMonitor() error {
+	// Stop any existing monitor before starting a new one.
+	// Prevents resource leaks and conflicts when StartMonitor is called
+	// repeatedly after connectivity blips or lux_core restarts.
+	if networkUpdateMonitor != nil || defaultInterfaceMonitor != nil {
+		_ = StopMonitor()
+	}
+
 	setting, err := configuration.GetSetting()
 	if err != nil {
 		return err

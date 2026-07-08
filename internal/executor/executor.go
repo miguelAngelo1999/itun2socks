@@ -213,14 +213,20 @@ func UpdateRule() (string, error) {
 // This handles the "set IPv4 address: The object already exists" error
 // that occurs when a previous lux_core was killed without proper cleanup.
 func cleanupTunAdapter(name string) {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS == "windows" {
+		// Remove the stale interface IP assignment on Windows
+		_ = exec.Command("netsh", "interface", "ip", "delete", "address",
+			name, "10.255.0.1").Run()
+		time.Sleep(200 * time.Millisecond)
 		return
 	}
-	// Remove the stale interface IP assignment
-	_ = exec.Command("netsh", "interface", "ip", "delete", "address",
-		name, "10.255.0.1").Run()
-	// Brief pause for the OS to release the adapter state
-	time.Sleep(200 * time.Millisecond)
+	if runtime.GOOS == "darwin" {
+		// On macOS, destroy any stale utun adapter with this name.
+		// A hard-killed lux_core can leave the utun device in a half-open state
+		// which causes "device or resource busy" or "address already in use" on restart.
+		_ = exec.Command("ifconfig", name, "destroy").Run()
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func newTun(isLocalServerEnabled bool) (*TunClient, error) {
