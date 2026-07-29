@@ -143,9 +143,38 @@ func Set(addr string, activeInterface string) error {
 	}
 	services := getAllNetworkServices()
 	if len(services) == 0 {
+		// Guard: don't clobber an existing non-localhost upstream
+		if existingHost, _, enabled, e := getWebProxy(); e == nil && enabled &&
+			existingHost != "" && existingHost != "127.0.0.1" && existingHost != "localhost" {
+			return nil
+		}
 		return SetWebProxy(host, port, activeInterface)
 	}
 	for _, svc := range services {
+		// Guard: if this service already has a non-localhost proxy set (e.g. Preproxy's
+		// upstream), don't overwrite it. Lux's TUN layer intercepts traffic at the
+		// network level and doesn't require the system proxy to be set to itself.
+		if out, e := exec.Command("networksetup", "-getwebproxy", svc).Output(); e == nil {
+			lines := strings.Split(string(out), "\n")
+			var existHost string
+			var existEnabled bool
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "Server:") {
+					existHost = strings.TrimSpace(strings.TrimPrefix(line, "Server:"))
+				}
+				if strings.Contains(strings.ToLower(line), "enabled: yes") {
+					existEnabled = true
+				}
+			}
+			if existEnabled && existHost != "" &&
+				existHost != "127.0.0.1" && existHost != "localhost" {
+				// A real upstream proxy is already set — leave it alone and skip this service.
+				// Save state so Clear() can still restore correctly if called.
+				saveOriginalState(svc)
+				continue
+			}
+		}
 		// Save original state BEFORE changing anything
 		saveOriginalState(svc)
 		// Set Lux proxy
