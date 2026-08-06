@@ -340,7 +340,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}
 		return
 	}
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule)
+	tracker := statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule)
+	remoteConn = tracker
 	defer remoteConn.Close()
 
 	switch true {
@@ -367,7 +368,30 @@ func handleTCPConn(connCtx C.ConnContext) {
 		)
 	}
 
+	connStart := time.Now()
 	handleSocket(connCtx, remoteConn)
+
+	// Log connection result after relay completes
+	duration := time.Since(connStart)
+	up := tracker.UploadTotal.Load()
+	down := tracker.DownloadTotal.Load()
+	via := "DIRECT"
+	switch true {
+	case metadata.SpecialProxy != "":
+		via = metadata.SpecialProxy
+	case rule != nil:
+		via = remoteConn.Chains().String()
+	case mode == Global:
+		via = "GLOBAL"
+	}
+	log.Debugln("[TCP] %s --> %s via %s done — %dms ↑%dB ↓%dB",
+		metadata.SourceAddress(),
+		metadata.RemoteAddress(),
+		via,
+		duration.Milliseconds(),
+		up,
+		down,
+	)
 }
 
 func shouldResolveIP(rule C.Rule, metadata *C.Metadata) bool {
