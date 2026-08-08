@@ -40,10 +40,50 @@ func RejectQuicMather(metadata *C.Metadata, prevRule rule_engine.Rule) (rule_eng
 func UpdateProxy(remoteProxy C.Proxy) {
 	mux.Lock()
 	defer mux.Unlock()
-	proxies = make(map[constants.Policy]C.Proxy)
+	named := make(map[constants.Policy]C.Proxy, len(namedProxies))
+	for k, v := range namedProxies {
+		named[k] = v
+	}
+	proxies = named
 	proxies[constants.PolicyProxy] = remoteProxy
 	proxies[constants.PolicyDirect] = adapter.NewProxy(outbound.NewDirect())
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
+}
+
+// namedProxies holds dialers for proxies addressable by id, so a rule can route
+// to one specific proxy rather than whichever is currently selected.
+//
+// Kept separate from proxies because UpdateProxy rebuilds that map whenever the
+// selected proxy changes, and the named set must survive that.
+var namedProxies = map[constants.Policy]C.Proxy{}
+
+// UpdateNamedProxies replaces the set of individually addressable proxies.
+// Keys are proxy ids; a rule whose policy is that id dials through it.
+func UpdateNamedProxies(byId map[string]C.Proxy) {
+	mux.Lock()
+	defer mux.Unlock()
+	namedProxies = make(map[constants.Policy]C.Proxy, len(byId))
+	for id, p := range byId {
+		if constants.IsBuiltInPolicy(constants.Policy(id)) {
+			// A proxy id colliding with a built-in policy name would shadow it.
+			log.Warnln(log.FormatLog(log.ConfigurationPrefix,
+				"ignoring proxy id %q: it collides with a built-in policy"), id)
+			continue
+		}
+		namedProxies[constants.Policy(id)] = p
+		proxies[constants.Policy(id)] = p
+	}
+}
+
+// NamedProxyIds lists the ids currently dialable, for validating rules.
+func NamedProxyIds() []string {
+	mux.RLock()
+	defer mux.RUnlock()
+	ids := make([]string, 0, len(namedProxies))
+	for k := range namedProxies {
+		ids = append(ids, string(k))
+	}
+	return ids
 }
 
 func GetProxy(rule constants.Policy) (C.Proxy, error) {

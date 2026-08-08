@@ -16,7 +16,9 @@ import (
 	"github.com/igoogolx/itun2socks/internal/matcher"
 	"github.com/igoogolx/itun2socks/internal/proxy_handler"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
+	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
 	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
+	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	sTun "github.com/sagernet/sing-tun"
@@ -29,23 +31,70 @@ type Client interface {
 	RuntimeDetail(hubAddress string) (any, error)
 }
 
+// UpdateRule rebuilds the rule engine from the store.
+//
+// Rules come from configuration.EffectiveRules, which flattens groups in order
+// and omits rules that are disabled, in a disabled group, or broken. Reading
+// Config.Rules here instead would reintroduce the flat representation whose
+// "#" prefixes and string identity this rewrite removed.
 func UpdateRule() (string, error) {
-	rawConfig, err := configuration.Read()
-	if err != nil {
-		return "", err
-	}
 	selectedRule, err := configuration.GetSelectedRule()
 	if err != nil {
 		return "", err
 	}
-	rEngine, err := rule_engine.New(selectedRule, rawConfig.Rules)
+
+	effective, err := configuration.EffectiveRules()
+	if err != nil {
+		return "", err
+	}
+
+	// Named proxies must be declared to the parser, or a rule targeting one is
+	// discarded as having an unknown policy.
+	knownProxyIds, err := configuration.KnownProxyIds()
+	if err != nil {
+		return "", err
+	}
+
+	raw := make([]string, 0, len(effective))
+	for _, r := range effective {
+		if v := r.RawValue(); v != "" {
+			raw = append(raw, v)
+		}
+	}
+
+	rEngine, err := rule_engine.NewWithPolicies(selectedRule, raw, knownProxyIds)
 	if err != nil {
 		return "", err
 	}
 	matcher.UpdateRuleEngine(rEngine)
-	log.Infoln(log.FormatLog(log.ExecutorPrefix, "update rule: %v"), selectedRule)
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "update rule: %v (%d active rules)"), selectedRule, len(raw))
 	dns.ResetCache()
 	return selectedRule, nil
+}
+
+// updateNamedProxies registers every configured proxy as individually dialable,
+// so a rule whose policy is a proxy id can route through it.
+func updateNamedProxies() {
+	rawConfig, err := configuration.Read()
+	if err != nil {
+		log.Warnln(log.FormatLog(log.ExecutorPrefix, "cannot read config to register named proxies: %v"), err)
+		return
+	}
+	byId := make(map[string]C.Proxy, len(rawConfig.Proxy))
+	for _, rawProxy := range rawConfig.Proxy {
+		id := fmt.Sprint(rawProxy["id"])
+		if id == "" || id == "<nil>" {
+			continue
+		}
+		p, err := adapter.ParseProxy(rawProxy)
+		if err != nil {
+			log.Warnln(log.FormatLog(log.ExecutorPrefix, "cannot dial proxy %v: %v"), id, err)
+			continue
+		}
+		byId[id] = p
+	}
+	conn.UpdateNamedProxies(byId)
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "registered %d named proxies"), len(byId))
 }
 
 func newTun(isLocalServerEnabled bool) (*TunClient, error) {
@@ -107,6 +156,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	tunnel.UpdateShouldFindProcess(config.ShouldFindProcess)
 	conn.UpdateConnMatcher(matchers)
 	conn.UpdateIsFakeIpEnabled(config.FakeIp)
+	updateNamedProxies()
 	conn.UpdateProxy(config.Proxy)
 
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())
@@ -136,6 +186,7 @@ func newSysProxy() (*SystemProxyClient, error) {
 	conn.UpdateConnMatcher([]conn.Matcher{
 		config.Rule.ConnMatcher,
 	})
+	updateNamedProxies()
 	conn.UpdateProxy(config.Proxy)
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())
 	_, err = UpdateRule()
