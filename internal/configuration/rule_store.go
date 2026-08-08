@@ -734,6 +734,14 @@ func indexOfGroup(c Config, id string) int {
 	return -1
 }
 
+func sortGroupsByOrder(groups []RuleGroup) {
+	sort.SliceStable(groups, func(i, j int) bool { return groups[i].Order < groups[j].Order })
+}
+
+func sortRulesByOrder(rules []RuleItem) {
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Order < rules[j].Order })
+}
+
 func maxOrderInGroup(c Config, groupId string) int {
 	max := -1
 	for _, r := range c.CustomizedRules {

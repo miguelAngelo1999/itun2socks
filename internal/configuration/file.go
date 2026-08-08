@@ -139,6 +139,12 @@ func fileExists(filename string) bool {
 // Init performs one-time initialization including encrypting any plaintext passwords
 // and clearing expired timed passwords.
 func Init() {
+	// Rules migrate before anything reads them, so the engine is only ever built
+	// from the structured store. A failure here is logged rather than fatal: the
+	// legacy Rules field is still intact, so the app stays usable.
+	if err := MigrateRules(); err != nil {
+		log.Warnln(log.FormatLog(log.ConfigurationPrefix, "failed to migrate rules: %v"), err)
+	}
 	if err := MigrateEncryptPasswords(); err != nil {
 		log.Warnln(log.FormatLog(log.ConfigurationPrefix, "failed to migrate passwords: %v"), err)
 	}
