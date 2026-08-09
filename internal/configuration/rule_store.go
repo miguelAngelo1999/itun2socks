@@ -158,7 +158,12 @@ func PolicyLabel(p RulePolicy, c Config) string {
 		if name := proxyNameById(c, p.ProxyId); name != "" {
 			return name
 		}
-		return "<missing proxy>"
+		// The proxy is gone. Report the id that was targeted rather than a
+		// placeholder, so the label still says which proxy is missing.
+		if p.ProxyId != "" {
+			return p.ProxyId
+		}
+		return "unknown"
 	default:
 		return "PROXY"
 	}
