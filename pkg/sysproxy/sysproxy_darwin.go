@@ -38,24 +38,66 @@ type proxySettings struct {
 	enabled bool
 }
 
+// resolveServiceName returns the network service name to hand to networksetup.
+//
+// networksetup addresses a *service* ("Wi-Fi"), not a device ("en0"), and
+// rejects anything else:
+//
+//	networksetup -setwebproxy en0   -> "** Error: The parameters were not valid." exit 4
+//	networksetup -setwebproxy Wi-Fi -> exit 0
+//
+// Callers pass Setting.HijackDns.NetworkService, which is empty unless the user
+// configured DNS hijacking, and may hold a device name. Either way networksetup
+// exits 4, which surfaced as the opaque "fail to start the client: exit status 4"
+// with no indication of the cause. Resolving it here fixes every caller.
+func resolveServiceName(activeInterface string) (string, error) {
+	candidate := strings.TrimSpace(activeInterface)
+
+	// A device name is not usable, and neither is an empty string. In both cases
+	// derive the service from the current default route.
+	if candidate == "" || looksLikeDeviceName(candidate) {
+		resolved, err := getActiveNetworkInterface()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine the active network service: %w", err)
+		}
+		return resolved, nil
+	}
+	return candidate, nil
+}
+
+// looksLikeDeviceName reports whether s is a BSD interface name such as en0 or
+// utun3, rather than a service name such as "Wi-Fi".
+func looksLikeDeviceName(s string) bool {
+	return regexp.MustCompile(`^(en|utun|bridge|awdl|llw|ap|gif|stf|anpi)\d+$`).MatchString(s)
+}
+
 func SetWebProxy(host string, port string, activeInterface string) error {
-	// Set the web proxy and secure web proxy
-	if err := setProxySettings(proxyTypeHTTP, activeInterface, host, port); err != nil {
+	service, err := resolveServiceName(activeInterface)
+	if err != nil {
 		return err
 	}
-	if err := setProxySettings(proxyTypeHTTPS, activeInterface, host, port); err != nil {
+
+	// Set the web proxy and secure web proxy
+	if err := setProxySettings(proxyTypeHTTP, service, host, port); err != nil {
+		return fmt.Errorf("set http proxy on %q: %w", service, err)
+	}
+	if err := setProxySettings(proxyTypeHTTPS, service, host, port); err != nil {
 		// revert previous changes
-		return err
+		return fmt.Errorf("set https proxy on %q: %w", service, err)
 	}
 
 	return nil
 }
 
 func DisableWebProxy(activeInterface string) error {
+	service, err := resolveServiceName(activeInterface)
+	if err != nil {
+		return err
+	}
 
 	// disable the web proxy and secure web proxy
-	errHTTP := disableProxy(proxyTypeHTTP, activeInterface)
-	errHTTPs := disableProxy(proxyTypeHTTPS, activeInterface)
+	errHTTP := disableProxy(proxyTypeHTTP, service)
+	errHTTPs := disableProxy(proxyTypeHTTPS, service)
 
 	return errors.Join(errHTTP, errHTTPs)
 }

@@ -59,6 +59,11 @@ var namedProxies = map[constants.Policy]C.Proxy{}
 
 // UpdateNamedProxies replaces the set of individually addressable proxies.
 // Keys are proxy ids; a rule whose policy is that id dials through it.
+//
+// Safe to call before UpdateProxy. The live map is only touched when it already
+// exists; otherwise the named set is recorded and UpdateProxy folds it in. This
+// ordering matters because the executor registers named proxies while building
+// the tunnel, which happens before the selected proxy is installed.
 func UpdateNamedProxies(byId map[string]C.Proxy) {
 	mux.Lock()
 	defer mux.Unlock()
@@ -71,7 +76,9 @@ func UpdateNamedProxies(byId map[string]C.Proxy) {
 			continue
 		}
 		namedProxies[constants.Policy(id)] = p
-		proxies[constants.Policy(id)] = p
+		if proxies != nil {
+			proxies[constants.Policy(id)] = p
+		}
 	}
 }
 
