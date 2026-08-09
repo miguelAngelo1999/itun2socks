@@ -11,37 +11,61 @@ import (
 
 var DefaultManager *Manager
 
-func init() {
-	cache, err := lru.NewWithEvict[string, tracker](256, func(key string, value tracker) {
-		log.Debugln("%s", log.FormatLog(log.CachePrefix, "close connection on evicted"))
-		err := value.Close()
-		if err != nil {
-			log.Warnln(log.FormatLog(log.CachePrefix, "fail to close connection on evicted, err: %v"), err)
-			return
-		}
+// Upper bound on tracked connections.
+//
+// This is a display and statistics view, not a connection owner, so the bound
+// only caps memory. It was 256, which on a busy machine is exceeded routinely.
+const maxTrackedConnections = 4096
+
+// newManager builds a Manager whose connection cache never closes what it drops.
+//
+// The eviction callback used to call value.Close(), which was wrong twice over:
+//
+//   - Leave calls Remove, and golang-lru fires the eviction callback on Remove
+//     just as it does on overflow, so every ordinary teardown closed the socket a
+//     second time. That is the source of the constant "fail to close remote tcp
+//     conn: use of closed network connection" noise.
+//
+//   - On overflow it terminated a connection that was still in use. A tracker's
+//     LRU position is only refreshed when bytes move, in PushUploaded and
+//     PushDownloaded, so a streaming response sitting idle between chunks drifts
+//     to the tail. Once enough new connections arrive it is evicted and closed
+//     mid-response. To the application the request simply hangs, with nothing
+//     logged as an error.
+//
+// Connections are closed by whoever owns them, and that path calls Leave to stop
+// tracking. Eviction now only forgets.
+func newManager(size int) (*Manager, error) {
+	cache, err := lru.NewWithEvict[string, tracker](size, func(key string, _ tracker) {
+		log.Debugln("%s", log.FormatLog(log.CachePrefix, "stopped tracking connection "+key))
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{
+		connections: cache,
+		proxy:       newStatistic(),
+		direct:      newStatistic(),
+	}, nil
+}
+
+func newStatistic() *Statistic {
+	return &Statistic{
+		uploadTemp:    atomic.NewInt64(0),
+		downloadTemp:  atomic.NewInt64(0),
+		uploadBlip:    atomic.NewInt64(0),
+		downloadBlip:  atomic.NewInt64(0),
+		uploadTotal:   atomic.NewInt64(0),
+		downloadTotal: atomic.NewInt64(0),
+	}
+}
+
+func init() {
+	m, err := newManager(maxTrackedConnections)
 	if err != nil {
 		log.Fatalln(log.FormatLog(log.CachePrefix, "fail to init cache in statistic, err: %v"), err)
 	}
-	DefaultManager = &Manager{
-		connections: cache,
-		proxy: &Statistic{
-			uploadTemp:    atomic.NewInt64(0),
-			downloadTemp:  atomic.NewInt64(0),
-			uploadBlip:    atomic.NewInt64(0),
-			downloadBlip:  atomic.NewInt64(0),
-			uploadTotal:   atomic.NewInt64(0),
-			downloadTotal: atomic.NewInt64(0),
-		},
-		direct: &Statistic{
-			uploadTemp:    atomic.NewInt64(0),
-			downloadTemp:  atomic.NewInt64(0),
-			uploadBlip:    atomic.NewInt64(0),
-			downloadBlip:  atomic.NewInt64(0),
-			uploadTotal:   atomic.NewInt64(0),
-			downloadTotal: atomic.NewInt64(0),
-		},
-	}
+	DefaultManager = m
 
 	go DefaultManager.handle(constants.PolicyProxy)
 	go DefaultManager.handle(constants.PolicyDirect)
