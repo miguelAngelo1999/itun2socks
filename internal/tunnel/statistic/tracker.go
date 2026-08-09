@@ -60,6 +60,22 @@ func (tt *TcpTracker) Close() error {
 	return tt.Conn.Close()
 }
 
+// CloseWrite forwards a half-close to the connection underneath.
+//
+// The embedded field is a net.Conn, whose method set has no CloseWrite, so
+// wrapping a connection in a tracker used to hide the capability. The relay tests
+// for it with an interface assertion and silently falls back to a full close when
+// it is absent, which turns "I have finished sending" into "I have hung up" and
+// cuts off a response that was still arriving.
+func (tt *TcpTracker) CloseWrite() error {
+	if cw, ok := tt.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	// Nothing to forward to. Report success rather than closing the whole
+	// connection, which is what the caller would do with an error.
+	return nil
+}
+
 func NewTCPTracker(conn net.Conn, manager *Manager, metadata *C.Metadata, rule rule_engine.Rule) *TcpTracker {
 	uid, _ := uuid.NewV4()
 
