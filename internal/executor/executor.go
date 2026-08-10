@@ -14,6 +14,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/proxy_handler"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
@@ -229,6 +230,11 @@ func New() (Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Seed the user's PAC URL before any client starts, so the first PAC apply
+	// sees it rather than falling back to WPAD detection on the first run.
+	pac.SetUserURL(rawConfig.Setting.PacUrl)
+
 	if rawConfig.Setting.Mode == "tun" {
 		return newTun(true)
 	}

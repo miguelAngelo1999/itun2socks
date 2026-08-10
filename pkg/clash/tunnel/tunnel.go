@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/igoogolx/itun2socks/internal/conn"
+	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/inbound"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/nat"
 	P "github.com/igoogolx/itun2socks/pkg/clash/component/process"
@@ -340,7 +343,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}
 		return
 	}
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule)
+	tracker := statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule)
+	remoteConn = tracker
 	defer remoteConn.Close()
 
 	switch true {
@@ -367,7 +371,30 @@ func handleTCPConn(connCtx C.ConnContext) {
 		)
 	}
 
+	connStart := time.Now()
 	handleSocket(connCtx, remoteConn)
+
+	// Log the outcome once the relay finishes. The line above says which route was
+	// chosen; this one says whether anything actually moved, which is the
+	// difference between a working route and one that merely resolved.
+	duration := time.Since(connStart)
+	via := "DIRECT"
+	switch true {
+	case metadata.SpecialProxy != "":
+		via = metadata.SpecialProxy
+	case rule != nil:
+		via = remoteConn.Chains().String()
+	case mode == Global:
+		via = "GLOBAL"
+	}
+	log.Debugln("[TCP] %s --> %s via %s done - %dms up=%dB down=%dB",
+		metadata.SourceAddress(),
+		metadata.RemoteAddress(),
+		via,
+		duration.Milliseconds(),
+		tracker.UploadTotal.Load(),
+		tracker.DownloadTotal.Load(),
+	)
 }
 
 func shouldResolveIP(rule C.Rule, metadata *C.Metadata) bool {
@@ -429,5 +456,40 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 		}
 	}
 
+	// Nothing matched. Falling straight to DIRECT here sent every unmatched
+	// destination out unproxied, because the clash proxies map is never populated
+	// from the selected proxy: tunnel.UpdateProxies is never called, so
+	// proxies["DIRECT"] was the only entry that ever resolved.
+	//
+	// Order of precedence:
+	//   1. custom rules, evaluated in the loop above
+	//   2. PAC, which is authoritative about internal hosts and exceptions
+	//   3. the configured upstream proxy
+	//   4. DIRECT, only when no proxy is configured
+	//
+	// PAC sits below explicit rules and above the default: a rule the user wrote
+	// should beat the corporate script, but the script knows which hosts must not
+	// be proxied, and that has to win over a blanket "proxy everything".
+	if pac.IsJSEvalActive() {
+		host := metadata.Host
+		if host == "" && metadata.DstIP != nil {
+			host = metadata.DstIP.String()
+		}
+		scheme := "https"
+		if metadata.NetWork == C.UDP {
+			scheme = "udp"
+		}
+		url := fmt.Sprintf("%s://%s", scheme, metadata.RemoteAddress())
+		if pac.IsDirectResult(pac.EvalForURL(url, host)) {
+			return proxies["DIRECT"], nil, nil
+		}
+		// PROXY, or a result we cannot interpret: fall through to the configured
+		// proxy rather than guessing DIRECT.
+	}
+
+	// Set by the executor through conn.UpdateProxy.
+	if proxyAdapter, err := conn.GetProxy(constants.PolicyProxy); err == nil && proxyAdapter != nil {
+		return proxyAdapter, nil, nil
+	}
 	return proxies["DIRECT"], nil, nil
 }

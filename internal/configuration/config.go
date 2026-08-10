@@ -140,6 +140,15 @@ type SettingCfg struct {
 	AutoConnect       bool   `json:"autoConnect,omitempty"`
 	AutoLaunch        bool   `json:"autoLaunch,omitempty"`
 	SensitiveInfoMode bool   `json:"sensitiveInfoMode,omitempty"`
+
+	// PacUrl points at a proxy auto-config script. When set it takes priority
+	// over WPAD auto-detection, which is what a network hands out via DHCP option
+	// 252 on macOS or AutoConfigURL in the registry on Windows.
+	//
+	// PAC decides between DIRECT and the configured proxy for destinations no
+	// custom rule matched. Empty means auto-detect, and failing that, route
+	// unmatched traffic to the configured proxy.
+	PacUrl string `json:"pacUrl,omitempty"`
 }
 
 type DnsServer struct {
