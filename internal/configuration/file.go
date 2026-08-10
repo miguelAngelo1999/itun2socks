@@ -43,6 +43,17 @@ func Read() (Config, error) {
 		config.Proxy[i] = decryptProxyPasswords(proxy)
 	}
 
+	// Derive the broken flag on every read instead of trusting what is on disk.
+	//
+	// Broken is computed state: it means "the proxy this rule targets is gone".
+	// It was only recomputed when rules were mutated, so a rule marked broken
+	// once stayed broken forever, and effectiveFrom skips broken rules outright.
+	// Three live rules targeting an existing proxy were excluded from evaluation
+	// for exactly this reason -- their flag was written during migration, before
+	// the proxy id could be resolved, and nothing ever revisited it. Their
+	// traffic silently fell through to the default policy instead.
+	markBroken(config)
+
 	return *config, nil
 }
 
