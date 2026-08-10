@@ -3,16 +3,13 @@ package executor
 import (
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
-	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/iface"
-	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	sTun "github.com/sagernet/sing-tun"
 )
@@ -83,65 +80,11 @@ func (c *TunClient) Start() error {
 		}
 	}
 
-	// Apply PAC in the background: fetching and compiling it talks to the network,
-	// and blocking Start on that would delay the tunnel coming up, or fail it
-	// outright on a network that serves no PAC. Until it lands, unmatched traffic
-	// goes to the configured proxy, which is the safe default.
-	go detectAndApplyPac()
-
-	// Networks change their PAC script, so re-fetch periodically rather than
-	// trusting the copy taken at connect time.
-	pac.StartRefreshLoop(30 * time.Minute)
-
 	return nil
-}
-
-// applyMu keeps concurrent PAC applies from interleaving; Start and the refresh
-// loop can both trigger one.
-var applyMu sync.Mutex
-
-// detectAndApplyPac resolves which PAC script to use and compiles it.
-//
-// A user-configured URL wins outright. Otherwise WPAD detection is tried, and if
-// nothing turns up PAC stays inactive, which leaves the routing fallback to send
-// unmatched traffic to the configured proxy.
-func detectAndApplyPac() {
-	if !applyMu.TryLock() {
-		log.Debugln("[pac] apply already running, skipping")
-		return
-	}
-	defer applyMu.Unlock()
-
-	if userURL := pac.GetUserURL(); userURL != "" {
-		if _, err := pac.Apply(userURL); err != nil {
-			// Keep whatever was compiled before. Clearing on a transient fetch
-			// failure would silently widen routing to "proxy everything".
-			log.Warnln("[pac] configured PAC %s unreachable (%v), keeping previous rules", userURL, err)
-		}
-		return
-	}
-
-	pacURL := pac.ProbeWPADUrl()
-	if pacURL == "" {
-		log.Debugln("[pac] no PAC URL advertised on this network")
-		return
-	}
-	if _, err := pac.Apply(pacURL); err != nil {
-		log.Warnln("[pac] auto-detected PAC %s failed: %v", pacURL, err)
-		pac.Clear()
-		return
-	}
-	log.Infoln("[pac] applied auto-detected PAC from %s", pacURL)
 }
 
 func (c *TunClient) Close() error {
 	var err error
-
-	// Drop PAC state on disconnect. Leaving compiled rules behind would let a
-	// stale script decide routing on the next network, which may have a different
-	// one or none at all.
-	pac.StopRefreshLoop()
-	pac.Clear()
 
 	if c.config.HijackDns.Enabled {
 		err := dns.Resume(c.config.HijackDns.NetworkService, c.config.HijackDns.AlwaysReset)
