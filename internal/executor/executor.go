@@ -14,6 +14,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/proxy_handler"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
@@ -95,6 +96,13 @@ func updateNamedProxies() {
 	}
 	conn.UpdateNamedProxies(byId)
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "registered %d named proxies"), len(byId))
+
+	// Populate the per-proxy PAC registry from any proxy that declares a pacUrl.
+	pac.DefaultRegistry.Update(rawConfig.Proxy, "")
+
+	// Store the selected proxy id so the PAC hook in NewTcpConn can look up its
+	// PAC even when the policy is the generic PolicyProxy constant.
+	conn.UpdateSelectedProxyId(rawConfig.Selected.Proxy)
 }
 
 func newTun(isLocalServerEnabled bool) (*TunClient, error) {

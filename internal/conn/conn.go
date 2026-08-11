@@ -50,6 +50,25 @@ func UpdateProxy(remoteProxy C.Proxy) {
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
 }
 
+// selectedProxyId is the id of the currently selected proxy, so per-proxy PAC
+// can be applied even when the rule matched PolicyProxy rather than a specific id.
+var selectedProxyId string
+
+// UpdateSelectedProxyId stores the id of the current selected proxy.
+// Called by the executor alongside UpdateProxy.
+func UpdateSelectedProxyId(id string) {
+	mux.Lock()
+	defer mux.Unlock()
+	selectedProxyId = id
+}
+
+// GetSelectedProxyId returns the current selected proxy's id.
+func GetSelectedProxyId() string {
+	mux.RLock()
+	defer mux.RUnlock()
+	return selectedProxyId
+}
+
 // namedProxies holds dialers for proxies addressable by id, so a rule can route
 // to one specific proxy rather than whichever is currently selected.
 //

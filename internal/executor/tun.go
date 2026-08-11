@@ -3,11 +3,13 @@ package executor
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/iface"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
@@ -80,11 +82,18 @@ func (c *TunClient) Start() error {
 		}
 	}
 
+	// Start the PAC refresh loop so per-proxy PAC scripts stay current.
+	pac.DefaultRegistry.StartRefreshLoop(30*time.Minute, "")
+
 	return nil
 }
 
 func (c *TunClient) Close() error {
 	var err error
+
+	// Stop PAC refresh and clear the registry on disconnect.
+	pac.DefaultRegistry.StopRefreshLoop()
+	pac.DefaultRegistry.Clear()
 
 	if c.config.HijackDns.Enabled {
 		err := dns.Resume(c.config.HijackDns.NetworkService, c.config.HijackDns.AlwaysReset)
