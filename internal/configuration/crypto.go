@@ -327,8 +327,8 @@ func ClearExpiredPasswords() error {
 		if err := Write(config); err != nil {
 			return err
 		}
-		// Notify connected clients that credentials expired so the UI can prompt
-		// for re-authentication rather than silently losing connectivity.
+		// Try to failover to another proxy that still has credentials.
+		// Only prompt the user if ALL proxies are exhausted.
 		expiredIds := []string{}
 		for _, proxy := range config.Proxy {
 			if expired, _ := proxy["passwordExpired"].(bool); expired {
@@ -338,7 +338,12 @@ func ClearExpiredPasswords() error {
 			}
 		}
 		if len(expiredIds) > 0 {
-			NotifyCredentialExpired(expiredIds)
+			// Attempt failover: find a proxy with valid credentials and switch to it.
+			failedOver := tryFailoverProxy(config, expiredIds)
+			if !failedOver && NotifyCredentialExpired != nil {
+				// All proxies exhausted — tell the UI to prompt for new creds.
+				NotifyCredentialExpired(expiredIds)
+			}
 		}
 		return nil
 	}

@@ -28,4 +28,10 @@ func init() {
 			"proxyIds": proxyIds,
 		})
 	}
+	configuration.NotifyProxySwitch = func(proxyId, proxyName string) {
+		BroadcastEvent("proxy-switch", map[string]any{
+			"proxyId": proxyId,
+			"name":    proxyName,
+		})
+	}
 }

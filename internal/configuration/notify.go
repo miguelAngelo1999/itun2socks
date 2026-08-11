@@ -7,3 +7,8 @@ package configuration
 //
 // If nil (e.g. in tests), the expiry is still processed but no event is emitted.
 var NotifyCredentialExpired func(proxyIds []string)
+
+// NotifyProxySwitch is set by the API layer to broadcast a proxy-switch event
+// when failover selects a different proxy. Informational — the UI can show a
+// toast rather than requiring user action.
+var NotifyProxySwitch func(proxyId, proxyName string)
