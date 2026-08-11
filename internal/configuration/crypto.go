@@ -324,7 +324,23 @@ func ClearExpiredPasswords() error {
 	}
 
 	if changed {
-		return Write(config)
+		if err := Write(config); err != nil {
+			return err
+		}
+		// Notify connected clients that credentials expired so the UI can prompt
+		// for re-authentication rather than silently losing connectivity.
+		expiredIds := []string{}
+		for _, proxy := range config.Proxy {
+			if expired, _ := proxy["passwordExpired"].(bool); expired {
+				if id, ok := proxy["id"].(string); ok {
+					expiredIds = append(expiredIds, id)
+				}
+			}
+		}
+		if len(expiredIds) > 0 {
+			NotifyCredentialExpired(expiredIds)
+		}
+		return nil
 	}
 	return nil
 }
