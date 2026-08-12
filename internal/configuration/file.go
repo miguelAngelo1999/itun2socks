@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/igoogolx/itun2socks/internal/blackbox"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"go.uber.org/atomic"
 )
@@ -150,6 +151,9 @@ func fileExists(filename string) bool {
 // Init performs one-time initialization including encrypting any plaintext passwords
 // and clearing expired timed passwords.
 func Init() {
+	// Initialize the blackbox incident recorder so it can persist events.
+	blackbox.Init()
+
 	// Rules migrate before anything reads them, so the engine is only ever built
 	// from the structured store. A failure here is logged rather than fatal: the
 	// legacy Rules field is still intact, so the app stays usable.

@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/igoogolx/itun2socks/internal/blackbox"
 )
 
 const encPrefix = "enc:"
@@ -338,6 +340,7 @@ func ClearExpiredPasswords() error {
 			}
 		}
 		if len(expiredIds) > 0 {
+			blackbox.CredentialExpired(expiredIds)
 			// Attempt failover: find a proxy with valid credentials and switch to it.
 			failedOver := tryFailoverProxy(config, expiredIds)
 			if !failedOver && NotifyCredentialExpired != nil {

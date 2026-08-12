@@ -91,6 +91,7 @@ func Start(addr string, secret string) error {
 		r.Mount("/manager", managerRouter())
 		r.Mount("/is-admin", isAdminRouter())
 		r.Mount("/heartbeat", heartbeatRouter())
+		r.Mount("/blackbox", blackboxRouter())
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/event", eventRouter())
 		r.Mount("/subscription", subscriptionRouter())
