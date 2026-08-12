@@ -2,11 +2,15 @@ package routes
 
 import (
 	"net/http"
+	"regexp"
 
 	"github.com/go-chi/render"
 	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
+
+// proxyPattern matches "PROXY host:port" in PAC source text.
+var proxyPattern = regexp.MustCompile(`(?i)PROXY\s+([0-9a-zA-Z._-]+:[0-9]+)`)
 
 // DetectedProxy is one PROXY entry extracted from a network's PAC script.
 type DetectedProxy struct {
@@ -34,10 +38,10 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 
 	log.Infoln("[detect-proxy] found PAC URL: %s", pacURL)
 
-	// Extract unique PROXY entries from the parsed rules.
-	// Rules from Parse() have Policy "PROXY" with payload as "host:port" style info,
-	// but the actual proxy address comes from evaluating the script.
-	// Skip the rule-based approach and go straight to JS eval for a known external host.
+	// Extract PROXY entries directly from the PAC source text rather than
+	// evaluating it. The evaluator handles myIpAddress/isInNet/dnsResolve which
+	// makes it context-dependent — a machine on a different subnet gets different
+	// results. For detection we want ALL declared proxies so the user can pick.
 	js, fetchErr := pac.Fetch(pacURL)
 	if fetchErr != nil {
 		render.Status(r, http.StatusOK)
@@ -49,33 +53,17 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	compiled, compileErr := pac.Compile(js)
-	if compileErr != nil {
-		render.Status(r, http.StatusOK)
-		render.JSON(w, r, map[string]any{
-			"pacUrl":  pacURL,
-			"proxies": []DetectedProxy{},
-			"message": "Found PAC URL but could not compile it: " + compileErr.Error(),
-		})
-		return
-	}
-
-	// Evaluate against well-known external hosts to discover PROXY directives.
+	// Find all "PROXY host:port" strings in the script.
 	seen := map[string]bool{}
 	var proxies []DetectedProxy
-	testHosts := []string{"www.google.com", "www.microsoft.com", "example.com"}
-	for _, host := range testHosts {
-		result := compiled.Eval("https://"+host+"/", host)
-		for _, part := range splitPACResult(result) {
-			if len(part) > 6 && part[:6] == "PROXY " {
-				addr := part[6:]
-				if !seen[addr] {
-					seen[addr] = true
-					h, p := splitHostPort(addr)
-					proxies = append(proxies, DetectedProxy{Host: h, Port: p, PacURL: pacURL})
-				}
-			}
+	for _, match := range proxyPattern.FindAllStringSubmatch(js, -1) {
+		addr := match[1]
+		if seen[addr] {
+			continue
 		}
+		seen[addr] = true
+		h, p := splitHostPort(addr)
+		proxies = append(proxies, DetectedProxy{Host: h, Port: p, PacURL: pacURL})
 	}
 
 	render.JSON(w, r, map[string]any{
