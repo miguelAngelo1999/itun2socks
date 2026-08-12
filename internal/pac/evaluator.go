@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -1007,6 +1008,7 @@ func (c *CompiledPAC) Eval(url, host string) (result string) {
 // Returns an empty string if not found.
 func ProbeWPADUrl() string {
 	if runtime.GOOS == "darwin" {
+		// Try ipconfig first (works as the user, not as root)
 		defaultIface := getDefaultIfaceName()
 		if defaultIface != "" {
 			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
@@ -1022,6 +1024,50 @@ func ProbeWPADUrl() string {
 						}
 					}
 				}
+			}
+		}
+		// Fallback: scutil --proxy works regardless of user context (even as root)
+		out, err := exec.Command("scutil", "--proxy").Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "ProxyAutoConfigURLString") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						u := strings.TrimSpace(parts[1])
+						if strings.HasPrefix(u, "http") {
+							return u
+						}
+					}
+				}
+			}
+		}
+		// Last resort: try the standard WPAD URL derived from DHCP domain
+		// Many corporate networks serve http://wpad.<domain>/wpad.dat
+		out2, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out2), "\n") {
+				if strings.Contains(line, "domain_name") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						domain := strings.TrimSpace(parts[1])
+						if domain != "" {
+							wpadUrl := "http://wpad." + domain + "/wpad.dat"
+							if probeURL(wpadUrl) {
+								return wpadUrl
+							}
+						}
+					}
+				}
+			}
+		}
+		// Final fallback: try http://<gateway>/wpad.dat directly.
+		// Many corporate routers serve the PAC at their own IP without a
+		// DNS record or DHCP option set.
+		if gw := getDefaultGateway(); gw != "" {
+			wpadUrl := "http://" + gw + "/wpad.dat"
+			if probeURL(wpadUrl) {
+				return wpadUrl
 			}
 		}
 	}
@@ -1053,4 +1099,29 @@ func getDefaultIfaceName() string {
 		}
 	}
 	return ""
+}
+
+func getDefaultGateway() string {
+	out, err := exec.Command("route", "-n", "get", "default").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "gateway:"))
+		}
+	}
+	return ""
+}
+
+// probeURL does a quick HEAD/GET to see if a URL is reachable and returns content.
+func probeURL(url string) bool {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
 }
