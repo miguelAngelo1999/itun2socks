@@ -31,7 +31,7 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, map[string]any{
 			"pacUrl":  "",
 			"proxies": []DetectedProxy{},
-			"message": "No PAC URL advertised on this network (DHCP option 252 / registry AutoConfigURL not set)",
+			"message": pac.NoPacFoundMessage(),
 		})
 		return
 	}

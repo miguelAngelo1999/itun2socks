@@ -20,6 +20,7 @@ package pac
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os/exec"
@@ -319,15 +320,15 @@ const (
 	tokRBrace
 	tokComma
 	tokSemicolon
-	tokAnd  // &&
-	tokOr   // ||
-	tokNot  // !
-	tokEq   // ==
-	tokNeq  // !=
-	tokLt   // <
-	tokGt   // >
-	tokLte  // <=
-	tokGte  // >=
+	tokAnd // &&
+	tokOr  // ||
+	tokNot // !
+	tokEq  // ==
+	tokNeq // !=
+	tokLt  // <
+	tokGt  // >
+	tokLte // <=
+	tokGte // >=
 )
 
 type token struct {
@@ -1072,13 +1073,32 @@ func ProbeWPADUrl() string {
 		}
 	}
 	if runtime.GOOS == "windows" {
-		out, err := exec.Command("powershell.exe",
-			"-noprofile", "-NonInteractive", "-command",
-			`(Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue).AutoConfigURL`,
-		).Output()
-		if err == nil {
-			u := strings.TrimSpace(string(out))
-			if u != "" && strings.HasPrefix(u, "http") {
+		// 1. Explicit PAC in the registry, per-user then machine-wide.
+		for _, hive := range []string{"HKCU", "HKLM"} {
+			out, err := exec.Command("powershell.exe",
+				"-noprofile", "-NonInteractive", "-command",
+				fmt.Sprintf(`(Get-ItemProperty "%s:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue).AutoConfigURL`, hive),
+			).Output()
+			if err == nil {
+				u := strings.TrimSpace(string(out))
+				if u != "" && strings.HasPrefix(u, "http") {
+					return u
+				}
+			}
+		}
+		// 2. WPAD by name, plain and per connection-specific DNS suffix. This is
+		// the DHCP option 252 / DNS devolution path the message advertises.
+		candidates := []string{"http://wpad/wpad.dat"}
+		if domain := getWindowsDNSSuffix(); domain != "" {
+			candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
+		}
+		// 3. Many corporate routers serve the PAC at their own IP with no DHCP
+		// option and no DNS record, so try the default gateway last.
+		if gw := getDefaultGateway(); gw != "" {
+			candidates = append(candidates, "http://"+gw+"/wpad.dat")
+		}
+		for _, u := range candidates {
+			if probeURL(u) {
 				return u
 			}
 		}
@@ -1102,6 +1122,18 @@ func getDefaultIfaceName() string {
 }
 
 func getDefaultGateway() string {
+	if runtime.GOOS == "windows" {
+		// route.exe output is localised, so ask PowerShell for the lowest
+		// metric default route instead of parsing text.
+		out, err := exec.Command("powershell.exe",
+			"-noprofile", "-NonInteractive", "-command",
+			`(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop`,
+		).Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
 	out, err := exec.Command("route", "-n", "get", "default").Output()
 	if err != nil {
 		return ""
@@ -1117,11 +1149,57 @@ func getDefaultGateway() string {
 
 // probeURL does a quick HEAD/GET to see if a URL is reachable and returns content.
 func probeURL(url string) bool {
-	client := &http.Client{Timeout: 4 * time.Second}
+	// Discovery must go direct. The default transport honours HTTP_PROXY, and
+	// lux exports it while proxying, so an upstream proxy answers 200 for
+	// hostnames that do not resolve and every candidate looks reachable.
+	client := &http.Client{
+		Timeout:   4 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
-	return resp.StatusCode == 200
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false
+	}
+	// A 200 on its own proves nothing: captive portals and proxy error pages
+	// return 200 with HTML. Require the entry point a PAC must declare.
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), "FindProxyForURL")
+}
+
+// getWindowsDNSSuffix returns the connection-specific DNS suffix of the
+// interface holding the default route, which is what DHCP hands out and what
+// WPAD name devolution is based on. Empty when the network advertises none.
+func getWindowsDNSSuffix() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	out, err := exec.Command("powershell.exe",
+		"-noprofile", "-NonInteractive", "-command",
+		`\ = Get-NetIPConfiguration | Where-Object { \.IPv4DefaultGateway } | Select-Object -First 1; if (\) { (Get-DnsClient -InterfaceIndex \.InterfaceIndex -EA SilentlyContinue).ConnectionSpecificSuffix }`,
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// NoPacFoundMessage explains what was actually probed, per platform. The old
+// wording claimed DHCP option 252 had been consulted on every OS, which was
+// untrue on Windows and sent people looking for a DHCP problem that did not
+// exist.
+func NoPacFoundMessage() string {
+	if runtime.GOOS == "windows" {
+		return "No PAC URL found: registry AutoConfigURL (HKCU and HKLM) is empty, " +
+			"and no PAC was served at http://wpad/wpad.dat, wpad.<dns-suffix>, " +
+			"or the default gateway."
+	}
+	return "No PAC URL found: DHCP option 252 is unset and no PAC was served at " +
+		"wpad.<domain> or the default gateway."
 }
