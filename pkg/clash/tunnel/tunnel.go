@@ -6,9 +6,13 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/igoogolx/itun2socks/internal/conn"
+	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/inbound"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/nat"
 	P "github.com/igoogolx/itun2socks/pkg/clash/component/process"
@@ -453,5 +457,32 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 		}
 	}
 
+	// No rule matched — consult PAC then use configured proxy.
+	// Hierarchy:
+	//   1. Custom clash rules (already evaluated above)
+	//   2. PAC eval — if DIRECT, honour it (internal hosts); if PROXY, fall through
+	//   3. Configured upstream proxy (proxy_all behaviour)
+	//   4. DIRECT as last resort (no proxy configured)
+	if pac.IsJSEvalActive() {
+		host := metadata.Host
+		if host == "" && metadata.DstIP != nil {
+			host = metadata.DstIP.String()
+		}
+		scheme := "https"
+		if metadata.NetWork == C.UDP {
+			scheme = "udp"
+		}
+		url := fmt.Sprintf("%s://%s", scheme, metadata.RemoteAddress())
+		result := pac.EvalForURL(url, host)
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(result)), "DIRECT") {
+			return proxies["DIRECT"], nil, nil
+		}
+		// PAC says PROXY or empty — use configured proxy below
+	}
+
+	// Use the currently selected upstream proxy (set by executor via conn.UpdateProxy).
+	if proxyAdapter, err := conn.GetProxy(constants.PolicyProxy); err == nil && proxyAdapter != nil {
+		return proxyAdapter, nil, nil
+	}
 	return proxies["DIRECT"], nil, nil
 }

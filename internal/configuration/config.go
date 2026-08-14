@@ -59,7 +59,30 @@ type SettingCfg struct {
 	AutoConnect       bool   `json:"autoConnect,omitempty"`
 	AutoLaunch        bool   `json:"autoLaunch,omitempty"`
 	SensitiveInfoMode    bool   `json:"sensitiveInfoMode,omitempty"`
-	RestoreAutoDetect    bool   `json:"restoreAutoDetect,omitempty"` // Windows: restore "Automatically detect" proxy when lux exits
+	RestoreAutoDetect    bool   `json:"restoreAutoDetect,omitempty"`
+	// URLs used for connectivity testing — configurable so corporate networks
+	// can point to an allowed domain instead of the default.
+	HealthCheckUrl string `json:"healthCheckUrl,omitempty"` // used by /health watchdog
+	DelayTestUrl   string `json:"delayTestUrl,omitempty"`   // used by /proxies/delay/:id
+	// PacUrl is a manually-configured PAC/WPAD URL. When non-empty, lux fetches
+	// this PAC file on startup and on every 30-min refresh cycle, and evaluates
+	// FindProxyForURL per connection to route DIRECT traffic around the proxy.
+	// Takes priority over auto-detected DHCP/registry PAC URLs.
+	PacUrl string `json:"pacUrl,omitempty"`
+
+	// BypassCidrs is a list of IP/CIDR ranges that should bypass the TUN interface
+	// entirely at the routing table level. Traffic to these IPs never enters
+	// lux_core's userspace stack — it goes directly out the physical adapter.
+	// This is in addition to IP-CIDR,x,DIRECT rules (which are also auto-extracted).
+	// Use for upstream proxy IPs, corporate subnets, etc.
+	BypassCidrs []string `json:"bypassCidrs,omitempty"`
+
+	// BypassProcesses is a list of process names/paths that should bypass the TUN.
+	// On Windows: uses WFP (Windows Filtering Platform) permit filters so traffic
+	// from these processes never enters the TUN interface.
+	// On macOS: no kernel-level per-process bypass exists; these are handled by
+	// the existing PROCESS,x,DIRECT rule engine after TUN capture.
+	BypassProcesses []string `json:"bypassProcesses,omitempty"`
 }
 
 type DnsServer struct {

@@ -13,11 +13,11 @@ import (
 	"github.com/igoogolx/itun2socks/internal/cfg/local_server"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/igoogolx/itun2socks/internal/conn"
-	"github.com/igoogolx/itun2socks/internal/balancer"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/internal/events"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/matcher"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/proxy_handler"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
@@ -35,10 +35,6 @@ type Client interface {
 	RuntimeDetail(hubAddress string) (any, error)
 }
 
-// extractRawInterfaceName delegates to balancer.ExtractRawName.
-func extractRawInterfaceName(name string) string {
-	return balancer.ExtractRawName(name)
-}
 
 // InitPasswordExpiryHandler registers the callback that fires when a timed proxy
 // password expires. If the expired proxy is currently selected, this automatically
@@ -244,34 +240,14 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Initialize load balancer if configured.
-	// Interface names from Flutter may be "Friendly Name (en0)" format —
-	// extract the raw OS name in parentheses.
-	setting, _ := configuration.GetSetting()
+	// Always use the OS default interface — load balancer removed.
+	// The OS kernel handles multi-interface routing correctly via its own routing table.
+	// Plugging in a dead ethernet cable no longer disrupts proxy traffic.
 
 	// Apply RestoreAutoDetect setting on Windows
+	setting, _ := configuration.GetSetting()
 	if runtime.GOOS == "windows" {
 		sysproxy.RestoreAutoDetectOnExit = setting.RestoreAutoDetect
-	}
-
-	if setting.LoadBalance.Enabled && len(setting.LoadBalance.Interfaces) >= 2 {
-		rawIfaces := make([]string, 0, len(setting.LoadBalance.Interfaces))
-		for _, iface := range setting.LoadBalance.Interfaces {
-			raw := extractRawInterfaceName(iface)
-			if raw != "" {
-				rawIfaces = append(rawIfaces, raw)
-			}
-		}
-		// Use the active upstream proxy as the latency probe target.
-		// Direct probes to 8.8.8.8 fail on corporate networks — the proxy is always reachable.
-		probeTarget := configuration.GetProxyProbeTarget()
-		if len(rawIfaces) >= 2 {
-			balancer.Configure(rawIfaces, setting.LoadBalance.Strategy, probeTarget)
-		} else {
-			balancer.Configure(nil, "", "")
-		}
-	} else {
-		balancer.Configure(nil, "", "")
 	}
 
 	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
@@ -287,6 +263,10 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		Logger:           logrus.StandardLogger(),
 		InterfaceMonitor: network_iface.GetDefaultInterfaceMonitor(),
 	}
+
+	// Populate route exclusions so DIRECT IP-CIDR traffic bypasses TUN entirely.
+	// This prevents packets from entering userspace only to be sent DIRECT anyway.
+	tunOptions.Inet4RouteExcludeAddress = collectBypassCidrs()
 	// Detect and apply PAC rules BEFORE TUN starts — at this point the network
 	// is still in its original state (no TUN interception), so wpad DNS resolution
 	// and HTTP fetch work correctly without routing issues.
@@ -401,6 +381,11 @@ func New() (Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Bootstrap the PAC user URL from saved config so detectAndApplyPac()
+	// sees it immediately on the first TUN startup call.
+	pac.SetUserURL(rawConfig.Setting.PacUrl)
+
 	if rawConfig.Setting.Mode == "tun" {
 		return newTun(true)
 	}

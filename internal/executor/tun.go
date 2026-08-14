@@ -2,10 +2,8 @@ package executor
 
 import (
 	"fmt"
-	"os/exec"
-	"runtime"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg"
 	"github.com/igoogolx/itun2socks/internal/constants"
@@ -86,11 +84,19 @@ func (c *TunClient) Start() error {
 		}
 	}
 
+	// Start PAC refresh loop — re-fetches and re-compiles every 30 minutes.
+	pac.StartRefreshLoop(30 * time.Minute)
+
+	// Apply WFP per-process bypass filters (Windows only).
+	// On other platforms this is a no-op.
+	ApplyProcessBypasses()
+
 	// Register route-change handler: re-detect PAC and flush stale connections
 	// when network interface changes (WireGuard/VPN reconnect, WiFi switch, etc.)
 	network_iface.SetRouteChangeHandler(func(newIface string) {
 		log.Infoln("[network] route changed to %s — flushing stale connections", newIface)
 		statistic.DefaultManager.CloseAllConnections()
+		pac.RefreshMyIP()
 		// Re-apply PAC rules for the new network (runs in background, TUN is up)
 		go detectAndApplyPac()
 	})
@@ -108,7 +114,11 @@ func (c *TunClient) Start() error {
 func (c *TunClient) Close() error {
 	var err error
 
-	// Clear PAC rules on disconnect
+	// Remove WFP bypass filters (Windows only). No-op on other platforms.
+	CloseWfpBypass()
+
+	// Stop refresh loop and clear PAC rules on disconnect.
+	pac.StopRefreshLoop()
 	pac.Clear()
 
 	if c.config.HijackDns.Enabled {
@@ -135,51 +145,46 @@ func (c *TunClient) Close() error {
 	return nil
 }
 
-// detectAndApplyPac finds the WPAD/DHCP PAC URL for the current network
-// and applies its DIRECT rules so internal resources bypass the proxy.
+// applyMu guards detectAndApplyPac so concurrent calls (startup + route-change)
+// don't race to fetch/compile the same PAC URL simultaneously.
+var applyMu sync.Mutex
+
+// detectAndApplyPac finds and applies the best available PAC URL.
+// Priority: user-configured URL (from settings) > DHCP/registry auto-detect.
+//
+// On fetch/compile failure:
+//   - If a user URL is configured: keep the last-known-good compiled PAC,
+//     log a warning. Do NOT fall through to DHCP detection.
+//   - If auto-detecting: clear PAC state (no fallback available).
 func detectAndApplyPac() {
-	var pacURL string
-
-	if runtime.GOOS == "darwin" {
-		// Check DHCP option 252 (proxy_auto_discovery_url) on the default interface
-		defaultIface := network_iface.GetDefaultInterfaceName()
-		if defaultIface != "" {
-			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
-			if err == nil {
-				for _, line := range strings.Split(string(out), "\n") {
-					if strings.Contains(line, "proxy_auto_discovery_url") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) == 2 {
-							pacURL = strings.TrimSpace(parts[1])
-						}
-					}
-				}
-			}
-		}
+	if !applyMu.TryLock() {
+		log.Debugln("[pac] detectAndApplyPac already running — skipping")
+		return
 	}
-	// TODO: Windows — check registry for AutoConfigURL
-	if runtime.GOOS == "windows" {
-		out, err := exec.Command("powershell.exe",
-			"-noprofile", "-NonInteractive", "-command",
-			`(Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue).AutoConfigURL`,
-		).Output()
-		if err == nil {
-			url := strings.TrimSpace(string(out))
-			if url != "" && strings.HasPrefix(url, "http") {
-				pacURL = url
-			}
+	defer applyMu.Unlock()
+
+	// User-configured URL takes absolute priority.
+	if userURL := pac.GetUserURL(); userURL != "" {
+		_, err := pac.Apply(userURL)
+		if err != nil {
+			// Keep whatever was previously compiled — don't clear, don't fall back.
+			log.Warnln("[pac] user PAC URL %s unreachable (%v) — keeping previous state", userURL, err)
 		}
+		return
 	}
 
+	// Auto-detect from DHCP option 252 (macOS) or registry AutoConfigURL (Windows).
+	pacURL := pac.ProbeWPADUrl()
 	if pacURL == "" {
 		log.Debugln("[pac] no PAC URL detected on this network")
 		return
 	}
 
-	rules, err := pac.Apply(pacURL)
+	_, err := pac.Apply(pacURL)
 	if err != nil {
-		log.Warnln("[pac] failed to apply PAC from %s: %v", pacURL, err)
+		log.Warnln("[pac] auto-detected PAC %s failed: %v", pacURL, err)
+		pac.Clear()
 		return
 	}
-	log.Infoln("[pac] auto-applied %d DIRECT rules from %s", len(rules), pacURL)
+	log.Infoln("[pac] auto-applied PAC from %s", pacURL)
 }
