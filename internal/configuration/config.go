@@ -140,6 +140,10 @@ type SettingCfg struct {
 	AutoConnect       bool   `json:"autoConnect,omitempty"`
 	AutoLaunch        bool   `json:"autoLaunch,omitempty"`
 	SensitiveInfoMode bool   `json:"sensitiveInfoMode,omitempty"`
+
+	PacUrl          string   `json:"pacUrl,omitempty"`
+	BypassCidrs     []string `json:"bypassCidrs,omitempty"`
+	BypassProcesses []string `json:"bypassProcesses,omitempty"`
 }
 
 type DnsServer struct {

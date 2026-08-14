@@ -68,6 +68,10 @@ func (c *TunClient) Start() error {
 	if err = c.stack.Start(); err != nil {
 		return fmt.Errorf("fail to start stack: %v", err)
 	}
+
+	// Apply WFP per-process bypasses (Windows only — no-op on macOS).
+	ApplyProcessBypasses()
+
 	if c.config.HijackDns.Enabled {
 
 		_, err := dns.Hijack(c.config.HijackDns.NetworkService, constants.HijackedDns, c.config.HijackDns.AlwaysReset)
@@ -90,6 +94,9 @@ func (c *TunClient) Start() error {
 
 func (c *TunClient) Close() error {
 	var err error
+
+	// Clean up WFP bypass filters (Windows only — no-op on macOS).
+	CloseWfpBypass()
 
 	// Stop PAC refresh and clear the registry on disconnect.
 	pac.DefaultRegistry.StopRefreshLoop()
