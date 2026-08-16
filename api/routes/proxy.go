@@ -14,6 +14,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
+	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -112,7 +113,13 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultDelayTimeout)
 	defer cancel()
+	// Clear the default interface binding so the proxy can be reached via
+	// whatever interface its subnet requires (e.g. VPN on utun7).
+	// Without this, lux_core binds to en0 and cannot reach proxies on VPN subnets.
+	savedIface := dialer.DefaultInterface.Load()
+	dialer.DefaultInterface.Store("")
 	delay, _, err := p.URLTest(ctx, url)
+	dialer.DefaultInterface.Store(savedIface)
 	if err != nil {
 		render.JSON(w, r, render.M{
 			"delay": -1,
