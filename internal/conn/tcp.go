@@ -90,7 +90,15 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	if err != nil {
 		return nil, err
 	}
-	return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+	// Proxy connections must NOT be bound to a specific interface.
+	// DefaultInterface is set globally (to en0), but proxy servers may be
+	// reachable only through a different interface (VPN, utun7, etc).
+	// Passing WithInterface("") overrides the default and lets the kernel
+	// route through whatever interface the proxy server's subnet requires.
+	if policy == constants.PolicyDirect {
+		return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+	}
+	return connDialer.DialContext(ctx, metadata, dialer.WithInterface(""))
 }
 
 // proxyIdForPolicy returns the proxy id if the policy targets a named proxy,
