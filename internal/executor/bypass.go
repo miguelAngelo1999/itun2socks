@@ -47,14 +47,23 @@ func collectBypassCidrs() []netip.Prefix {
 		}
 	}
 
-	// 2. Auto-extract the upstream proxy server IP so it always bypasses TUN.
-	// Without this, lux_core's own outbound connections to the proxy get captured
+	// 2. Auto-extract ALL proxy server IPs so they always bypass TUN.
+	// Without this, lux_core's own outbound connections to any proxy get captured
 	// by TUN creating a routing loop.
-	proxyServer := getSelectedProxyServerIP(&rawConfig)
-	if proxyServer.IsValid() && proxyServer.Is4() {
-		prefix := netip.PrefixFrom(proxyServer, 32)
+	for _, p := range rawConfig.Proxy {
+		server, _ := p["server"].(string)
+		if server == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(server)
+		if err != nil || !addr.Is4() {
+			continue
+		}
+		prefix := netip.PrefixFrom(addr, 32)
 		excludes = append(excludes, prefix)
-		log.Infoln(log.FormatLog(log.ExecutorPrefix, "bypass: auto-excluded upstream proxy %v"), prefix)
+	}
+	if len(rawConfig.Proxy) > 0 {
+		log.Infoln(log.FormatLog(log.ExecutorPrefix, "bypass: auto-excluded %d proxy server IPs from TUN"), len(rawConfig.Proxy))
 	}
 
 	// 3. Extract IP-CIDR,x,DIRECT rules from customized rules
