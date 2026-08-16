@@ -23,6 +23,9 @@ type Http struct {
 	pass      string
 	tlsConfig *tls.Config
 	Headers   http.Header
+	via       string // upstream proxy address for chaining
+	viaUser   string
+	viaPass   string
 }
 
 type HttpOption struct {
@@ -36,6 +39,12 @@ type HttpOption struct {
 	SNI            string            `proxy:"sni,omitempty"`
 	SkipCertVerify bool              `proxy:"skip-cert-verify,omitempty"`
 	Headers        map[string]string `proxy:"headers,omitempty"`
+	// Via is the address of an upstream proxy to reach this proxy through.
+	// Format: "host:port". When set, DialContext first CONNECTs to Via,
+	// then CONNECTs through it to the target. This is proxy chaining.
+	Via         string `proxy:"via,omitempty"`
+	ViaUser     string `proxy:"via-username,omitempty"`
+	ViaPassword string `proxy:"via-password,omitempty"`
 }
 
 // StreamConn implements C.ProxyAdapter
@@ -59,11 +68,25 @@ func (h *Http) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
 
 // DialContext implements C.ProxyAdapter
 func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (_ C.Conn, err error) {
-	c, err := dialer.DialContext(ctx, "tcp", h.addr, h.Base.DialOptions(opts...)...)
-	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %w", h.addr, err)
+	var c net.Conn
+	if h.via != "" {
+		// Proxy chaining: connect to upstream proxy first, then CONNECT to this proxy.
+		c, err = dialer.DialContext(ctx, "tcp", h.via, h.Base.DialOptions(opts...)...)
+		if err != nil {
+			return nil, fmt.Errorf("%s via %s connect error: %w", h.addr, h.via, err)
+		}
+		tcpKeepAlive(c)
+		if err = h.connectVia(c); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("%s via %s tunnel error: %w", h.addr, h.via, err)
+		}
+	} else {
+		c, err = dialer.DialContext(ctx, "tcp", h.addr, h.Base.DialOptions(opts...)...)
+		if err != nil {
+			return nil, fmt.Errorf("%s connect error: %w", h.addr, err)
+		}
+		tcpKeepAlive(c)
 	}
-	tcpKeepAlive(c)
 
 	defer func(c net.Conn) {
 		safeConnClose(c, err)
@@ -75,6 +98,32 @@ func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata, opts ...di
 	}
 
 	return NewConn(c, h), nil
+}
+
+// connectVia tunnels through the upstream proxy to reach this proxy's address.
+func (h *Http) connectVia(c net.Conn) error {
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: h.addr},
+		Host:   h.addr,
+		Header: make(http.Header),
+	}
+	if h.viaUser != "" {
+		auth := h.viaUser + ":" + h.viaPass
+		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+	}
+	if err := req.Write(c); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("upstream CONNECT returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
@@ -136,9 +185,9 @@ func NewHttp(option HttpOption) *Http {
 		}
 	}
 
-	headers := http.Header{}
+	header := http.Header{}
 	for name, value := range option.Headers {
-		headers.Add(name, value)
+		header.Add(name, value)
 	}
 
 	return &Http{
@@ -152,6 +201,9 @@ func NewHttp(option HttpOption) *Http {
 		user:      option.UserName,
 		pass:      option.Password,
 		tlsConfig: tlsConfig,
-		Headers:   headers,
+		Headers:   header,
+		via:       option.Via,
+		viaUser:   option.ViaUser,
+		viaPass:   option.ViaPassword,
 	}
 }
