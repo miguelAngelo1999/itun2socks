@@ -35,6 +35,15 @@ var (
 	procInternetSetOption = modwininet.NewProc("InternetSetOptionW")
 )
 
+// prevPACURL and prevAutoDetect remember the WinINET auto-proxy settings that
+// were active before lux set its own proxy. They are restored when the proxy
+// is disabled, so browsers regain their original PAC/WPAD behaviour.
+var (
+	prevPACURL     string
+	prevAutoDetect uint32
+	prevSaved      bool
+)
+
 // https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags
 // INTERNET_OPTION_SETTINGS_CHANGED: 39
 // Notifies the system that the registry settings have been changed so that it verifies the settings on the next call to InternetConnect.
@@ -79,6 +88,19 @@ func DisableSOCKSProxy() error {
 }
 
 func setProxySettings(settings *proxySettings) error {
+	// Before setting our proxy, save and clear the auto-proxy settings.
+	// A PAC URL or WPAD auto-detect takes precedence over the manual proxy
+	// setting and causes traffic to bypass lux entirely.
+	if !prevSaved {
+		if k2, e2 := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE|registry.SET_VALUE); e2 == nil {
+			prevPACURL, _, _ = k2.GetStringValue("AutoConfigURL")
+			{ v64, _, _ := k2.GetIntegerValue("AutoDetect"); prevAutoDetect = uint32(v64) }
+			k2.SetStringValue("AutoConfigURL", "")
+			k2.SetDWordValue("AutoDetect", 0)
+			k2.Close()
+			prevSaved = true
+		}
+	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
@@ -101,6 +123,15 @@ func setProxySettings(settings *proxySettings) error {
 }
 
 func disableProxy() error {
+	// Restore the auto-proxy settings we saved when the proxy was enabled.
+	if prevSaved {
+		if k2, e2 := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE); e2 == nil {
+			k2.SetStringValue("AutoConfigURL", prevPACURL)
+			if prevAutoDetect == 0 { k2.DeleteValue("AutoDetect") } else { k2.SetDWordValue("AutoDetect", prevAutoDetect) }
+			k2.Close()
+		}
+		prevSaved = false
+	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
