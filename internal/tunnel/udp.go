@@ -128,13 +128,17 @@ func handleDnsConn(ct conn.UdpConnContext) {
 }
 
 // processUDP starts a loop to handle udp packet
+// processUDP handles the UDP queue. DNS to the fake-IP resolver is handled
+// in-process. All other UDP is dropped: HTTP proxies are TCP-only, and
+// capturing media UDP (WhatsApp, Zoom, Teams ...) in mixed mode always fails.
+// With StrictRoute=false the app retransmits and the OS routes it directly.
 func processUDP() {
 	for c := range udpQueue {
 		if conn.GetIsDNSConn(c.Metadata()) {
 			go handleDnsConn(c)
 		} else {
-			go handleUdpConn(c)
+			// Non-DNS UDP: release so TUN frees the slot; app retransmits → goes direct.
+			c.Wg().Done()
 		}
-
 	}
 }
