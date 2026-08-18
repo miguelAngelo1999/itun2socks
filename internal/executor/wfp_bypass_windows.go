@@ -136,7 +136,7 @@ func InitWfpBypass() error {
 		flags:       fwpmSessionFlagDynamic,
 	}
 	var engine uintptr
-	r, _, _ := procFwpmEngineOpen0.Call(0, 0, 0, uintptr(unsafe.Pointer(session)), uintptr(unsafe.Pointer(&engine)))
+	r, _, _ := procFwpmEngineOpen0.Call(0, 10, 0, uintptr(unsafe.Pointer(session)), uintptr(unsafe.Pointer(&engine))) // 10 = RPC_C_AUTHN_WINNT
 	if r != 0 {
 		return fmt.Errorf("FwpmEngineOpen0 failed: 0x%08x", r)
 	}

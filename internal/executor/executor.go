@@ -142,7 +142,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	stack, err := sTun.NewStack("gvisor", sTun.StackOptions{
+	stack, err := sTun.NewStack("system", sTun.StackOptions{
 		Context:    context.Background(),
 		Handler:    proxy_handler.New(tunnel.TcpQueue(), tunnel.UdpQueue()),
 		TunOptions: tunOptions,

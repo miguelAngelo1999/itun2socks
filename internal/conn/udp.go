@@ -10,6 +10,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
+	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/pool"
 	"github.com/sagernet/sing/common/buf"
@@ -153,7 +154,11 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	}
 	rawConn, err := connDialer.ListenPacketContext(ctx, metadata, dialer.WithInterface(defaultInterface), dialer.WithAddrReuse(true))
 	if err != nil {
-		return nil, err
+		directDialer, dErr := GetProxy(constants.PolicyDirect)
+		if dErr != nil { return nil, err }
+		rawConn, dErr = directDialer.ListenPacketContext(ctx, metadata, dialer.WithInterface(defaultInterface), dialer.WithAddrReuse(true))
+		if dErr != nil { return nil, err }
+		log.Infoln(log.FormatLog(log.UdpPrefix, `proxy no UDP support, DIRECT fallback for %v`), metadata.RemoteAddress())
 	}
 	return &CopyablePacketConn{rawConn}, nil
 }

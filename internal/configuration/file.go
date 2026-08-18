@@ -30,7 +30,7 @@ func Read() (Config, error) {
 
 	//FIXME: remove in v2
 	if len(config.Setting.Stack) == 0 {
-		config.Setting.Stack = "gvisor"
+		config.Setting.Stack = "system"
 	}
 	if len(config.Setting.Theme) == 0 {
 		config.Setting.Theme = "system"
