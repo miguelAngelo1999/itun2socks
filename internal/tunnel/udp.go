@@ -23,15 +23,16 @@ func UdpQueue() chan conn.UdpConnContext {
 	return udpQueue
 }
 
-func copyUdpPacket(lc network.PacketConn, rc network.PacketConn) error {
-	_, err := bufio.CopyPacket(lc, rc)
-	return err
+func copyUdpPacket(lc network.PacketConn, rc network.PacketConn) (int64, error) {
+	return bufio.CopyPacket(lc, rc)
 }
 
 func handleUdpConn(ct conn.UdpConnContext) {
 	var once sync.Once
 	var lc network.PacketConn
 	var err error
+
+	remote := ct.Metadata().RemoteAddress()
 
 	cleanConn := func() {
 		if lc != nil {
@@ -53,7 +54,7 @@ func handleUdpConn(ct conn.UdpConnContext) {
 
 	localConn, err := conn.NewUdpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), network_iface.GetDefaultInterfaceName())
 	if err != nil {
-		log.Warnln(log.FormatLog(log.UdpPrefix, "fail to get udp conn, err: %v, remote address: %v"), err, ct.Metadata().RemoteAddress())
+		log.Warnln(log.FormatLog(log.UdpPrefix, "fail to get udp conn, err: %v, remote address: %v"), err, remote)
 		return
 	}
 	lc = statistic.NewUDPTracker(*localConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())
@@ -61,24 +62,28 @@ func handleUdpConn(ct conn.UdpConnContext) {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
+	// app -> internet
 	go func() {
 		defer func() {
 			wg.Done()
 			once.Do(cleanConn)
 		}()
-		err := copyUdpPacket(lc, ct.Conn())
+		n, err := copyUdpPacket(lc, ct.Conn())
+		log.Debugln(log.FormatLog(log.UdpPrefix, "upload finished: bytes=%v, err=%v, remote address: %v"), n, err, remote)
 		if err != nil {
-			conn.PrintPacketError(err, fmt.Sprintf(log.FormatLog(log.UdpPrefix, "fail to output ,err: %v, remote address: %v"), err, ct.Metadata().RemoteAddress()))
+			conn.PrintPacketError(err, fmt.Sprintf(log.FormatLog(log.UdpPrefix, "fail to output ,err: %v, remote address: %v"), err, remote))
 		}
 	}()
+	// internet -> app
 	go func() {
 		defer func() {
 			wg.Done()
 			once.Do(cleanConn)
 		}()
-		err := copyUdpPacket(ct.Conn(), lc)
+		n, err := copyUdpPacket(ct.Conn(), lc)
+		log.Debugln(log.FormatLog(log.UdpPrefix, "download finished: bytes=%v, err=%v, remote address: %v"), n, err, remote)
 		if err != nil {
-			conn.PrintPacketError(err, fmt.Sprintf(log.FormatLog(log.UdpPrefix, "fail to input ,err: %v, remote address: %v"), err, ct.Metadata().RemoteAddress()))
+			conn.PrintPacketError(err, fmt.Sprintf(log.FormatLog(log.UdpPrefix, "fail to input ,err: %v, remote address: %v"), err, remote))
 		}
 	}()
 
@@ -127,8 +132,11 @@ func handleDnsConn(ct conn.UdpConnContext) {
 	}
 }
 
-// processUDP starts a loop to handle udp packet
-// processUDP starts a loop to handle udp packet
+// processUDP starts a loop to handle udp packet.
+//
+// DNS to the fake-IP resolver is answered in-process; every other UDP flow is
+// relayed by handleUdpConn, which picks a DIRECT outbound when the matched proxy
+// cannot carry UDP.
 func processUDP() {
 	for c := range udpQueue {
 		if conn.GetIsDNSConn(c.Metadata()) {
