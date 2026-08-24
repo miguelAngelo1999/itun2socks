@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"strings"
+	"unicode/utf8"
 	"fmt"
 	"net"
 	"net/http"
@@ -28,6 +31,35 @@ type CertCheckResult struct {
 	Error       string `json:"error,omitempty"`
 }
 
+
+// toLatin1UTF8 re-decodes a string that contains raw Latin-1 bytes as proper UTF-8.
+// Older CA certs (common in Brazil) store accented characters as ISO-8859-1.
+func toLatin1UTF8(s string) string {
+if utf8.ValidString(s) {
+return s
+}
+runes := make([]rune, len(s))
+for i := 0; i < len(s); i++ {
+runes[i] = rune(s[i])
+}
+return string(runes)
+}
+
+// certIssuerName returns a human-readable name from a cert's issuer,
+// preferring Organization over CommonName, with Latin-1 handling.
+func certIssuerName(name pkix.Name) string {
+parts := []string{}
+if len(name.Organization) > 0 {
+parts = append(parts, "O="+toLatin1UTF8(name.Organization[0]))
+}
+if name.CommonName != "" {
+parts = append(parts, "CN="+toLatin1UTF8(name.CommonName))
+}
+if len(parts) > 0 {
+return strings.Join(parts, ", ")
+}
+return toLatin1UTF8(name.String())
+}
 // checkCert connects through the configured proxy to a well-known HTTPS host and
 // inspects the certificate. If the cert is not issued by a publicly trusted CA
 // (i.e. it's a corporate MITM cert), it reports the intercepting CA's details.
@@ -136,8 +168,8 @@ func checkCert(w http.ResponseWriter, r *http.Request) {
 		// Cert is publicly trusted — no interception
 		render.JSON(w, r, CertCheckResult{
 			Intercepted: false,
-			Issuer:      leaf.Issuer.CommonName,
-			Subject:     leaf.Subject.CommonName,
+			Issuer:      certIssuerName(leaf.Issuer),
+			Subject:     toLatin1UTF8(leaf.Subject.CommonName),
 		})
 		return
 	}
@@ -160,12 +192,12 @@ func checkCert(w http.ResponseWriter, r *http.Request) {
 	fingerprint := sha256.Sum256(issuingCA.Raw)
 
 	log.Infoln("[check-cert] MITM cert detected: issuer=%s subject=%s",
-		issuingCA.Issuer.CommonName, issuingCA.Subject.CommonName)
+		certIssuerName(issuingCA.Issuer), toLatin1UTF8(issuingCA.Subject.CommonName))
 
 	render.JSON(w, r, CertCheckResult{
 		Intercepted: true,
-		Issuer:      issuingCA.Issuer.CommonName,
-		Subject:     issuingCA.Subject.CommonName,
+		Issuer:      certIssuerName(issuingCA.Issuer),
+		Subject:     toLatin1UTF8(issuingCA.Subject.CommonName),
 		NotBefore:   issuingCA.NotBefore.Format("2006-01-02"),
 		NotAfter:    issuingCA.NotAfter.Format("2006-01-02"),
 		SHA256:      fmt.Sprintf("%x", fingerprint),
