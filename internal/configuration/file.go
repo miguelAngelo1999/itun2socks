@@ -1,4 +1,4 @@
-package configuration
+﻿package configuration
 
 import (
 	_ "embed"
@@ -110,6 +110,23 @@ func readFile() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("fail to parse defalut config file: %v", err)
 		}
+	}
+
+
+	// Validate critical settings — bad values in config.json cause broken startup.
+	switch c.Setting.Stack {
+	case "system", "gvisor", "mixed", "":
+		// valid
+	default:
+		log.Warnln("config: invalid stack %q, resetting to system", c.Setting.Stack)
+		c.Setting.Stack = "system"
+	}
+	switch c.Setting.Mode {
+	case "mixed", "tun", "system", "":
+		// valid
+	default:
+		log.Warnln("config: invalid mode %q, resetting to mixed", c.Setting.Mode)
+		c.Setting.Mode = "mixed"
 	}
 	return c, nil
 }
