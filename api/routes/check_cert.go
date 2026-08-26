@@ -66,6 +66,8 @@ return toLatin1UTF8(name.String())
 //
 // POST /proxies/check-cert
 // Body: {"server": "10.8.0.1", "port": 8082, "username": "...", "password": "..."}
+// Username/password are optional — tries auth-free domains first (Apple/MS update
+// servers that corporate proxies typically whitelist without credentials).
 func checkCert(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Server   string `json:"server"`
@@ -86,6 +88,23 @@ func checkCert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxyAddr := fmt.Sprintf("%s:%d", req.Server, req.Port)
+
+	// Try auth-free domains first (Apple/MS update domains that Squid whitelists)
+	noAuthHosts := []string{"swscan.apple.com:443", "download.windowsupdate.com:443"}
+	for _, testHost := range noAuthHosts {
+		result := probeCert(proxyAddr, testHost, "", "")
+		if result != nil && result.Intercepted {
+			render.JSON(w, r, result)
+			return
+		}
+		if result != nil && result.Error == "" && !result.Intercepted {
+			// Connected fine, no interception — cert is publicly trusted
+			render.JSON(w, r, result)
+			return
+		}
+	}
+
+	// Fall back to auth + google.com
 	testHost := "www.google.com:443"
 
 	log.Infoln("[check-cert] connecting through %s to %s", proxyAddr, testHost)
@@ -203,4 +222,103 @@ func checkCert(w http.ResponseWriter, r *http.Request) {
 		SHA256:      fmt.Sprintf("%x", fingerprint),
 		PEM:         string(pemBlock),
 	})
+}
+
+// probeCert connects through a proxy to testHost and checks if the cert is MITM'd.
+// Returns nil if the connection failed (so caller can try next host).
+func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult {
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	// Determine SNI from testHost
+	sni := testHost
+	if host, _, err := net.SplitHostPort(testHost); err == nil {
+		sni = host
+	}
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", testHost, testHost)
+	if username != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+		connectReq += "Proxy-Authorization: Basic " + auth + "\r\n"
+	}
+	connectReq += "\r\n"
+
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		return nil
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return nil
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		// 407 = needs auth, skip this host
+		return &CertCheckResult{Error: fmt.Sprintf("proxy returned %d", resp.StatusCode)}
+	}
+
+	conn.SetReadDeadline(time.Time{})
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		return nil
+	}
+	defer tlsConn.Close()
+
+	certs := tlsConn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil
+	}
+
+	leaf := certs[0]
+	systemRoots, err := x509.SystemCertPool()
+	if err != nil {
+		systemRoots = x509.NewCertPool()
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, c := range certs[1:] {
+		intermediates.AddCert(c)
+	}
+
+	_, verifyErr := leaf.Verify(x509.VerifyOptions{
+		DNSName:       sni,
+		Roots:         systemRoots,
+		Intermediates: intermediates,
+	})
+
+	if verifyErr == nil {
+		return &CertCheckResult{Intercepted: false, Issuer: leaf.Issuer.CommonName, Subject: leaf.Subject.CommonName}
+	}
+
+	// MITM detected
+	var issuingCA *x509.Certificate
+	if len(certs) > 1 {
+		issuingCA = certs[len(certs)-1]
+	} else {
+		issuingCA = leaf
+	}
+
+	pemBlock := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuingCA.Raw})
+	fingerprint := sha256.Sum256(issuingCA.Raw)
+
+	log.Infoln("[check-cert] MITM detected via %s: issuer=%s", testHost, issuingCA.Issuer.CommonName)
+
+	return &CertCheckResult{
+		Intercepted: true,
+		Issuer:      issuingCA.Issuer.CommonName,
+		Subject:     issuingCA.Subject.CommonName,
+		NotBefore:   issuingCA.NotBefore.Format("2006-01-02"),
+		NotAfter:    issuingCA.NotAfter.Format("2006-01-02"),
+		SHA256:      fmt.Sprintf("%x", fingerprint),
+		PEM:         string(pemBlock),
+	}
 }

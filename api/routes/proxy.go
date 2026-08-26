@@ -40,6 +40,7 @@ func proxyRouter() http.Handler {
 	r.Get("/udp-test/{proxyId}", testProxyUdp)
 	r.Post("/detect", detectProxies)
 	r.Post("/check-cert", checkCert)
+	r.Post("/install-cert", installCert)
 	return r
 }
 
