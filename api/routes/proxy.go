@@ -3,6 +3,7 @@ package routes
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -121,8 +122,14 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	delay, _, err := p.URLTest(ctx, url)
 	dialer.DefaultInterface.Store(savedIface)
 	if err != nil {
+		errStr := err.Error()
+		isCertErr := strings.Contains(errStr, "x509") ||
+			strings.Contains(errStr, "certificate") ||
+			strings.Contains(errStr, "tls:")
 		render.JSON(w, r, render.M{
-			"delay": -1,
+			"delay":     -1,
+			"certError": isCertErr,
+			"error":     errStr,
 		})
 		return
 	}
