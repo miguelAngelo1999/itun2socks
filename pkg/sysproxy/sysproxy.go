@@ -72,11 +72,15 @@ func Set(addr string, activeInterface string) error {
 		return err
 	}
 	setEnvProxy(addr)
+	// Exempt all UWP apps from network isolation so they can reach the local proxy.
+	go applyUWPLoopbackExemptions()
 	return nil
 }
 
 func Clear(activeInterface string) error {
 	clearEnvProxy()
+	// Restore default UWP network isolation.
+	go clearUWPLoopbackExemptions()
 	return DisableWebProxy(activeInterface)
 }
 
