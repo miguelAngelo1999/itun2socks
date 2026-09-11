@@ -68,5 +68,18 @@ func installCert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Infoln("[install-cert] certificate installed successfully")
+
+	// On macOS, flush the trust evaluation cache so that subsequent calls to
+	// x509.SystemCertPool() (including our own check-cert probe) pick up the
+	// newly-installed root without needing a process restart.
+	// `security verify-cert` forces a SecTrustEvaluate pass which invalidates
+	// the per-process trust anchor cache.
+	if runtime.GOOS == "darwin" {
+		flush := exec.Command("security", "verify-cert", "-c", tmpFile.Name())
+		// Ignore exit code — the cert may not yet be a trusted anchor for all
+		// policies, but the side-effect (cache flush) still occurs.
+		_ = flush.Run()
+	}
+
 	render.JSON(w, r, render.M{"success": true})
 }
