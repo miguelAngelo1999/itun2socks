@@ -20,8 +20,15 @@ func selectedRouter() http.Handler {
 	return r
 }
 
-func setRuleSelectedId(w http.ResponseWriter, r *http.Request) {
+func proxyNameFromConfig(id string) string {
+	proxies, err := configuration2.GetProxies()
+	if err != nil {
+		return id
+	}
+	return proxyNameFromID(id, proxies)
+}
 
+func setRuleSelectedId(w http.ResponseWriter, r *http.Request) {
 	var req map[string]string
 	if err := render.DecodeJSON(r.Body, &req); err != nil {
 		render.Status(r, http.StatusBadRequest)
@@ -53,7 +60,6 @@ func setProxySelectedId(w http.ResponseWriter, r *http.Request) {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, ErrBadRequest)
 		return
-
 	}
 	proxySelectedId := req["id"]
 	if err := configuration2.SetSelectedId("proxy", proxySelectedId); err != nil {
@@ -76,6 +82,10 @@ func setProxySelectedId(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.UpdateProxy(proxy)
 	}
+
+	// Notify the auto-switch controller that the user made a manual selection.
+	// This sets a 10-min suppression hold so auto-switch doesn't override it.
+	go switchCtrl.NotifyManualSelect(proxySelectedId, proxyNameFromConfig(proxySelectedId))
 
 	render.NoContent(w, r)
 }

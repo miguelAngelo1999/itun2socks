@@ -96,6 +96,7 @@ func Start(addr string, secret string) error {
 		r.Mount("/event", eventRouter())
 		r.Mount("/subscription", subscriptionRouter())
 			r.Mount("/auth", authRouter())
+		r.Mount("/net-switch", netSwitchRouter())
 	})
 	go FileServer(r)
 	err := http.ListenAndServe(addr, r)
