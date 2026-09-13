@@ -49,7 +49,15 @@ func resolveMetadata(metadata *C.Metadata) rule_engine.Rule {
 		printLog = log.Debugln
 	}
 	cachedDomain, ok := dns.GetCachedDnsItem(remoteAddr)
-	if ok {
+	if rule.GetPolicy() == constants.PolicyReject {
+		// Log denied connections at warn level so they appear in orange in the
+		// log view and are easy to spot without filtering.
+		if ok {
+			log.Warnln(log.FormatLog(logType, " [DENY] %s to %s(%s) matched rule: %s"), metadata.SourceAddress(), metadata.RemoteAddress(), cachedDomain, rule.GetPolicy())
+		} else {
+			log.Warnln(log.FormatLog(logType, " [DENY] %s to %s matched rule: %s"), metadata.SourceAddress(), metadata.RemoteAddress(), rule.GetPolicy())
+		}
+	} else if ok {
 		printLog(log.FormatLog(logType, " %s to %s(%s) using %s"), metadata.SourceAddress(), metadata.RemoteAddress(), cachedDomain, rule.GetPolicy())
 	} else {
 		printLog(log.FormatLog(logType, " %s to %s using %s"), metadata.SourceAddress(), metadata.RemoteAddress(), rule.GetPolicy())
