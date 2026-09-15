@@ -1005,11 +1005,16 @@ func (c *CompiledPAC) Eval(url, host string) (result string) {
 
 // ── wpad helper ──────────────────────────────────────────────────────────────
 
-// ProbeWPADUrl tries to find a PAC URL via WPAD DNS lookup.
-// Returns an empty string if not found.
+// ProbeWPADUrl tries to find a PAC URL via:
+//  1. OS-authoritative source first (DHCP option 252 / system proxy config /
+//     Windows registry) — no network probe needed, instant result.
+//  2. Parallel HTTP probes against all candidate WPAD URLs.
+//
+// All network probes run concurrently so the worst-case wait equals one probe
+// timeout, not N probes × timeout. Returns an empty string if not found.
 func ProbeWPADUrl() string {
 	if runtime.GOOS == "darwin" {
-		// Try ipconfig first (works as the user, not as root)
+		// ── Fast path: DHCP option 252 ──────────────────────────────────────
 		defaultIface := getDefaultIfaceName()
 		if defaultIface != "" {
 			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
@@ -1020,6 +1025,7 @@ func ProbeWPADUrl() string {
 						if len(parts) == 2 {
 							u := strings.TrimSpace(parts[1])
 							if strings.HasPrefix(u, "http") {
+								log.Infoln("[wpad] found via DHCP option 252: %s", u)
 								return u
 							}
 						}
@@ -1027,7 +1033,8 @@ func ProbeWPADUrl() string {
 				}
 			}
 		}
-		// Fallback: scutil --proxy works regardless of user context (even as root)
+
+		// ── Fast path: scutil --proxy (system proxy config) ─────────────────
 		out, err := exec.Command("scutil", "--proxy").Output()
 		if err == nil {
 			for _, line := range strings.Split(string(out), "\n") {
@@ -1037,43 +1044,47 @@ func ProbeWPADUrl() string {
 					if len(parts) == 2 {
 						u := strings.TrimSpace(parts[1])
 						if strings.HasPrefix(u, "http") {
+							log.Infoln("[wpad] found via scutil --proxy: %s", u)
 							return u
 						}
 					}
 				}
 			}
 		}
-		// Last resort: try the standard WPAD URL derived from DHCP domain
-		// Many corporate networks serve http://wpad.<domain>/wpad.dat
-		out2, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
-		if err == nil {
-			for _, line := range strings.Split(string(out2), "\n") {
-				if strings.Contains(line, "domain_name") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) == 2 {
-						domain := strings.TrimSpace(parts[1])
-						if domain != "" {
-							wpadUrl := "http://wpad." + domain + "/wpad.dat"
-							if probeURL(wpadUrl) {
-								return wpadUrl
+
+		// ── Slow path: parallel probes ──────────────────────────────────────
+		var candidates []string
+
+		// wpad.<domain> from DHCP domain_name
+		if defaultIface != "" {
+			out2, err2 := exec.Command("ipconfig", "getpacket", defaultIface).Output()
+			if err2 == nil {
+				for _, line := range strings.Split(string(out2), "\n") {
+					if strings.Contains(line, "domain_name") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) == 2 {
+							domain := strings.TrimSpace(parts[1])
+							if domain != "" {
+								candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
 							}
 						}
 					}
 				}
 			}
 		}
-		// Final fallback: try http://<gateway>/wpad.dat directly.
-		// Many corporate routers serve the PAC at their own IP without a
-		// DNS record or DHCP option set.
+
+		// http://<gateway>/wpad.dat
 		if gw := getDefaultGateway(); gw != "" {
-			wpadUrl := "http://" + gw + "/wpad.dat"
-			if probeURL(wpadUrl) {
-				return wpadUrl
-			}
+			candidates = append(candidates, "http://"+gw+"/wpad.dat")
+		}
+
+		if u := probeURLsParallel(candidates); u != "" {
+			return u
 		}
 	}
+
 	if runtime.GOOS == "windows" {
-		// 1. Explicit PAC in the registry, per-user then machine-wide.
+		// ── Fast path: Windows registry AutoConfigURL ────────────────────────
 		for _, hive := range []string{"HKCU", "HKLM"} {
 			out, err := exec.Command("powershell.exe",
 				"-noprofile", "-NonInteractive", "-command",
@@ -1082,25 +1093,59 @@ func ProbeWPADUrl() string {
 			if err == nil {
 				u := strings.TrimSpace(string(out))
 				if u != "" && strings.HasPrefix(u, "http") {
+					log.Infoln("[wpad] found via Windows registry (%s): %s", hive, u)
 					return u
 				}
 			}
 		}
-		// 2. WPAD by name, plain and per connection-specific DNS suffix. This is
-		// the DHCP option 252 / DNS devolution path the message advertises.
+
+		// ── Slow path: parallel probes ──────────────────────────────────────
 		candidates := []string{"http://wpad/wpad.dat"}
 		if domain := getWindowsDNSSuffix(); domain != "" {
 			candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
 		}
-		// 3. Many corporate routers serve the PAC at their own IP with no DHCP
-		// option and no DNS record, so try the default gateway last.
 		if gw := getDefaultGateway(); gw != "" {
 			candidates = append(candidates, "http://"+gw+"/wpad.dat")
 		}
-		for _, u := range candidates {
+
+		if u := probeURLsParallel(candidates); u != "" {
+			return u
+		}
+	}
+
+	return ""
+}
+
+// probeURLsParallel fires all candidate URLs concurrently and returns the first
+// one that responds with a valid PAC script. Returns "" if none do.
+// Each probe has a 1.5s timeout — WPAD is always local LAN so this is generous.
+func probeURLsParallel(candidates []string) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	type result struct {
+		url string
+	}
+	ch := make(chan result, len(candidates))
+
+	for _, u := range candidates {
+		u := u
+		go func() {
 			if probeURL(u) {
-				return u
+				ch <- result{url: u}
+			} else {
+				ch <- result{url: ""}
 			}
+		}()
+	}
+
+	// Collect results; return first success.
+	for range candidates {
+		r := <-ch
+		if r.url != "" {
+			log.Infoln("[wpad] found via parallel probe: %s", r.url)
+			return r.url
 		}
 	}
 	return ""
@@ -1152,8 +1197,10 @@ func probeURL(url string) bool {
 	// Discovery must go direct. The default transport honours HTTP_PROXY, and
 	// lux exports it while proxying, so an upstream proxy answers 200 for
 	// hostnames that do not resolve and every candidate looks reachable.
+	// WPAD is always local LAN — 1.5s is generous; 4s caused detection to feel
+	// broken on networks where the gateway is slow to reject.
 	client := &http.Client{
-		Timeout:   4 * time.Second,
+		Timeout:   1500 * time.Millisecond,
 		Transport: &http.Transport{Proxy: nil},
 	}
 	resp, err := client.Get(url)
