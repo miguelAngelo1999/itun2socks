@@ -143,6 +143,12 @@ func CredentialExpired(proxyIds []string) {
 	})
 }
 
+// NotifyAuthFailed is set by the API layer. The health-check calls it when the
+// selected proxy returns 407 (auth no longer valid), so the UI can prompt the
+// user to retype the password. Lives here as a hook to avoid an import cycle
+// (blackbox must not import configuration/api).
+var NotifyAuthFailed func()
+
 func FailoverAttempt(fromId, toId, toName string, success bool) {
 	Record("failover", fmt.Sprintf("from %s to %s (%s) success=%v", fromId[:8], toId[:8], toName, success), map[string]any{
 		"fromId": fromId, "toId": toId, "toName": toName, "success": success,

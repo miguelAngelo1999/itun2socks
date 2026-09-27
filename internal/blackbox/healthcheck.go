@@ -109,8 +109,12 @@ func probeConnectivity(proxyAddr string) bool {
 			return true
 		}
 		if code == "407" {
-			// Auth failed — proxy is reachable but creds are bad
+			// Auth failed — proxy is reachable but creds are bad. Tell the UI
+			// to prompt the user to retype the password.
 			Record("proxy-auth-probe-failed", "health probe got 407 from "+proxyAddr, nil)
+			if NotifyAuthFailed != nil {
+				NotifyAuthFailed()
+			}
 			return false
 		}
 	}

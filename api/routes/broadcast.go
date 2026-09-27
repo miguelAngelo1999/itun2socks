@@ -3,6 +3,7 @@ package routes
 import (
 	"encoding/json"
 
+	"github.com/igoogolx/itun2socks/internal/blackbox"
 	"github.com/igoogolx/itun2socks/internal/configuration"
 )
 
@@ -32,6 +33,21 @@ func init() {
 		BroadcastEvent("proxy-switch", map[string]any{
 			"proxyId": proxyId,
 			"name":    proxyName,
+		})
+	}
+	// When the health-check sees a 407 from the selected proxy (auth no longer
+	// valid), prompt the UI to retype the password for that proxy.
+	blackbox.NotifyAuthFailed = func() {
+		data, err := configuration.Read()
+		if err != nil {
+			return
+		}
+		selected := data.Selected.Proxy
+		if selected == "" {
+			return
+		}
+		BroadcastEvent("credential-expired", map[string]any{
+			"proxyIds": []string{selected},
 		})
 	}
 }
