@@ -37,3 +37,9 @@ func SetSOCKSProxy(ip string, port string) error {
 func DisableSOCKSProxy() error {
 	return errors.New("unsupported platform")
 }
+
+// setEnvProxyPlatform is a no-op on unsupported platforms.
+func setEnvProxyPlatform(_ string) {}
+
+// clearEnvProxyPlatform is a no-op on unsupported platforms.
+func clearEnvProxyPlatform() {}

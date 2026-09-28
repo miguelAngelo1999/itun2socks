@@ -17,11 +17,17 @@
 package sysproxy
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
 type ProxyType string
@@ -317,4 +323,75 @@ func getSOCKSProxy() (host string, port string, enabled bool, err error) {
 	}
 
 	return socksSettings.host, socksSettings.port, socksSettings.enabled, nil
+}
+
+// ── env-var proxy (macOS) ────────────────────────────────────────────────────
+
+// exportProxyCACerts exports all trusted CA certificates from the macOS System
+// Keychain into a PEM bundle that Node.js can read via NODE_EXTRA_CA_CERTS.
+//
+// Node.js does not read the macOS keychain — it has its own OpenSSL cert bundle.
+// The only official mechanism to add trust is NODE_EXTRA_CA_CERTS pointing at a
+// real PEM file. Setting it to the binary .keychain file does nothing.
+//
+// Returns the path to the written bundle, or "" on failure.
+func exportProxyCACerts() string {
+	bundlePath := filepath.Join(constants.Path.HomeDir(), "proxy_ca_bundle.pem")
+
+	var buf bytes.Buffer
+	for _, keychain := range []string{
+		"/Library/Keychains/System.keychain",
+		"/System/Library/Keychains/SystemRootCertificates.keychain",
+	} {
+		out, err := exec.Command("security", "find-certificate", "-a", "-p", keychain).Output()
+		if err != nil {
+			log.Debugln("[sysproxy] find-certificate %s: %v", keychain, err)
+			continue
+		}
+		buf.Write(out)
+	}
+	if buf.Len() == 0 {
+		log.Warnln("[sysproxy] exportProxyCACerts: no certs found, skipping bundle")
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Dir(bundlePath), 0755); err != nil {
+		log.Warnln("[sysproxy] exportProxyCACerts: mkdir failed: %v", err)
+		return ""
+	}
+	if err := os.WriteFile(bundlePath, buf.Bytes(), 0644); err != nil {
+		log.Warnln("[sysproxy] exportProxyCACerts: write failed: %v", err)
+		return ""
+	}
+	log.Infoln("[sysproxy] exported %d certs to %s", strings.Count(buf.String(), "BEGIN CERTIFICATE"), bundlePath)
+	return bundlePath
+}
+
+// setEnvProxyPlatform sets HTTP(S)_PROXY/ALL_PROXY and NODE_EXTRA_CA_CERTS in
+// the GUI session environment via `launchctl setenv`.
+func setEnvProxyPlatform(addr string) {
+	url := "http://" + addr
+	for _, key := range envProxyVars {
+		if err := exec.Command("launchctl", "setenv", key, url).Run(); err != nil {
+			log.Debugln("[sysproxy] launchctl setenv %s: %v", key, err)
+		}
+	}
+	if bundlePath := exportProxyCACerts(); bundlePath != "" {
+		_ = exec.Command("launchctl", "setenv", "NODE_EXTRA_CA_CERTS", bundlePath).Run()
+		log.Infoln("[sysproxy] NODE_EXTRA_CA_CERTS → %s", bundlePath)
+	}
+	log.Infoln("[sysproxy] set env proxy to %s", url)
+}
+
+// clearEnvProxyPlatform removes the env vars set by setEnvProxyPlatform.
+func clearEnvProxyPlatform() {
+	keys := append([]string{}, envProxyVars...)
+	keys = append(keys,
+		"NODE_EXTRA_CA_CERTS",
+		// Legacy: unset even if we stopped setting them.
+		"NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS",
+	)
+	for _, key := range keys {
+		_ = exec.Command("launchctl", "unsetenv", key).Run()
+	}
+	log.Infoln("[sysproxy] cleared env proxy and Node TLS vars")
 }

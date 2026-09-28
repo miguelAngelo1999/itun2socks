@@ -44,6 +44,94 @@ var (
 	prevSaved      bool
 )
 
+// prevConnDefault / prevConnLegacy hold the original binary connection-settings
+// blobs (DefaultConnectionSettings / SavedLegacySettings) so the WPAD
+// "Automatically detect settings" bit can be restored exactly on disable.
+var (
+	prevConnDefault []byte
+	prevConnLegacy  []byte
+	prevConnSaved   bool
+)
+
+const connectionsKeyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections`
+
+// clearAutoDetectBit clears bit 0x08 ("Automatically detect settings" / WPAD)
+// in a DefaultConnectionSettings-format binary blob and bumps the change
+// counter (bytes 4-7, little-endian) so WinINET reloads it.
+//
+// The blob layout (see MS-format notes / community reverse-engineering):
+//   bytes 0-3  : format version (usually 0x46)
+//   bytes 4-7  : counter, incremented on every change
+//   byte  8    : flags — 0x01 manual proxy, 0x02 PAC script, 0x08 auto-detect
+// Returns a NEW slice; the input is not mutated.
+func clearAutoDetectBit(blob []byte) []byte {
+	if len(blob) < 9 {
+		// Malformed/empty. Build a minimal valid blob: version 0x46, counter 1,
+		// flags 0x01 (manual proxy on, auto-detect off, no PAC).
+		return []byte{0x46, 0, 0, 0, 1, 0, 0, 0, 0x01, 0, 0, 0}
+	}
+	out := make([]byte, len(blob))
+	copy(out, blob)
+	// Clear the auto-detect (0x08) and PAC (0x02) bits, keep proxy (0x01) on.
+	out[8] &^= 0x08
+	// Bump the little-endian counter at bytes 4-7 so the change is honoured.
+	ctr := uint32(out[4]) | uint32(out[5])<<8 | uint32(out[6])<<16 | uint32(out[7])<<24
+	ctr++
+	out[4] = byte(ctr)
+	out[5] = byte(ctr >> 8)
+	out[6] = byte(ctr >> 16)
+	out[7] = byte(ctr >> 24)
+	return out
+}
+
+// disableWpadAutoDetect rewrites the binary connection-settings blobs to turn
+// off "Automatically detect settings". Writing the AutoDetect DWORD alone (as
+// older lux builds did) does NOT uncheck the box — WinINET reads the WPAD state
+// from bit 0x08 of DefaultConnectionSettings, not from that DWORD. Saves the
+// originals into prevConn* for restoration.
+func disableWpadAutoDetect() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, connectionsKeyPath, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+
+	if !prevConnSaved {
+		prevConnDefault, _, _ = k.GetBinaryValue("DefaultConnectionSettings")
+		prevConnLegacy, _, _ = k.GetBinaryValue("SavedLegacySettings")
+		prevConnSaved = true
+	}
+
+	if def, _, e := k.GetBinaryValue("DefaultConnectionSettings"); e == nil && len(def) > 0 {
+		_ = k.SetBinaryValue("DefaultConnectionSettings", clearAutoDetectBit(def))
+	}
+	if leg, _, e := k.GetBinaryValue("SavedLegacySettings"); e == nil && len(leg) > 0 {
+		_ = k.SetBinaryValue("SavedLegacySettings", clearAutoDetectBit(leg))
+	}
+}
+
+// restoreWpadAutoDetect puts the original connection-settings blobs back so the
+// user's prior "Automatically detect settings" state returns when lux stops.
+func restoreWpadAutoDetect() {
+	if !prevConnSaved {
+		return
+	}
+	k, err := registry.OpenKey(registry.CURRENT_USER, connectionsKeyPath, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	if len(prevConnDefault) > 0 {
+		_ = k.SetBinaryValue("DefaultConnectionSettings", prevConnDefault)
+	}
+	if len(prevConnLegacy) > 0 {
+		_ = k.SetBinaryValue("SavedLegacySettings", prevConnLegacy)
+	}
+	prevConnSaved = false
+	prevConnDefault = nil
+	prevConnLegacy = nil
+}
+
 // https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags
 // INTERNET_OPTION_SETTINGS_CHANGED: 39
 // Notifies the system that the registry settings have been changed so that it verifies the settings on the next call to InternetConnect.
@@ -101,6 +189,11 @@ func setProxySettings(settings *proxySettings) error {
 			prevSaved = true
 		}
 	}
+	// The AutoDetect DWORD above is not what the Windows proxy UI / WPAD reads;
+	// the real "Automatically detect settings" state lives in bit 0x08 of the
+	// binary DefaultConnectionSettings blob. Clear it there too, or traffic can
+	// still be diverted to a WPAD-discovered proxy and bypass lux.
+	disableWpadAutoDetect()
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
@@ -132,6 +225,9 @@ func disableProxy() error {
 		}
 		prevSaved = false
 	}
+	// Restore the original binary connection-settings blob (and thus the user's
+	// prior "Automatically detect settings" state).
+	restoreWpadAutoDetect()
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
