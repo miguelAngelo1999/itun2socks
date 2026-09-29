@@ -9,8 +9,23 @@ func Set(addr string, activeInterface string) error {
 	if err != nil {
 		return err
 	}
-	if err := SetWebProxy(host, port, activeInterface); err != nil {
-		return err
+	// Set the proxy on ALL active network services (Wi-Fi, USB Ethernet, etc.),
+	// not just the one behind the default route. Otherwise plugging in a USB
+	// ethernet adapter — or any service that isn't the current default — never
+	// gets the proxy. getAllNetworkServices() returns nil on non-macOS (and if
+	// networksetup fails), so those platforms fall back to the single-interface
+	// call, which is correct: on Windows SetWebProxy ignores the interface and
+	// sets the system-wide WinINET proxy anyway.
+	services := getAllNetworkServices()
+	if len(services) == 0 {
+		if err := SetWebProxy(host, port, activeInterface); err != nil {
+			return err
+		}
+	} else {
+		for _, svc := range services {
+			// Ignore per-service errors — some services don't support a proxy.
+			_ = SetWebProxy(host, port, svc)
+		}
 	}
 	setEnvProxy(addr)
 	// Exempt all UWP apps from network isolation so they can reach the local proxy.
@@ -22,7 +37,15 @@ func Clear(activeInterface string) error {
 	clearEnvProxy()
 	// Restore default UWP network isolation.
 	go clearUWPLoopbackExemptions()
-	return DisableWebProxy(activeInterface)
+	// Clear the proxy on ALL active network services (mirror of Set).
+	services := getAllNetworkServices()
+	if len(services) == 0 {
+		return DisableWebProxy(activeInterface)
+	}
+	for _, svc := range services {
+		_ = DisableWebProxy(svc)
+	}
+	return nil
 }
 
 // envProxyVars is the canonical list of proxy env vars lux sets so that CLI

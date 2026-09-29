@@ -395,3 +395,32 @@ func clearEnvProxyPlatform() {
 	}
 	log.Infoln("[sysproxy] cleared env proxy and Node TLS vars")
 }
+
+// getAllNetworkServices returns all ENABLED network services reported by
+// `networksetup -listallnetworkservices` (Wi-Fi, USB Ethernet, Thunderbolt
+// Bridge, etc.). Setting the proxy on every service — rather than only the one
+// behind the default route — is what makes a USB ethernet adapter (or any
+// non-default service) get the proxy too.
+//
+// The first output line is a header; services prefixed with `*` are disabled
+// and skipped. Returns nil on failure so callers fall back to the single-
+// interface path.
+func getAllNetworkServices() []string {
+	out, err := exec.Command("networksetup", "-listallnetworkservices").Output()
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var services []string
+	for i, line := range lines {
+		if i == 0 {
+			continue // header: "An asterisk (*) denotes that a network service is disabled."
+		}
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "*") {
+			continue // blank, or a disabled service
+		}
+		services = append(services, line)
+	}
+	return services
+}

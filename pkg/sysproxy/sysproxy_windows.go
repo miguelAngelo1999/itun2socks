@@ -144,6 +144,11 @@ const (
 	INTERNET_OPTION_REFRESH          = 37
 )
 
+// getAllNetworkServices returns nil on Windows: the WinINET proxy set by
+// SetWebProxy is system-wide (per-user), not per network service, so there is
+// nothing to enumerate. Set/Clear fall back to the single call.
+func getAllNetworkServices() []string { return nil }
+
 func SetWebProxy(host string, port string, _ string) error {
 
 	settings := &proxySettings{
