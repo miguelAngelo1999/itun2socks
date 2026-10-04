@@ -44,13 +44,17 @@ func broadcastEnvChange() {
 	)
 }
 
-// exportProxyCACerts dumps the Windows trusted Root CA store to a PEM bundle so
+// exportProxyCACerts dumps the Windows trusted CA stores to a PEM bundle so
 // Node.js (which ships its own CA list and ignores the Windows store) can trust
-// a corporate proxy's CA via NODE_EXTRA_CA_CERTS. Returns "" on failure.
+// a corporate proxy's MITM CA via NODE_EXTRA_CA_CERTS. Returns "" on failure.
 //
-// certutil is present on every Windows install. `-store Root` prints the
-// machine Root store; we also append the CurrentUser Root store to catch CAs
-// installed per-user (which is where lux's own cert installer may place them).
+// It enumerates, in BOTH the CurrentUser and LocalMachine locations:
+//   - Root     : trusted root CAs (where most installers, incl. lux, place a CA)
+//   - CA       : intermediate CAs — some proxy MITM setups install their CA here
+//   - AuthRoot : the auto-updated third-party root store
+// Scanning all three (not just Root) is what guarantees the proxy's CA is
+// captured regardless of which store it landed in. Certs are de-duplicated by
+// thumbprint so a cert present in several stores is emitted once.
 func exportProxyCACerts() string {
 	bundlePath := filepath.Join(constants.Path.HomeDir(), "proxy_ca_bundle.pem")
 	if err := os.MkdirAll(filepath.Dir(bundlePath), 0755); err != nil {
@@ -58,13 +62,18 @@ func exportProxyCACerts() string {
 		return ""
 	}
 
-	// PowerShell one-liner: enumerate both Root stores and emit base64 PEM.
+	// PowerShell: walk every (location, store) pair, dedupe by thumbprint, emit
+	// base64 PEM for each unique cert.
 	ps := `$ErrorActionPreference='SilentlyContinue';` +
-		`$out=@();` +
+		`$seen=@{};$out=@();` +
 		`foreach($loc in 'CurrentUser','LocalMachine'){` +
-		`  foreach($c in Get-ChildItem "Cert:\$loc\Root"){` +
-		`    $b=[Convert]::ToBase64String($c.RawData,'InsertLineBreaks');` +
-		`    $out += "-----BEGIN CERTIFICATE-----`+"`n"+`$b`+"`n"+`-----END CERTIFICATE-----"` +
+		`  foreach($store in 'Root','CA','AuthRoot'){` +
+		`    foreach($c in Get-ChildItem "Cert:\$loc\$store"){` +
+		`      if($seen.ContainsKey($c.Thumbprint)){continue};` +
+		`      $seen[$c.Thumbprint]=$true;` +
+		`      $b=[Convert]::ToBase64String($c.RawData,'InsertLineBreaks');` +
+		`      $out += "-----BEGIN CERTIFICATE-----`+"`n"+`$b`+"`n"+`-----END CERTIFICATE-----"` +
+		`    }` +
 		`  }` +
 		`};` +
 		`Set-Content -Path '` + bundlePath + `' -Value ($out -join "` + "`n" + `") -Encoding ascii`
@@ -77,7 +86,7 @@ func exportProxyCACerts() string {
 		log.Warnln("[sysproxy] exportProxyCACerts: empty/missing bundle")
 		return ""
 	}
-	log.Infoln("[sysproxy] exported trusted roots to %s", bundlePath)
+	log.Infoln("[sysproxy] exported trusted CAs (Root+CA+AuthRoot) to %s", bundlePath)
 	return bundlePath
 }
 
