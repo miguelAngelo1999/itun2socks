@@ -730,6 +730,36 @@ func indexOfRule(c Config, id string) int {
 	return -1
 }
 
+// dedupeRuleIds repairs a config that contains more than one rule sharing the
+// same id. Historically (pre-id-store migrations, and a legacy add path) two
+// rules could end up with the same id on disk; the symptom is a rule that
+// appears twice in the UI, where editing only ever hits the first copy and the
+// second cannot be addressed or deleted (its id resolves to the first, so a
+// delete either removes the wrong row or 404s on the count check).
+//
+// This keeps the FIRST occurrence of each id untouched and assigns a fresh
+// unique id (and slug) to every later duplicate, so both rules become
+// independently editable and deletable. It also repairs an empty/blank id.
+// Returns true if it changed anything (so the caller can persist the repair).
+func dedupeRuleIds(c *Config) bool {
+	seen := make(map[string]bool, len(c.CustomizedRules))
+	changed := false
+	for i := range c.CustomizedRules {
+		id := c.CustomizedRules[i].Id
+		if id == "" || seen[id] {
+			newId := nextRuleId(c)
+			c.CustomizedRules[i].Id = newId
+			c.CustomizedRules[i].Slug = uniqueSlug(
+				makeSlug(c.CustomizedRules[i], *c), slugsInUse(*c, newId))
+			seen[newId] = true
+			changed = true
+			continue
+		}
+		seen[id] = true
+	}
+	return changed
+}
+
 func indexOfGroup(c Config, id string) int {
 	for i, g := range c.RuleGroups {
 		if g.Id == id {

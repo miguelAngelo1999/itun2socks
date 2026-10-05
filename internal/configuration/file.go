@@ -44,6 +44,13 @@ func Read() (Config, error) {
 		config.Proxy[i] = decryptProxyPasswords(proxy)
 	}
 
+	// Repair duplicate rule ids on every read. A config with two rules sharing
+	// one id makes a rule appear twice in the UI, uneditable/undeletable past
+	// the first copy. dedupeRuleIds reassigns a fresh id to each later
+	// duplicate so both become independent. Done in-memory here (Read holds a
+	// read lock and cannot persist); the next mutation's Write makes it durable.
+	dedupeRuleIds(config)
+
 	// Derive the broken flag on every read instead of trusting what is on disk.
 	//
 	// Broken is computed state: it means "the proxy this rule targets is gone".
