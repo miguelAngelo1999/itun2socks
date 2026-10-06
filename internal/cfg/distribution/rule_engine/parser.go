@@ -60,10 +60,20 @@ func parseToParsedRules(name string, extraRules []string, knownProxyIds []string
 		return nil, err
 	}
 
-	for _, line := range extraRules {
-		rule, protocol, err := parseRawValueWithProtocol(line, knownProxyIds)
-		if err == nil {
-			rules = append(rules, ParsedRule{Rule: rule, Protocol: protocol})
+	// bypass_all means "everything DIRECT, no exceptions" — skip custom rules
+	// entirely so the built-in catch-all (DOMAIN-REGEX .* DIRECT + IP-CIDR
+	// 0.0.0.0/0 DIRECT) fires for all traffic. Without this, 74 custom rules
+	// match first and route their traffic through a proxy even though the user
+	// selected "bypass all." Same for proxy_all: the intent is to proxy
+	// everything, so custom DIRECT rules should not override it.
+	skipCustom := name == "bypass_all" || name == "proxy_all"
+
+	if !skipCustom {
+		for _, line := range extraRules {
+			rule, protocol, err := parseRawValueWithProtocol(line, knownProxyIds)
+			if err == nil {
+				rules = append(rules, ParsedRule{Rule: rule, Protocol: protocol})
+			}
 		}
 	}
 	for _, line := range builtInItems {
