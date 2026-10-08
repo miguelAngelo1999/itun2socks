@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/igoogolx/itun2socks/internal/configuration"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
@@ -32,6 +33,13 @@ func (c *SystemProxyClient) Start() error {
 	}
 
 	addr := "127.0.0.1:" + strconv.Itoa(c.localserver.Port)
+	// Derive OS-proxy exception entries from the user's DIRECT rules (e.g. a LAN
+	// IP-CIDR) so the browser bypasses the proxy for them, matching what the
+	// user would otherwise set by hand in the OS proxy exception list. Best
+	// effort — a failure here must not block the proxy from starting.
+	if bypass, bErr := configuration.DirectBypassEntries(); bErr == nil {
+		sysproxy.SetExtraBypass(bypass)
+	}
 	err = sysproxy.Set(addr, c.activeInterface)
 	if err != nil {
 		return err

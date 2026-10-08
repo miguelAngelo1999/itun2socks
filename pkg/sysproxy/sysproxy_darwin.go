@@ -92,7 +92,48 @@ func SetWebProxy(host string, port string, activeInterface string) error {
 		return fmt.Errorf("set https proxy on %q: %w", service, err)
 	}
 
+	// Merge DIRECT-rule bypass entries into this service's exception list so the
+	// browser bypasses the proxy for them (e.g. a LAN DVR/camera). Preserves the
+	// user's existing bypass entries.
+	mergeBypassDomains(service, getExtraBypass())
+
 	return nil
+}
+
+// mergeBypassDomains adds entries to a service's proxy bypass list without
+// dropping what is already there. networksetup -setproxybypassdomains replaces
+// the whole list, so we read the current one first and set the union.
+func mergeBypassDomains(service string, extra []string) {
+	if len(extra) == 0 {
+		return
+	}
+	out, err := exec.Command("networksetup", "-getproxybypassdomains", service).Output()
+	seen := map[string]bool{}
+	var merged []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[strings.ToLower(s)] {
+			return
+		}
+		seen[strings.ToLower(s)] = true
+		merged = append(merged, s)
+	}
+	if err == nil {
+		text := string(out)
+		if !strings.Contains(strings.ToLower(text), "there aren't any") {
+			for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+				add(line)
+			}
+		}
+	}
+	for _, e := range extra {
+		add(e)
+	}
+	if len(merged) == 0 {
+		return
+	}
+	args := append([]string{"-setproxybypassdomains", service}, merged...)
+	_ = exec.Command("networksetup", args...).Run()
 }
 
 func DisableWebProxy(activeInterface string) error {

@@ -2,7 +2,31 @@ package sysproxy
 
 import (
 	"net"
+	"sync"
 )
+
+// extraBypass holds OS-proxy exception entries derived from the user's DIRECT
+// rules. Set() stores them here and the per-OS SetWebProxy reads them when
+// building the exception list, so a DIRECT rule for a LAN device also makes the
+// browser bypass the proxy for it (not just lux_core's internal routing).
+var (
+	extraBypassMux sync.RWMutex
+	extraBypass    []string
+)
+
+// SetExtraBypass records the bypass entries to merge into the OS exception list
+// on the next Set(). Call before Set().
+func SetExtraBypass(entries []string) {
+	extraBypassMux.Lock()
+	extraBypass = append([]string(nil), entries...)
+	extraBypassMux.Unlock()
+}
+
+func getExtraBypass() []string {
+	extraBypassMux.RLock()
+	defer extraBypassMux.RUnlock()
+	return append([]string(nil), extraBypass...)
+}
 
 func Set(addr string, activeInterface string) error {
 	host, port, err := net.SplitHostPort(addr)

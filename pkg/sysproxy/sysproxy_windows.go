@@ -184,10 +184,17 @@ const (
 func getAllNetworkServices() []string { return nil }
 
 func SetWebProxy(host string, port string, _ string) error {
-
+	// Lux's always-on exceptions plus any derived from the user's DIRECT rules
+	// (e.g. a LAN IP-CIDR -> 192.168.61.*), so the browser bypasses the proxy
+	// for them. These are MERGED with the user's own ProxyOverride in
+	// setProxySettings, never replacing it.
+	override := "*.local;<local>"
+	for _, e := range getExtraBypass() {
+		override += ";" + e
+	}
 	settings := &proxySettings{
 		proxyServer:   net.JoinHostPort(host, port),
-		proxyOverride: "*.local;<local>",
+		proxyOverride: override,
 	}
 
 	return setProxySettings(settings)

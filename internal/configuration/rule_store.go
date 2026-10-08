@@ -81,6 +81,93 @@ func EffectiveRules() ([]RuleItem, error) {
 	return effectiveFrom(c), nil
 }
 
+// DirectBypassEntries returns OS-proxy "exception list" patterns derived from
+// the user's enabled DIRECT rules (IP-CIDR, DOMAIN, DOMAIN-SUFFIX,
+// DOMAIN-KEYWORD). These are handed to the system proxy so the browser/OS
+// never routes that traffic to the proxy in the first place.
+//
+// This is why a Lux "DIRECT" rule alone was not enough for a LAN device
+// (DVR/camera): in system/mixed mode the browser still CONNECTed to the proxy
+// for that IP, and lux_core's own DIRECT dial could not reach the LAN host the
+// same way a true browser-direct connection would. Pushing the rule into the
+// OS exception list makes the browser bypass the proxy entirely for it —
+// exactly like editing Windows Internet Options by hand.
+//
+// Entry forms produced (both WinINET ProxyOverride and macOS
+// -setproxybypassdomains accept them):
+//   - IP-CIDR 192.168.61.0/23      -> "192.168.61.*" (prefix wildcard)
+//   - IP-CIDR single host a.b.c.d  -> "a.b.c.d"
+//   - DOMAIN         example.com   -> "example.com"
+//   - DOMAIN-SUFFIX  example.com   -> "*.example.com" and "example.com"
+//   - DOMAIN-KEYWORD foo           -> "*foo*"
+func DirectBypassEntries() ([]string, error) {
+	c, err := Read()
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[strings.ToLower(s)] {
+			return
+		}
+		seen[strings.ToLower(s)] = true
+		out = append(out, s)
+	}
+	for _, r := range effectiveFrom(c) {
+		if r.Policy.Kind != PolicyKindDirect {
+			continue
+		}
+		for _, cond := range r.Conditions {
+			val := strings.TrimSpace(cond.Value)
+			if val == "" {
+				continue
+			}
+			switch strings.ToUpper(cond.Type) {
+			case string(constants.RuleIpCidr):
+				add(cidrToBypass(val))
+			case string(constants.RuleDomain):
+				add(val)
+			case string(constants.RuleDomainSuffix):
+				add("*." + strings.TrimPrefix(val, "."))
+				add(strings.TrimPrefix(val, "."))
+			case string(constants.RuleDomainKeyword):
+				add("*" + val + "*")
+			}
+		}
+	}
+	return out, nil
+}
+
+// cidrToBypass converts an IP-CIDR to a proxy-bypass wildcard. For common /8,
+// /16, /24 (and the frequent /23 the user hit) it emits an octet-prefix
+// wildcard like "192.168.61.*"; otherwise it falls back to the bare IP, which
+// still bypasses that exact host.
+func cidrToBypass(cidr string) string {
+	ip, mask, found := strings.Cut(cidr, "/")
+	if !found {
+		return ip // single host
+	}
+	octets := strings.Split(ip, ".")
+	if len(octets) != 4 {
+		return ip
+	}
+	switch strings.TrimSpace(mask) {
+	case "8":
+		return octets[0] + ".*"
+	case "16":
+		return octets[0] + "." + octets[1] + ".*"
+	case "23", "24":
+		return octets[0] + "." + octets[1] + "." + octets[2] + ".*"
+	case "32":
+		return ip
+	default:
+		// Non-octet mask: bypass the network base host at least.
+		return octets[0] + "." + octets[1] + "." + octets[2] + ".*"
+	}
+}
+
 func effectiveFrom(c Config) []RuleItem {
 	groups := make([]RuleGroup, len(c.RuleGroups))
 	copy(groups, c.RuleGroups)
