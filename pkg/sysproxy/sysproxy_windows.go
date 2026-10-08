@@ -44,6 +44,40 @@ var (
 	prevSaved      bool
 )
 
+// prevProxyOverride remembers the user's ProxyOverride (proxy exception list)
+// from before lux enabled its proxy, so it can be restored on disable instead
+// of being wiped. mergeProxyOverride adds lux's required entries without
+// dropping the user's.
+var (
+	prevProxyOverride string
+	prevOverrideSaved bool
+)
+
+// mergeProxyOverride returns existing ';'-separated bypass entries with the
+// entries in `required` appended, de-duplicated (case-insensitive), order
+// preserved (existing first). Either side may be empty.
+func mergeProxyOverride(existing, required string) string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		for _, e := range strings.Split(s, ";") {
+			e = strings.TrimSpace(e)
+			if e == "" {
+				continue
+			}
+			k := strings.ToLower(e)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, e)
+		}
+	}
+	add(existing)
+	add(required)
+	return strings.Join(out, ";")
+}
+
 // prevConnDefault / prevConnLegacy hold the original binary connection-settings
 // blobs (DefaultConnectionSettings / SavedLegacySettings) so the WPAD
 // "Automatically detect settings" bit can be restored exactly on disable.
@@ -208,7 +242,16 @@ func setProxySettings(settings *proxySettings) error {
 	if err = key.SetStringValue("ProxyServer", settings.proxyServer); err != nil {
 		return err
 	}
-	if err = key.SetStringValue("ProxyOverride", settings.proxyOverride); err != nil {
+	// Preserve the user's existing proxy exception list. Save the original once
+	// so it can be restored on disable, then MERGE our required entries into it
+	// rather than replacing it — overwriting ProxyOverride wiped the user's
+	// manually-configured bypass hosts on every enable.
+	if !prevOverrideSaved {
+		prevProxyOverride, _, _ = key.GetStringValue("ProxyOverride")
+		prevOverrideSaved = true
+	}
+	merged := mergeProxyOverride(prevProxyOverride, settings.proxyOverride)
+	if err = key.SetStringValue("ProxyOverride", merged); err != nil {
 		return err
 	}
 	// Finally, enable the proxy
@@ -238,6 +281,18 @@ func disableProxy() error {
 		return err
 	}
 	defer key.Close()
+
+	// Restore the user's original proxy exception list (ProxyOverride) that we
+	// merged into on enable, so lux leaves it exactly as it found it.
+	if prevOverrideSaved {
+		if prevProxyOverride == "" {
+			key.DeleteValue("ProxyOverride")
+		} else {
+			key.SetStringValue("ProxyOverride", prevProxyOverride)
+		}
+		prevOverrideSaved = false
+		prevProxyOverride = ""
+	}
 
 	// Set ProxyEnable to 0
 	err = key.SetDWordValue("ProxyEnable", 0)
