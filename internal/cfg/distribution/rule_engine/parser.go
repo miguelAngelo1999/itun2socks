@@ -60,21 +60,24 @@ func parseToParsedRules(name string, extraRules []string, knownProxyIds []string
 		return nil, err
 	}
 
-	// bypass_all means "everything DIRECT, no exceptions" — skip custom rules
-	// entirely so the built-in catch-all (DOMAIN-REGEX .* DIRECT + IP-CIDR
-	// 0.0.0.0/0 DIRECT) fires for all traffic. Without this, 74 custom rules
-	// match first and route their traffic through a proxy even though the user
-	// selected "bypass all." Same for proxy_all: the intent is to proxy
-	// everything, so custom DIRECT rules should not override it.
-	skipCustom := name == "bypass_all" || name == "proxy_all"
+	// bypass_all / proxy_all: skip custom DIRECT/PROXY/SELECTED rules so the
+	// built-in catch-all actually bypasses (or proxies) everything — otherwise
+	// custom routing rules match first and the mode doesn't do what its name
+	// says. BUT keep custom REJECT rules: ad/analytics/malware blocking should
+	// apply in EVERY mode (a REJECT blocks, it never routes through a proxy, so
+	// honoring it does not violate "bypass all"). Without this, ads passed
+	// straight through DIRECT in bypass_all and the Denied log stayed empty.
+	rejectOnly := name == "bypass_all" || name == "proxy_all"
 
-	if !skipCustom {
-		for _, line := range extraRules {
-			rule, protocol, err := parseRawValueWithProtocol(line, knownProxyIds)
-			if err == nil {
-				rules = append(rules, ParsedRule{Rule: rule, Protocol: protocol})
-			}
+	for _, line := range extraRules {
+		rule, protocol, err := parseRawValueWithProtocol(line, knownProxyIds)
+		if err != nil {
+			continue
 		}
+		if rejectOnly && rule.GetPolicy() != constants.PolicyReject {
+			continue
+		}
+		rules = append(rules, ParsedRule{Rule: rule, Protocol: protocol})
 	}
 	for _, line := range builtInItems {
 		// Built-in sets never carry a protocol field or a named proxy.
