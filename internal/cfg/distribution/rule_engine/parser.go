@@ -60,22 +60,39 @@ func parseToParsedRules(name string, extraRules []string, knownProxyIds []string
 		return nil, err
 	}
 
-	// bypass_all / proxy_all: skip custom DIRECT/PROXY/SELECTED rules so the
-	// built-in catch-all actually bypasses (or proxies) everything — otherwise
-	// custom routing rules match first and the mode doesn't do what its name
-	// says. BUT keep custom REJECT rules: ad/analytics/malware blocking should
-	// apply in EVERY mode (a REJECT blocks, it never routes through a proxy, so
-	// honoring it does not violate "bypass all"). Without this, ads passed
-	// straight through DIRECT in bypass_all and the Denied log stayed empty.
+	// Catch-all modes filter which custom rules survive, so the built-in
+	// catch-all actually does what the mode name says. Three shapes:
+	//
+	//   bypass_all / proxy_all   — keep only REJECT custom rules (ad/malware
+	//     blocking applies in every mode; a REJECT blocks, never routes through
+	//     a proxy, so it doesn't violate "bypass/proxy all"). Everything else
+	//     (DIRECT/PROXY/named-proxy) is dropped so routing is uniform.
+	//
+	//   bypass_except_proxy      — "ignorar tudo" but honor per-proxy rules:
+	//     keep REJECT **and** rules targeting a SPECIFIC named proxy (policy is
+	//     a proxy id, i.e. not a built-in DIRECT/REJECT/PROXY). Drop generic
+	//     DIRECT and PROXY-selected rules. Lets a few domains/processes go to
+	//     their dedicated proxy while all other traffic is DIRECT.
+	//
+	// A rule's GetPolicy() is a built-in (DIRECT/REJECT/PROXY) or a proxy id.
 	rejectOnly := name == "bypass_all" || name == "proxy_all"
+	keepRejectAndNamedProxy := name == "bypass_except_proxy"
 
 	for _, line := range extraRules {
 		rule, protocol, err := parseRawValueWithProtocol(line, knownProxyIds)
 		if err != nil {
 			continue
 		}
-		if rejectOnly && rule.GetPolicy() != constants.PolicyReject {
+		pol := rule.GetPolicy()
+		if rejectOnly && pol != constants.PolicyReject {
 			continue
+		}
+		if keepRejectAndNamedProxy {
+			// Keep REJECT and named-proxy rules; drop DIRECT and PROXY-selected.
+			isNamedProxy := !constants.IsBuiltInPolicy(pol)
+			if pol != constants.PolicyReject && !isNamedProxy {
+				continue
+			}
 		}
 		rules = append(rules, ParsedRule{Rule: rule, Protocol: protocol})
 	}
