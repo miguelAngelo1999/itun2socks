@@ -1003,6 +1003,53 @@ func (c *CompiledPAC) Eval(url, host string) (result string) {
 	}
 }
 
+// EvalRaw is like Eval but reports whether evaluation timed out instead of
+// collapsing a timeout to a conservative "DIRECT". A PAC-only (dynamic) outbound
+// uses this so it can FAIL a dial on timeout rather than silently connecting
+// direct — a silent DIRECT there would leak traffic around the proxy.
+//
+// On a panic (malformed body) it still returns ("DIRECT", false): a parse panic
+// is a definitive result, not a transient timeout.
+func (c *CompiledPAC) EvalRaw(url, host string) (result string, timedOut bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warnln("[pac] evaluator panic for %s: %v — returning DIRECT", host, r)
+			result = "DIRECT"
+			timedOut = false
+		}
+	}()
+
+	done := make(chan string, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- "DIRECT"
+			}
+		}()
+		lex := newLexer(c.body)
+		p := &parser{lex: lex, host: host, url: url}
+		for {
+			t := p.peek()
+			if t.kind == tokEOF {
+				done <- "DIRECT"
+				return
+			}
+			if res, ok := p.parseStatement(); ok {
+				done <- res
+				return
+			}
+		}
+	}()
+
+	select {
+	case res := <-done:
+		return res, false
+	case <-time.After(200 * time.Millisecond):
+		log.Warnln("[pac] eval timeout for %s", host)
+		return "", true
+	}
+}
+
 // ── wpad helper ──────────────────────────────────────────────────────────────
 
 // ProbeWPADUrl tries to find a PAC URL via:

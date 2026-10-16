@@ -15,6 +15,27 @@ func ParseProxy(mapping map[string]any) (C.Proxy, error) {
 		return nil, fmt.Errorf("missing type")
 	}
 
+	// PAC-only proxy: no fixed upstream server, a PAC URL supplies the upstream
+	// per connection. Detected by an empty server + a non-empty pacUrl. This is
+	// checked BEFORE the type switch so the normal server-based paths stay
+	// byte-for-byte unchanged (zero regression on the PAC-gates-a-server path,
+	// which keeps a real server and is handled by the switch below).
+	server, _ := mapping["server"].(string)
+	pacUrl, _ := mapping["pacUrl"].(string)
+	if server == "" && pacUrl != "" {
+		id, _ := mapping["id"].(string)
+		user, _ := mapping["username"].(string)
+		pass, _ := mapping["password"].(string)
+		name, _ := mapping["name"].(string)
+		dyn := outbound.NewPacDynamic(outbound.PacDynamicOption{
+			Name:     name,
+			ProxyId:  id,
+			UserName: user,
+			Password: pass,
+		})
+		return NewProxy(dyn), nil
+	}
+
 	var (
 		proxy C.ProxyAdapter
 		err   error

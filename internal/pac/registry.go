@@ -28,6 +28,7 @@ type Registry struct {
 type entry struct {
 	proxyId  string
 	pacUrl   string
+	pacOnly  bool         // true when this proxy has no fixed server (PAC supplies the upstream)
 	compiled *CompiledPAC // nil means fetch/compile failed; traffic goes through the proxy
 }
 
@@ -56,6 +57,8 @@ func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
 		url, _ := p["pacUrl"].(string)
+		server, _ := p["server"].(string)
+		pacOnly := server == ""
 		if id == "" || url == "" {
 			continue
 		}
@@ -63,13 +66,15 @@ func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
 
 		existing := r.entries[id]
 		if existing != nil && existing.pacUrl == url {
-			// URL unchanged — keep the compiled version.
+			// URL unchanged — keep the compiled version, but refresh the
+			// pacOnly flag in case the server field changed.
+			existing.pacOnly = pacOnly
 			continue
 		}
 
 		// New or changed: fetch and compile.
 		compiled := fetchAndCompile(url, fetchProxy)
-		r.entries[id] = &entry{proxyId: id, pacUrl: url, compiled: compiled}
+		r.entries[id] = &entry{proxyId: id, pacUrl: url, pacOnly: pacOnly, compiled: compiled}
 		if compiled != nil {
 			log.Infoln("[pac-registry] compiled PAC for proxy %s from %s", id, url)
 		} else {
@@ -104,6 +109,46 @@ func (r *Registry) Eval(proxyId, url, host string) (result string, hasPAC bool) 
 		return "DIRECT", true
 	}
 	return "PROXY", true
+}
+
+// EvalDirective evaluates the PAC for proxy [proxyId] against the given URL and
+// host and returns the RAW directive without collapsing it to DIRECT/PROXY.
+//
+// Unlike Eval, this preserves the upstream address the PAC chose, e.g.
+// "PROXY 10.0.0.1:8080" or "SOCKS5 10.0.0.1:1080". This is what a PAC-only
+// (dynamic) outbound needs so it can dial the exact upstream the PAC selected
+// per connection.
+//
+// Returns:
+//   - (directive, true, false)  the raw directive string if this proxy has a compiled PAC
+//   - ("", false, false)        if this proxy has no PAC
+//   - ("", true, true)          if the PAC evaluation timed out (caller should fail, not DIRECT)
+func (r *Registry) EvalDirective(proxyId, url, host string) (directive string, hasPAC bool, timedOut bool) {
+	r.mu.RLock()
+	e := r.entries[proxyId]
+	r.mu.RUnlock()
+
+	if e == nil || e.compiled == nil {
+		return "", false, false
+	}
+
+	res, to := e.compiled.EvalRaw(url, host)
+	if to {
+		return "", true, true
+	}
+	return res, true, false
+}
+
+// IsPacOnly reports whether proxy [proxyId] is a PAC-only proxy (no fixed
+// server; the PAC supplies the upstream per connection). The dial-time
+// ShouldDirect gate is skipped for these so the dynamic outbound is the single
+// PAC-eval authority — it honors per-connection DIRECT and fails (never leaks
+// DIRECT) on eval timeout.
+func (r *Registry) IsPacOnly(proxyId string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e := r.entries[proxyId]
+	return e != nil && e.pacOnly
 }
 
 // ShouldDirect is the convenience check for the routing hook: does proxy P's PAC
@@ -172,7 +217,7 @@ func (r *Registry) refresh(fetchProxy string) {
 	for id, e := range r.entries {
 		compiled := fetchAndCompile(e.pacUrl, fetchProxy)
 		if compiled != nil {
-			r.entries[id] = &entry{proxyId: id, pacUrl: e.pacUrl, compiled: compiled}
+			r.entries[id] = &entry{proxyId: id, pacUrl: e.pacUrl, pacOnly: e.pacOnly, compiled: compiled}
 		}
 		// On failure, keep the old compiled version rather than clearing it.
 	}

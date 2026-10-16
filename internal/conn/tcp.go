@@ -73,7 +73,7 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	if proxyId == "" && policy == constants.PolicyProxy {
 		proxyId = GetSelectedProxyId()
 	}
-	if proxyId != "" && metadata.Host != "" {
+	if proxyId != "" && metadata.Host != "" && !pac.DefaultRegistry.IsPacOnly(proxyId) {
 		port := fmt.Sprintf("%d", metadata.DstPort)
 		isTLS := metadata.DstPort == 443
 		if pac.DefaultRegistry.ShouldDirect(proxyId, metadata.Host, port, isTLS) {

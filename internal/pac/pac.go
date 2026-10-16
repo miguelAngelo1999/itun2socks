@@ -266,3 +266,73 @@ func Fetch(pacURL string) (string, error) {
 func IsDirectResult(result string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(result)), "DIRECT")
 }
+
+// Directive is a single parsed upstream from a PAC FindProxyForURL result.
+type Directive struct {
+	Scheme string // "direct", "http", or "socks5"
+	Host   string // empty for direct
+	Port   string // empty for direct
+}
+
+// IsDirect reports whether this directive means "connect directly".
+func (d Directive) IsDirect() bool { return d.Scheme == "direct" }
+
+// ParseDirectives splits a PAC FindProxyForURL result into its ordered list of
+// upstream directives. A PAC may return several alternatives separated by
+// semicolons for failover, e.g.:
+//
+//	"PROXY 10.0.0.1:8080; SOCKS5 10.0.0.2:1080; DIRECT"
+//
+// Each token is normalised to a Directive. Tokens that cannot be parsed are
+// skipped. If nothing parses, a single DIRECT directive is returned so callers
+// always have a usable result.
+//
+// Supported leading keywords (case-insensitive):
+//   - DIRECT                → {Scheme:"direct"}
+//   - PROXY host:port       → {Scheme:"http"}   (HTTP CONNECT upstream)
+//   - HTTP  host:port       → {Scheme:"http"}
+//   - HTTPS host:port       → {Scheme:"http"}   (upstream reached over TLS not modelled; treated as http)
+//   - SOCKS host:port       → {Scheme:"socks5"}
+//   - SOCKS5 host:port      → {Scheme:"socks5"}
+func ParseDirectives(result string) []Directive {
+	var out []Directive
+	for _, tok := range strings.Split(result, ";") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		fields := strings.Fields(tok)
+		kw := strings.ToUpper(fields[0])
+
+		if kw == "DIRECT" {
+			out = append(out, Directive{Scheme: "direct"})
+			continue
+		}
+		if len(fields) < 2 {
+			// Malformed (e.g. "PROXY" with no address) — skip.
+			continue
+		}
+
+		var scheme string
+		switch kw {
+		case "PROXY", "HTTP", "HTTPS":
+			scheme = "http"
+		case "SOCKS", "SOCKS5":
+			scheme = "socks5"
+		default:
+			// Unknown keyword — skip.
+			continue
+		}
+
+		host, port, err := net.SplitHostPort(fields[1])
+		if err != nil || host == "" || port == "" {
+			continue
+		}
+		out = append(out, Directive{Scheme: scheme, Host: host, Port: port})
+	}
+
+	if len(out) == 0 {
+		out = append(out, Directive{Scheme: "direct"})
+	}
+	return out
+}
