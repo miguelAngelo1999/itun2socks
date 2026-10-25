@@ -149,6 +149,59 @@ func CredentialExpired(proxyIds []string) {
 // (blackbox must not import configuration/api).
 var NotifyAuthFailed func()
 
+// Auth-failure latch. When the upstream proxy rejects the user's credentials
+// with 407, we must (a) tell the UI exactly once, and (b) STOP re-attempting
+// the upstream CONNECT on every subsequent request (which would hammer the
+// upstream with a known-bad password). The latch is checked on the data path
+// (conn.NewTcpConn) to fail those dials fast until the user saves new creds —
+// which restarts the manager and clears the latch.
+var (
+	authLatchMu     sync.Mutex
+	authLatched     bool
+	authNotifiedAt  time.Time
+)
+
+// ReportAuthFailed records an upstream 407 on the data path. It sets the latch
+// and notifies the UI, but debounces the notification so a burst of failing
+// requests only prompts the user once (not once per request). Safe to call
+// from many connection goroutines concurrently.
+func ReportAuthFailed(proxyAddr string) {
+	authLatchMu.Lock()
+	firstTime := !authLatched
+	authLatched = true
+	// Debounce the UI notification to at most once per 30s.
+	notify := firstTime || time.Since(authNotifiedAt) > 30*time.Second
+	if notify {
+		authNotifiedAt = time.Now()
+	}
+	authLatchMu.Unlock()
+
+	if firstTime {
+		Record("proxy-auth-rejected", "upstream 407 on data path from "+proxyAddr, nil)
+	}
+	if notify && NotifyAuthFailed != nil {
+		NotifyAuthFailed()
+	}
+}
+
+// IsAuthLatched reports whether the selected proxy's credentials were rejected
+// by the upstream and not yet corrected. The data path uses this to fail fast
+// instead of retrying a known-bad password.
+func IsAuthLatched() bool {
+	authLatchMu.Lock()
+	defer authLatchMu.Unlock()
+	return authLatched
+}
+
+// ClearAuthLatch resets the latch. Called when the manager (re)starts — e.g.
+// after the user saves new credentials, which restarts the tunnel.
+func ClearAuthLatch() {
+	authLatchMu.Lock()
+	authLatched = false
+	authNotifiedAt = time.Time{}
+	authLatchMu.Unlock()
+}
+
 func FailoverAttempt(fromId, toId, toName string, success bool) {
 	Record("failover", fmt.Sprintf("from %s to %s (%s) success=%v", fromId[:8], toId[:8], toName, success), map[string]any{
 		"fromId": fromId, "toId": toId, "toName": toName, "success": success,

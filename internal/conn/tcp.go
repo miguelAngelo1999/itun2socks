@@ -2,10 +2,13 @@ package conn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 
+	"github.com/igoogolx/itun2socks/internal/blackbox"
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/pac"
@@ -13,6 +16,18 @@ import (
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
+
+// errAuthLatched is returned for a proxy dial while the selected proxy's
+// credentials are known-rejected (upstream 407). Failing fast here stops the
+// core from re-attempting a known-bad password on every request.
+var errAuthLatched = errors.New("proxy auth rejected — awaiting new credentials")
+
+// isUpstreamAuthError reports whether a dial error came from the upstream proxy
+// rejecting our credentials (the outbound returns "HTTP need auth" for a 407,
+// wrapped as "<addr> connect error: HTTP need auth").
+func isUpstreamAuthError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "HTTP need auth")
+}
 
 type TcpConnContext struct {
 	ctx      context.Context
@@ -98,7 +113,23 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	if policy == constants.PolicyDirect {
 		return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
 	}
-	return connDialer.DialContext(ctx, metadata, dialer.WithInterface(""))
+
+	// This is a proxy dial. If the upstream has already rejected our
+	// credentials (407), fail fast instead of re-attempting the known-bad
+	// password on every request — the UI has been prompted to fix it and the
+	// latch clears when the manager restarts with new creds.
+	if blackbox.IsAuthLatched() {
+		return nil, errAuthLatched
+	}
+
+	c, err := connDialer.DialContext(ctx, metadata, dialer.WithInterface(""))
+	if err != nil && isUpstreamAuthError(err) {
+		// Upstream rejected the credentials: latch + notify the UI (debounced
+		// inside ReportAuthFailed) so the user is asked to retype, and stop
+		// retrying this proxy until they do.
+		blackbox.ReportAuthFailed(connDialer.Addr())
+	}
+	return c, err
 }
 
 // proxyIdForPolicy returns the proxy id if the policy targets a named proxy,

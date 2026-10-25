@@ -44,6 +44,9 @@ func Start() error {
 	}
 	log.Infoln("%s", log.FormatLog(log.ExecutorPrefix, "started the client successfully"))
 	blackbox.ManagerStarted()
+	// A (re)start means fresh credentials/config — clear any auth-rejected
+	// latch so the data path attempts the upstream again.
+	blackbox.ClearAuthLatch()
 	// Start a health check loop that probes every 30 seconds.
 	blackbox.StartHealthCheck(30*time.Second, "")
 	return nil
