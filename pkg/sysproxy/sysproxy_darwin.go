@@ -416,11 +416,23 @@ func setEnvProxyPlatform(addr string) {
 			log.Debugln("[sysproxy] launchctl setenv %s: %v", key, err)
 		}
 	}
+	setNodeExtraCAPlatform()
+	log.Infoln("[sysproxy] set env proxy to %s", url)
+}
+
+// setNodeExtraCAPlatform exports ALL macOS system-trusted CAs into the PEM
+// bundle and points NODE_EXTRA_CA_CERTS at it. Separated from the proxy-env
+// setter so the manager can call it on every mode's connect, not just System.
+func setNodeExtraCAPlatform() {
 	if bundlePath := exportProxyCACerts(); bundlePath != "" {
 		_ = exec.Command("launchctl", "setenv", "NODE_EXTRA_CA_CERTS", bundlePath).Run()
 		log.Infoln("[sysproxy] NODE_EXTRA_CA_CERTS → %s", bundlePath)
 	}
-	log.Infoln("[sysproxy] set env proxy to %s", url)
+}
+
+// clearNodeExtraCAPlatform removes NODE_EXTRA_CA_CERTS from the GUI session.
+func clearNodeExtraCAPlatform() {
+	_ = exec.Command("launchctl", "unsetenv", "NODE_EXTRA_CA_CERTS").Run()
 }
 
 // clearEnvProxyPlatform removes the env vars set by setEnvProxyPlatform.

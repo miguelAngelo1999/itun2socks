@@ -121,6 +121,38 @@ func setEnvProxyPlatform(addr string) {
 	log.Infoln("[sysproxy] set env proxy to %s", url)
 }
 
+// setNodeExtraCAPlatform exports all system-trusted CAs into the PEM bundle and
+// points NODE_EXTRA_CA_CERTS at it (persistent per-user env). Called on every
+// mode's connect so Node/Electron tools trust everything the OS trusts.
+func setNodeExtraCAPlatform() {
+	bundlePath := exportProxyCACerts()
+	if bundlePath == "" {
+		return
+	}
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	if err != nil {
+		log.Warnln("[sysproxy] open HKCU\\Environment: %v", err)
+		return
+	}
+	defer k.Close()
+	_ = k.SetStringValue("NODE_EXTRA_CA_CERTS", bundlePath)
+	broadcastEnvChange()
+	log.Infoln("[sysproxy] NODE_EXTRA_CA_CERTS → %s", bundlePath)
+}
+
+// clearNodeExtraCAPlatform removes NODE_EXTRA_CA_CERTS from the per-user env.
+func clearNodeExtraCAPlatform() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	if err := k.DeleteValue("NODE_EXTRA_CA_CERTS"); err != nil && err != registry.ErrNotExist {
+		log.Debugln("[sysproxy] delete NODE_EXTRA_CA_CERTS: %v", err)
+	}
+	broadcastEnvChange()
+}
+
 // clearEnvProxyPlatform deletes the env vars set by setEnvProxyPlatform and
 // broadcasts the change.
 func clearEnvProxyPlatform() {

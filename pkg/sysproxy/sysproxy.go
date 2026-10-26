@@ -93,3 +93,22 @@ func setEnvProxy(addr string) {
 func clearEnvProxy() {
 	clearEnvProxyPlatform()
 }
+
+// ExportCACertsAndSetEnv writes ALL macOS system-trusted CA certificates into
+// the Node.js PEM bundle and points NODE_EXTRA_CA_CERTS at it — on EVERY proxy
+// mode (System/Mixed/TUN), not just System. The per-mode system-proxy path
+// already does this for System mode via setEnvProxy; this exported entry lets
+// the manager do it on connect for all modes so Node/Electron tools (Antigravity,
+// VS Code, npm, …) trust everything the OS trusts (plus lux's own bumped CA,
+// which lives in the System keychain) whenever the tunnel is up.
+//
+// No-op on platforms without a system keychain export (handled by the per-OS
+// setNodeExtraCAPlatform implementation).
+func ExportCACertsAndSetEnv() {
+	setNodeExtraCAPlatform()
+}
+
+// ClearCAEnv removes NODE_EXTRA_CA_CERTS (called on disconnect).
+func ClearCAEnv() {
+	clearNodeExtraCAPlatform()
+}

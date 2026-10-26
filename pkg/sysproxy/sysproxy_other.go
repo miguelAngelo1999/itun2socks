@@ -44,6 +44,12 @@ func setEnvProxyPlatform(_ string) {}
 // clearEnvProxyPlatform is a no-op on unsupported platforms.
 func clearEnvProxyPlatform() {}
 
+// setNodeExtraCAPlatform is a no-op on unsupported platforms.
+func setNodeExtraCAPlatform() {}
+
+// clearNodeExtraCAPlatform is a no-op on unsupported platforms.
+func clearNodeExtraCAPlatform() {}
+
 // getAllNetworkServices returns nil so Set/Clear fall back to the single
 // interface path (multi-service enumeration is macOS-only via networksetup).
 func getAllNetworkServices() []string { return nil }

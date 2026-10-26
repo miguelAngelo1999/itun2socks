@@ -8,6 +8,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/blackbox"
 	"github.com/igoogolx/itun2socks/internal/executor"
 	"github.com/igoogolx/itun2socks/pkg/log"
+	"github.com/igoogolx/itun2socks/pkg/sysproxy"
 )
 
 var (
@@ -47,6 +48,12 @@ func Start() error {
 	// A (re)start means fresh credentials/config — clear any auth-rejected
 	// latch so the data path attempts the upstream again.
 	blackbox.ClearAuthLatch()
+	// Export ALL macOS/Windows system-trusted CAs into the Node.js PEM bundle
+	// and point NODE_EXTRA_CA_CERTS at it — on EVERY mode (System/Mixed/TUN),
+	// so Node/Electron tools trust everything the OS trusts (plus lux's bumped
+	// CA) whenever the tunnel is up. System mode also does this via its own
+	// sysproxy.Set; this makes Mixed/TUN behave the same.
+	sysproxy.ExportCACertsAndSetEnv()
 	// Start a health check loop that probes every 30 seconds.
 	blackbox.StartHealthCheck(30*time.Second, "")
 	return nil
