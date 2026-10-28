@@ -238,10 +238,21 @@ func maskToCIDR(network, mask string) string {
 }
 
 // Fetch downloads a PAC script from url and returns its JS content.
+//
+// CRITICAL: the fetch must bypass BOTH the system proxy and lux's own TUN
+// interface. In TUN mode lux_core's own outbound connections are captured by
+// the tun device and routed through the tunnel; for a PAC-ONLY proxy whose PAC
+// is not yet compiled, that connection has no upstream and times out — a
+// chicken-and-egg deadlock ("context deadline exceeded" fetching the PAC while
+// the PAC is what tells us where to connect). So we dial DIRECT with Proxy:nil,
+// exactly like FetchAndParse, instead of the default transport.
 func Fetch(pacURL string) (string, error) {
+	directDialer := &net.Dialer{Timeout: 10 * time.Second}
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
+			Proxy:           nil, // bypass system proxy (http_proxy=127.0.0.1:1090)
+			DialContext:     directDialer.DialContext, // bypass the TUN tunnel
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
