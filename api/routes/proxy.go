@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,45 @@ func proxyRouter() http.Handler {
 	r.Post("/check-cert", checkCert)
 	r.Post("/install-cert", installCert)
 	r.Get("/{proxyId}/pac-rules", getPACRules)
+	r.Get("/{proxyId}/pac-upstream", getPACUpstream)
 	return r
+}
+
+// getPACUpstream returns the first HTTP upstream proxy the PAC of a PAC-only
+// proxy selects for a typical external HTTPS site. The UI uses it to probe that
+// upstream for an untrusted TLS-bump CA, since a PAC-only proxy has no server
+// of its own. Returns {"found":false} when the PAC says DIRECT, selects only
+// non-HTTP upstreams, or is not loaded.
+//
+// GET /proxies/{proxyId}/pac-upstream
+func getPACUpstream(w http.ResponseWriter, r *http.Request) {
+	proxyId := chi.URLParam(r, "proxyId")
+	if proxyId == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	host := ""
+	if u, err := neturl.Parse(defaultDelayTestUrl); err == nil {
+		host = u.Hostname()
+	}
+	directive, hasPAC, timedOut := pac.DefaultRegistry.EvalDirective(proxyId, defaultDelayTestUrl, host)
+	if !hasPAC || timedOut {
+		render.JSON(w, r, render.M{"found": false})
+		return
+	}
+	for _, d := range pac.ParseDirectives(directive) {
+		if d.IsDirect() || d.Scheme != "http" {
+			continue
+		}
+		port, err := strconv.Atoi(d.Port)
+		if err != nil || d.Host == "" || port <= 0 {
+			continue
+		}
+		render.JSON(w, r, render.M{"found": true, "server": d.Host, "port": port})
+		return
+	}
+	render.JSON(w, r, render.M{"found": false})
 }
 
 func testProxyUdp(w http.ResponseWriter, r *http.Request) {
