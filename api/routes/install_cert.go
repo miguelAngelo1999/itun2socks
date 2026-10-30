@@ -7,7 +7,9 @@ import (
 	"runtime"
 
 	"github.com/go-chi/render"
+	"github.com/igoogolx/itun2socks/internal/manager"
 	"github.com/igoogolx/itun2socks/pkg/log"
+	"github.com/igoogolx/itun2socks/pkg/sysproxy"
 )
 
 // installCert receives a PEM certificate and installs it to the system trust store.
@@ -92,6 +94,14 @@ func installCert(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Infoln("[install-cert] trust settings written, output: %s", string(out))
+	}
+
+	// Refresh the Node/Electron CA bundle right away so apps launched from now
+	// on trust the new CA, without waiting for the next connect toggle. Only
+	// while connected: the bundle path is set in the GUI environment, which is
+	// cleared on disconnect.
+	if manager.GetIsStarted() {
+		sysproxy.ExportCACertsAndSetEnv()
 	}
 
 	log.Infoln("[install-cert] certificate installed successfully")

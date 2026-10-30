@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -368,6 +369,35 @@ func getSOCKSProxy() (host string, port string, enabled bool, err error) {
 
 // ── env-var proxy (macOS) ────────────────────────────────────────────────────
 
+// consoleUserLoginKeychains returns the login keychain files of the logged-in
+// GUI user (not root). Uses SUDO_USER when lux_core was started through sudo,
+// otherwise the owner of /dev/console. Missing files are skipped.
+func consoleUserLoginKeychains() []string {
+	name := os.Getenv("SUDO_USER")
+	if name == "" || name == "root" {
+		out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output()
+		if err != nil {
+			return nil
+		}
+		name = strings.TrimSpace(string(out))
+	}
+	if name == "" || name == "root" {
+		return nil
+	}
+	u, err := user.Lookup(name)
+	if err != nil || u.HomeDir == "" {
+		return nil
+	}
+	var found []string
+	for _, f := range []string{"login.keychain-db", "login.keychain"} {
+		p := filepath.Join(u.HomeDir, "Library", "Keychains", f)
+		if _, err := os.Stat(p); err == nil {
+			found = append(found, p)
+		}
+	}
+	return found
+}
+
 // exportProxyCACerts exports all trusted CA certificates from the macOS System
 // Keychain into a PEM bundle that Node.js can read via NODE_EXTRA_CA_CERTS.
 //
@@ -379,17 +409,34 @@ func getSOCKSProxy() (host string, port string, enabled bool, err error) {
 func exportProxyCACerts() string {
 	bundlePath := filepath.Join(constants.Path.HomeDir(), "proxy_ca_bundle.pem")
 
-	var buf bytes.Buffer
-	for _, keychain := range []string{
+	keychains := []string{
 		"/Library/Keychains/System.keychain",
 		"/System/Library/Keychains/SystemRootCertificates.keychain",
-	} {
+	}
+	// lux_core runs as root, so the user's own login keychain (where a CA the
+	// user trusted by hand lives) is not on the default search list. Add it
+	// explicitly so those CAs reach Node/Electron too.
+	keychains = append(keychains, consoleUserLoginKeychains()...)
+
+	var buf bytes.Buffer
+	seen := map[string]bool{}
+	for _, keychain := range keychains {
 		out, err := exec.Command("security", "find-certificate", "-a", "-p", keychain).Output()
 		if err != nil {
 			log.Debugln("[sysproxy] find-certificate %s: %v", keychain, err)
 			continue
 		}
-		buf.Write(out)
+		// De-duplicate: the same CA can sit in more than one keychain.
+		const endMarker = "-----END CERTIFICATE-----"
+		for _, block := range strings.SplitAfter(string(out), endMarker) {
+			block = strings.TrimSpace(block)
+			if !strings.Contains(block, "BEGIN CERTIFICATE") || seen[block] {
+				continue
+			}
+			seen[block] = true
+			buf.WriteString(block)
+			buf.WriteString("\n")
+		}
 	}
 	if buf.Len() == 0 {
 		log.Warnln("[sysproxy] exportProxyCACerts: no certs found, skipping bundle")
