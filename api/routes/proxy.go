@@ -135,18 +135,21 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 		// reachability probe of the upstream the PAC picks for the test URL. If
 		// that upstream is dialable, report the proxy as reachable (delay 0 =
 		// "up, latency not measured") instead of a hard failure.
+		errStr := err.Error()
+		isCertErr := strings.Contains(errStr, "x509") ||
+			strings.Contains(errStr, "certificate") ||
+			strings.Contains(errStr, "tls:")
 		server, _ := proxyOption["server"].(string)
 		pacUrl, _ := proxyOption["pacUrl"].(string)
-		if server == "" && pacUrl != "" {
+		// Never mask a certificate error: the UI uses certError to offer the
+		// "Trust Certificate" prompt, and a reachable TCP port says nothing
+		// about whether the system trusts the proxy's bump CA.
+		if !isCertErr && server == "" && pacUrl != "" {
 			if ok := pacUpstreamReachable(proxyId, url); ok {
 				render.JSON(w, r, render.M{"delay": 0, "pacOnly": true})
 				return
 			}
 		}
-		errStr := err.Error()
-		isCertErr := strings.Contains(errStr, "x509") ||
-			strings.Contains(errStr, "certificate") ||
-			strings.Contains(errStr, "tls:")
 		render.JSON(w, r, render.M{
 			"delay":     -1,
 			"certError": isCertErr,
