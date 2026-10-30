@@ -2,7 +2,9 @@ package routes
 
 import (
 	"context"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 
@@ -12,10 +14,11 @@ import (
 	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/manager"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
-	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
+	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -124,6 +127,22 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	delay, _, err := p.URLTest(ctx, url)
 	dialer.DefaultInterface.Store(savedIface)
 	if err != nil {
+		// PAC-only proxies (empty server + pacUrl) route per connection through
+		// whatever upstream the PAC selects. A strict URLTest (HEAD through the
+		// corporate proxy, with its own TLS check) frequently "fails" even when
+		// real browsing works — producing a misleading red "failed" badge while
+		// traffic flows fine. For a PAC-only proxy, fall back to a plain TCP
+		// reachability probe of the upstream the PAC picks for the test URL. If
+		// that upstream is dialable, report the proxy as reachable (delay 0 =
+		// "up, latency not measured") instead of a hard failure.
+		server, _ := proxyOption["server"].(string)
+		pacUrl, _ := proxyOption["pacUrl"].(string)
+		if server == "" && pacUrl != "" {
+			if ok := pacUpstreamReachable(proxyId, url); ok {
+				render.JSON(w, r, render.M{"delay": 0, "pacOnly": true})
+				return
+			}
+		}
 		errStr := err.Error()
 		isCertErr := strings.Contains(errStr, "x509") ||
 			strings.Contains(errStr, "certificate") ||
@@ -146,6 +165,34 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, render.M{
 		"delay": delay,
 	})
+}
+
+// pacUpstreamReachable evaluates a PAC-only proxy's PAC for the given test URL
+// and checks whether the upstream it selects is TCP-reachable. Used by the
+// delay test so a PAC-only proxy that genuinely works is not shown as "failed"
+// just because a strict URLTest HEAD didn't pass. Returns true when the PAC
+// says DIRECT (nothing to dial — the proxy intentionally bypasses that host) or
+// when the selected upstream accepts a TCP connection.
+func pacUpstreamReachable(proxyId, testURL string) bool {
+	host := ""
+	if u, err := neturl.Parse(testURL); err == nil {
+		host = u.Hostname()
+	}
+	directive, hasPAC, timedOut := pac.DefaultRegistry.EvalDirective(proxyId, testURL, host)
+	if !hasPAC || timedOut {
+		return false
+	}
+	for _, d := range pac.ParseDirectives(directive) {
+		if d.IsDirect() {
+			return true // PAC bypasses this host — not a proxy failure
+		}
+		c, err := net.DialTimeout("tcp", net.JoinHostPort(d.Host, d.Port), 4*time.Second)
+		if err == nil {
+			_ = c.Close()
+			return true
+		}
+	}
+	return false
 }
 
 // getProxies returns all proxies with passwords STRIPPED for security.
