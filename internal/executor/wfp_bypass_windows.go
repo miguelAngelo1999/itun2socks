@@ -216,12 +216,26 @@ func CloseWfpBypass() {
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: closed"))
 }
 
+var defaultBypassProcesses = []string{
+	"WhatsApp.exe",
+}
+
+func isDefaultProcess(proc string) bool {
+	for _, dp := range defaultBypassProcesses {
+		if strings.EqualFold(proc, dp) || strings.EqualFold(proc+".exe", dp) {
+			return true
+		}
+	}
+	return false
+}
+
 func ApplyProcessBypasses() {
 	rawConfig, err := configuration.Read()
 	if err != nil {
 		return
 	}
 	var processes []string
+	processes = append(processes, defaultBypassProcesses...)
 	processes = append(processes, rawConfig.Setting.BypassProcesses...)
 	for _, raw := range rawConfig.Rules {
 		raw = strings.TrimSpace(raw)
@@ -254,7 +268,9 @@ func ApplyProcessBypasses() {
 		}
 		exePath := resolveProcessPath(proc)
 		if exePath == "" {
-			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), proc)
+			if !isDefaultProcess(proc) {
+				log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), proc)
+			}
 			continue
 		}
 		if err := AddProcessBypass(exePath); err != nil {
@@ -277,13 +293,16 @@ func resolveProcessPath(name string) string {
 		filepath.Join(os.Getenv("ProgramFiles"), name),
 		filepath.Join(os.Getenv("ProgramFiles(x86)"), name),
 		filepath.Join(os.Getenv("LOCALAPPDATA"), name),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "WhatsApp", name),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "WhatsApp", name),
+		filepath.Join(os.Getenv("ProgramFiles"), "WhatsApp", name),
 	}
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	return name
+	return ""
 }
 
 func getWfpAppID(path string) (*fwpByteBlob, error) {

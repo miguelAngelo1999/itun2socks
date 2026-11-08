@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -121,7 +120,14 @@ func (h *Http) connectVia(c net.Conn) error {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("upstream CONNECT returned %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("upstream proxy denied connection (HTTP 403 Forbidden)")
+		} else if resp.StatusCode == http.StatusProxyAuthRequired {
+			return fmt.Errorf("upstream proxy authentication required (HTTP 407)")
+		} else if resp.StatusCode >= http.StatusInternalServerError {
+			return fmt.Errorf("upstream proxy gateway error (HTTP %d %s)", resp.StatusCode, resp.Status)
+		}
+		return fmt.Errorf("upstream proxy rejected connection: HTTP %d %s", resp.StatusCode, resp.Status)
 	}
 	return nil
 }
@@ -157,19 +163,23 @@ func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
 		return nil
 	}
 
+	if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("upstream proxy denied connection (HTTP 403 Forbidden)")
+	}
+
 	if resp.StatusCode == http.StatusProxyAuthRequired {
-		return errors.New("HTTP need auth")
+		return fmt.Errorf("upstream proxy authentication required (HTTP 407)")
 	}
 
 	if resp.StatusCode == http.StatusMethodNotAllowed {
-		return errors.New("CONNECT method not allowed by proxy")
+		return fmt.Errorf("upstream proxy denied connection (HTTP 405 Method Not Allowed)")
 	}
 
 	if resp.StatusCode >= http.StatusInternalServerError {
-		return errors.New(resp.Status)
+		return fmt.Errorf("upstream proxy gateway error (HTTP %d %s)", resp.StatusCode, resp.Status)
 	}
 
-	return fmt.Errorf("can not connect remote err code: %d", resp.StatusCode)
+	return fmt.Errorf("upstream proxy rejected connection: HTTP %d %s", resp.StatusCode, resp.Status)
 }
 
 func NewHttp(option HttpOption) *Http {

@@ -21,12 +21,15 @@ import (
 // This function is called once at TUN startup and feeds into sing-tun's
 // Inet4RouteExcludeAddress option.
 var defaultVoipBypassCidrs = []string{
-	"157.240.0.0/16", // Meta / WhatsApp
-	"31.13.0.0/16",   // Meta / WhatsApp
-	"185.60.216.0/22",// Meta / WhatsApp
-	"129.134.0.0/16", // Meta / WhatsApp
-	"179.60.192.0/22",// Meta / WhatsApp
-	"204.15.20.0/22", // Meta / WhatsApp
+	"57.144.0.0/14",   // Meta / WhatsApp VoIP STUN/TURN & media (AS32934)
+	"157.240.0.0/16",  // Meta / WhatsApp
+	"31.13.0.0/16",    // Meta / WhatsApp
+	"185.60.216.0/22", // Meta / WhatsApp
+	"129.134.0.0/16",  // Meta / WhatsApp
+	"179.60.192.0/22", // Meta / WhatsApp
+	"204.15.20.0/22",  // Meta / WhatsApp
+	"69.63.176.0/20",  // Meta / WhatsApp
+	"69.171.224.0/19", // Meta / WhatsApp
 }
 
 func collectBypassCidrs() []netip.Prefix {

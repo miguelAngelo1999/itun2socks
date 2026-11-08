@@ -30,7 +30,11 @@ func handleTCPConn(ct conn.TcpConnContext) {
 		}
 	}()
 	if err != nil {
-		log.Warnln(log.FormatLog(log.TcpPrefix, "fail to get tcp conn, err: %v, rule: %v, remote address: %v"), err, ct.Rule().GetPolicy(), ct.Metadata().RemoteAddress())
+		if IsProxyDenied(err) {
+			log.Warnln(log.FormatLog(log.TcpPrefix, "[DENY] [PROXY_DENIED] upstream proxy denied connection to %s, err: %v"), ct.Metadata().RemoteAddress(), err)
+		} else {
+			log.Warnln(log.FormatLog(log.TcpPrefix, "fail to get tcp conn, err: %v, rule: %v, remote address: %v"), err, ct.Rule().GetPolicy(), ct.Metadata().RemoteAddress())
+		}
 		return
 	}
 	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())

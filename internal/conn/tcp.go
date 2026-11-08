@@ -23,10 +23,30 @@ import (
 var errAuthLatched = errors.New("proxy auth rejected — awaiting new credentials")
 
 // isUpstreamAuthError reports whether a dial error came from the upstream proxy
-// rejecting our credentials (the outbound returns "HTTP need auth" for a 407,
-// wrapped as "<addr> connect error: HTTP need auth").
+// rejecting our credentials (e.g. HTTP 407).
 func isUpstreamAuthError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "HTTP need auth")
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "HTTP need auth") ||
+		strings.Contains(s, "upstream proxy authentication required") ||
+		strings.Contains(s, "HTTP 407")
+}
+
+func isWhatsAppTraffic(metadata *C.Metadata) bool {
+	if metadata == nil {
+		return false
+	}
+	if metadata.DstPort == 5222 {
+		return true
+	}
+	host := strings.ToLower(metadata.Host)
+	if strings.HasSuffix(host, ".whatsapp.com") || host == "whatsapp.com" ||
+		strings.HasSuffix(host, ".whatsapp.net") || host == "whatsapp.net" {
+		return true
+	}
+	return false
 }
 
 type TcpConnContext struct {
@@ -112,6 +132,19 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	// route through whatever interface the proxy server's subnet requires.
 	if policy == constants.PolicyDirect {
 		return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+	}
+
+	// WhatsApp signaling (port 5222 / XMPP) and WhatsApp traffic to non-SSL ports:
+	// HTTP proxies (Squid, etc.) only permit CONNECT to SSL port 443 and reject
+	// port 5222 with HTTP 403 Forbidden.
+	// Route WhatsApp signaling directly via physical interface, matching System proxy mode.
+	if policy != constants.PolicyDirect && isWhatsAppTraffic(metadata) && (metadata.DstPort == 5222 || connDialer.Type() == C.Http && metadata.DstPort != 443) {
+		log.Infoln(log.FormatLog(log.TcpPrefix, "WhatsApp signaling (%v:%v) bypasses proxy to DIRECT"),
+			metadata.Host, metadata.DstPort)
+		directDialer, dErr := GetProxy(constants.PolicyDirect)
+		if dErr == nil {
+			return directDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
+		}
 	}
 
 	// This is a proxy dial. If the upstream has already rejected our

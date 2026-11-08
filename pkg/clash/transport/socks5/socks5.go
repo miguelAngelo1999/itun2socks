@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -14,11 +15,34 @@ import (
 	"github.com/Dreamacro/protobytes"
 )
 
-// Error represents a SOCKS error
+// Error represents a SOCKS error as defined in RFC 1928 section 6.
 type Error byte
 
+func (err Error) String() string {
+	switch err {
+	case ErrGeneralFailure:
+		return "general SOCKS server failure"
+	case ErrConnectionNotAllowed:
+		return "connection not allowed by ruleset"
+	case ErrNetworkUnreachable:
+		return "network unreachable"
+	case ErrHostUnreachable:
+		return "host unreachable"
+	case ErrConnectionRefused:
+		return "connection refused"
+	case ErrTTLExpired:
+		return "TTL expired"
+	case ErrCommandNotSupported:
+		return "command not supported"
+	case ErrAddressNotSupported:
+		return "address type not supported"
+	default:
+		return "unknown error"
+	}
+}
+
 func (err Error) Error() string {
-	return "SOCKS error: " + strconv.Itoa(int(err))
+	return fmt.Sprintf("upstream proxy denied connection (SOCKS5 REP %d: %s)", int(err), err.String())
 }
 
 // Command is request commands as defined in RFC 1928 section 4.
@@ -253,10 +277,10 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (
 		}
 
 		if buf[1] != 0 {
-			return nil, errors.New("rejected username/password")
+			return nil, errors.New("upstream proxy denied connection (rejected username/password)")
 		}
 	} else if buf[1] != 0 {
-		return nil, errors.New("SOCKS need auth")
+		return nil, errors.New("upstream proxy authentication required (SOCKS need auth)")
 	}
 
 	// VER, CMD, RSV, ADDR
@@ -267,6 +291,14 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (
 	// VER, REP, RSV
 	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
 		return nil, err
+	}
+
+	if buf[0] != 5 {
+		return nil, errors.New("SOCKS version error")
+	}
+
+	if buf[1] != 0 {
+		return nil, Error(buf[1])
 	}
 
 	return ReadAddr(rw, buf)

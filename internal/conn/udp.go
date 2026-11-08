@@ -205,13 +205,21 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 		return nil, err
 	}
 
-	if policy != constants.PolicyDirect && !connDialer.SupportUDP() {
+	// STUN (UDP port 3478) is used for NAT traversal and VoIP media establishment (WhatsApp, etc.).
+	// Relaying STUN through a proxy often breaks ICE hole punching or fails entirely on HTTP proxies.
+	// Always relay UDP port 3478 directly, and fallback to DIRECT if the matched proxy does not carry UDP.
+	if policy != constants.PolicyDirect && (metadata.DstPort == 3478 || !connDialer.SupportUDP()) {
 		directDialer, dErr := GetProxy(constants.PolicyDirect)
 		if dErr != nil {
 			return nil, fmt.Errorf("proxy %v cannot carry udp and direct dialer is unavailable: %v", policy, dErr)
 		}
-		log.Infoln(log.FormatLog(log.UdpPrefix, "proxy cannot carry udp, relaying DIRECT: %v -> %v"),
-			metadata.SourceAddress(), metadata.RemoteAddress())
+		if metadata.DstPort == 3478 {
+			log.Infoln(log.FormatLog(log.UdpPrefix, "STUN/VoIP UDP port 3478, relaying DIRECT: %v -> %v"),
+				metadata.SourceAddress(), metadata.RemoteAddress())
+		} else {
+			log.Infoln(log.FormatLog(log.UdpPrefix, "proxy cannot carry udp, relaying DIRECT: %v -> %v"),
+				metadata.SourceAddress(), metadata.RemoteAddress())
+		}
 		connDialer = directDialer
 	}
 

@@ -1,12 +1,14 @@
 package conn
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter"
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outbound"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
+	"github.com/stretchr/testify/assert"
 )
 
 // The executor registers named proxies while building the tunnel, which happens
@@ -79,4 +81,33 @@ func TestNamedProxyCannotShadowBuiltIn(t *testing.T) {
 			t.Error("a proxy id of PROXY was accepted and would shadow the built-in")
 		}
 	}
+}
+
+func TestIsWhatsAppTraffic(t *testing.T) {
+	tests := []struct {
+		m        *C.Metadata
+		expected bool
+	}{
+		{nil, false},
+		{&C.Metadata{Host: "google.com", DstPort: 443}, false},
+		{&C.Metadata{Host: "web.whatsapp.com", DstPort: 5222}, true},
+		{&C.Metadata{Host: "web.whatsapp.com", DstPort: 443}, true},
+		{&C.Metadata{Host: "c.whatsapp.net", DstPort: 5222}, true},
+		{&C.Metadata{Host: "pps.whatsapp.net", DstPort: 443}, true},
+		{&C.Metadata{Host: "unknown.com", DstPort: 5222}, true},
+	}
+
+	for _, tt := range tests {
+		res := isWhatsAppTraffic(tt.m)
+		if res != tt.expected {
+			t.Errorf("isWhatsAppTraffic(%+v) = %v, expected %v", tt.m, res, tt.expected)
+		}
+	}
+}
+
+func TestIsUpstreamAuthError(t *testing.T) {
+	assert.False(t, isUpstreamAuthError(nil))
+	assert.True(t, isUpstreamAuthError(errors.New("HTTP need auth")))
+	assert.True(t, isUpstreamAuthError(errors.New("upstream proxy authentication required (HTTP 407)")))
+	assert.False(t, isUpstreamAuthError(errors.New("connection timeout")))
 }
