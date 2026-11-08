@@ -1,6 +1,7 @@
 package conn
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outbound"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The executor registers named proxies while building the tunnel, which happens
@@ -83,31 +85,36 @@ func TestNamedProxyCannotShadowBuiltIn(t *testing.T) {
 	}
 }
 
-func TestIsWhatsAppTraffic(t *testing.T) {
-	tests := []struct {
-		m        *C.Metadata
-		expected bool
-	}{
-		{nil, false},
-		{&C.Metadata{Host: "google.com", DstPort: 443}, false},
-		{&C.Metadata{Host: "web.whatsapp.com", DstPort: 5222}, true},
-		{&C.Metadata{Host: "web.whatsapp.com", DstPort: 443}, true},
-		{&C.Metadata{Host: "c.whatsapp.net", DstPort: 5222}, true},
-		{&C.Metadata{Host: "pps.whatsapp.net", DstPort: 443}, true},
-		{&C.Metadata{Host: "unknown.com", DstPort: 5222}, true},
-	}
-
-	for _, tt := range tests {
-		res := isWhatsAppTraffic(tt.m)
-		if res != tt.expected {
-			t.Errorf("isWhatsAppTraffic(%+v) = %v, expected %v", tt.m, res, tt.expected)
-		}
-	}
-}
-
 func TestIsUpstreamAuthError(t *testing.T) {
 	assert.False(t, isUpstreamAuthError(nil))
 	assert.True(t, isUpstreamAuthError(errors.New("HTTP need auth")))
 	assert.True(t, isUpstreamAuthError(errors.New("upstream proxy authentication required (HTTP 407)")))
 	assert.False(t, isUpstreamAuthError(errors.New("connection timeout")))
 }
+
+type dummyRule struct {
+	policy constants.Policy
+}
+
+func (d *dummyRule) Match(value string) bool    { return true }
+func (d *dummyRule) Value() string              { return "" }
+func (d *dummyRule) GetPolicy() constants.Policy { return d.policy }
+func (d *dummyRule) Type() constants.RuleType   { return "" }
+func (d *dummyRule) Valid() bool                { return true }
+
+func TestNewUdpConnUnsupported(t *testing.T) {
+	proxies = nil
+	namedProxies = map[constants.Policy]C.Proxy{}
+
+	httpProxy := adapter.NewProxy(outbound.NewHttp(outbound.HttpOption{
+		Name:   "http-test",
+		Server: "1.1.1.1",
+		Port:   8080,
+	}))
+	UpdateProxy(httpProxy)
+
+	_, err := NewUdpConn(context.Background(), &C.Metadata{DstPort: 3478}, &dummyRule{policy: constants.PolicyProxy}, "")
+	require.Error(t, err)
+	assert.Equal(t, "proxy does not support UDP", err.Error())
+}
+

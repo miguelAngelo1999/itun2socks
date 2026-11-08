@@ -1,34 +1,50 @@
 package executor
 
 import (
-	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/igoogolx/itun2socks/internal/configuration"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestDefaultVoipBypassCidrs(t *testing.T) {
-	stunIP1 := netip.MustParseAddr("57.144.171.54")
-	stunIP2 := netip.MustParseAddr("57.144.67.54")
+func TestCollectBypassCidrs(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"setting": {
+			"bypassCidrs": ["10.0.0.0/8", "192.168.1.1"]
+		},
+		"proxy": [
+			{"id": "proxy1", "server": "1.2.3.4"}
+		],
+		"rules": [
+			"IP-CIDR,172.16.0.0/12,DIRECT",
+			"IP-CIDR,8.8.8.8,PROXY",
+			"DOMAIN,google.com,DIRECT"
+		]
+	}`
+	err := os.WriteFile(cfgPath, []byte(content), 0644)
+	require.NoError(t, err)
 
-	var prefixes []netip.Prefix
-	for _, cidr := range defaultVoipBypassCidrs {
-		prefix, err := netip.ParsePrefix(cidr)
-		assert.NoError(t, err, "CIDR should parse: %s", cidr)
-		prefixes = append(prefixes, prefix)
+	origPath, _ := configuration.GetConfigFilePath()
+	t.Cleanup(func() {
+		configuration.SetConfigFilePath(origPath)
+	})
+	configuration.SetConfigFilePath(cfgPath)
+
+	excludes := collectBypassCidrs()
+	var actual []string
+	for _, p := range excludes {
+		actual = append(actual, p.String())
 	}
 
-	match1 := false
-	match2 := false
-	for _, p := range prefixes {
-		if p.Contains(stunIP1) {
-			match1 = true
-		}
-		if p.Contains(stunIP2) {
-			match2 = true
-		}
-	}
-
-	assert.True(t, match1, "57.144.171.54 must be covered by bypass CIDRs")
-	assert.True(t, match2, "57.144.67.54 must be covered by bypass CIDRs")
+	assert.Contains(t, actual, "10.0.0.0/8")
+	assert.Contains(t, actual, "192.168.1.1/32")
+	assert.Contains(t, actual, "1.2.3.4/32")
+	assert.Contains(t, actual, "172.16.0.0/12")
+	assert.NotContains(t, actual, "8.8.8.8/32")
+	assert.NotContains(t, actual, "57.144.0.0/14")
 }

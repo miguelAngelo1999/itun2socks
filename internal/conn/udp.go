@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
-	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
@@ -185,14 +184,7 @@ func (uc *CopyableReaderWriterConn) WriteTo(data []byte, addr net.Addr) (int, er
 
 // NewUdpConn builds the outbound packet conn for a UDP flow.
 //
-// HTTP/HTTPS proxies are TCP-only. Handing them a UDP flow fails with
-// "no support", and dropping the flow instead black-holes it inside the TUN:
-// the route for the destination still points at the TUN device, so retransmits
-// are swallowed too and nothing reaches the wire.
-//
-// When the matched policy resolves to a proxy that cannot carry UDP, relay the
-// flow DIRECT out the physical interface instead. TCP still goes through the
-// proxy; UDP goes straight out, which is what system-proxy mode does.
+// If the matched proxy does not support UDP, fail fast with an error.
 //
 // One socket per flow is correct here: sing keys its UDP NAT sessions on the
 // client source address alone, so all destinations reached from a single client
@@ -205,22 +197,8 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 		return nil, err
 	}
 
-	// STUN (UDP port 3478) is used for NAT traversal and VoIP media establishment (WhatsApp, etc.).
-	// Relaying STUN through a proxy often breaks ICE hole punching or fails entirely on HTTP proxies.
-	// Always relay UDP port 3478 directly, and fallback to DIRECT if the matched proxy does not carry UDP.
-	if policy != constants.PolicyDirect && (metadata.DstPort == 3478 || !connDialer.SupportUDP()) {
-		directDialer, dErr := GetProxy(constants.PolicyDirect)
-		if dErr != nil {
-			return nil, fmt.Errorf("proxy %v cannot carry udp and direct dialer is unavailable: %v", policy, dErr)
-		}
-		if metadata.DstPort == 3478 {
-			log.Infoln(log.FormatLog(log.UdpPrefix, "STUN/VoIP UDP port 3478, relaying DIRECT: %v -> %v"),
-				metadata.SourceAddress(), metadata.RemoteAddress())
-		} else {
-			log.Infoln(log.FormatLog(log.UdpPrefix, "proxy cannot carry udp, relaying DIRECT: %v -> %v"),
-				metadata.SourceAddress(), metadata.RemoteAddress())
-		}
-		connDialer = directDialer
+	if !connDialer.SupportUDP() {
+		return nil, fmt.Errorf("proxy does not support UDP")
 	}
 
 	rawConn, err := connDialer.ListenPacketContext(ctx, metadata, dialer.WithInterface(defaultInterface), dialer.WithAddrReuse(true))

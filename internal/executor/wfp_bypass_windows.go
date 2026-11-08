@@ -25,14 +25,26 @@ var (
 		Data1: 0xd78e1e87, Data2: 0x8644, Data3: 0x4f37,
 		Data4: [8]byte{0x9b, 0x9c, 0x7e, 0x8e, 0x5e, 0x98, 0xdf, 0x68},
 	}
+	fwpmConditionIPProtocol = windows.GUID{
+		Data1: 0x3971ef2b, Data2: 0x623e, Data3: 0x4f9a,
+		Data4: [8]byte{0x8c, 0xb1, 0x6e, 0x79, 0xb8, 0x06, 0xb9, 0xa7},
+	}
+	fwpmConditionIPRemotePort = windows.GUID{
+		Data1: 0xc35a604d, Data2: 0xd22b, Data3: 0x4e1a,
+		Data4: [8]byte{0x91, 0xb4, 0x68, 0xf6, 0x74, 0xee, 0x67, 0x4b},
+	}
 )
 
 const (
-	fwpActionPermit           = 0x00001000
-	fwpMatchEqual             = 0
-	fwpConditionValueTypeBLOB = 13
-	fwpmSessionFlagDynamic    = 0x00000001
-	fwpEmptyValue             = 0
+	fwpActionPermit             = 0x00001000
+	fwpActionBlock              = 0x00001001
+	fwpMatchEqual               = 0
+	fwpMatchNotEqual            = 10
+	fwpConditionValueTypeUInt8  = 1
+	fwpConditionValueTypeUInt16 = 2
+	fwpConditionValueTypeBLOB   = 13
+	fwpmSessionFlagDynamic      = 0x00000001
+	fwpEmptyValue               = 0
 )
 
 type fwpmSession0 struct {
@@ -216,17 +228,125 @@ func CloseWfpBypass() {
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: closed"))
 }
 
-var defaultBypassProcesses = []string{
-	"WhatsApp.exe",
+type WfpUdpBlock struct {
+	engine      uintptr
+	sublayerKey windows.GUID
+	filterKey   windows.GUID
 }
 
-func isDefaultProcess(proc string) bool {
-	for _, dp := range defaultBypassProcesses {
-		if strings.EqualFold(proc, dp) || strings.EqualFold(proc+".exe", dp) {
-			return true
-		}
+var (
+	udpBlockMu        sync.Mutex
+	globalWfpUdpBlock *WfpUdpBlock
+)
+
+// ApplyUdpBlock adds a dynamic WFP block sublayer and filter on FWPM_LAYER_ALE_AUTH_CONNECT_V4
+// for protocol UDP (17) where remote port != 53 (DNS). The session is dynamic so Windows
+// cleans it up automatically if the process exits or stops.
+func ApplyUdpBlock() error {
+	udpBlockMu.Lock()
+	defer udpBlockMu.Unlock()
+	if globalWfpUdpBlock != nil {
+		return nil
 	}
-	return false
+
+	name, _ := windows.UTF16PtrFromString("Lux Dynamic UDP Block")
+	desc, _ := windows.UTF16PtrFromString("Blocks UDP traffic (except DNS) when upstream proxy lacks UDP support")
+	session := &fwpmSession0{
+		displayData: fwpmDisplayData0{name: name, description: desc},
+		flags:       fwpmSessionFlagDynamic,
+	}
+	var engine uintptr
+	r, _, _ := procFwpmEngineOpen0.Call(0, 10, 0, uintptr(unsafe.Pointer(session)), uintptr(unsafe.Pointer(&engine))) // 10 = RPC_C_AUTHN_WINNT
+	if r != 0 {
+		return fmt.Errorf("FwpmEngineOpen0 failed for UDP block: 0x%08x", r)
+	}
+
+	sublayerKey := newGUID()
+	sublayerName, _ := windows.UTF16PtrFromString("Lux UDP Block Sublayer")
+	sublayer := &fwpmSublayer0{
+		sublayerKey: sublayerKey,
+		displayData: fwpmDisplayData0{name: sublayerName},
+		weight:      0x8000,
+	}
+	r, _, _ = procFwpmSubLayerAdd0.Call(engine, uintptr(unsafe.Pointer(sublayer)), 0)
+	if r != 0 {
+		procFwpmEngineClose0.Call(engine)
+		return fmt.Errorf("FwpmSubLayerAdd0 failed for UDP block: 0x%08x", r)
+	}
+
+	filterKey := newGUID()
+	filterName, _ := windows.UTF16PtrFromString("Lux UDP Block: Drop non-DNS UDP")
+	conditions := [2]fwpmFilterCondition0{
+		{
+			fieldKey:  fwpmConditionIPProtocol,
+			matchType: fwpMatchEqual,
+			conditionValue: fwpConditionValue0{
+				valueType: fwpConditionValueTypeUInt8,
+				value:     17, // IPPROTO_UDP
+			},
+		},
+		{
+			fieldKey:  fwpmConditionIPRemotePort,
+			matchType: fwpMatchNotEqual,
+			conditionValue: fwpConditionValue0{
+				valueType: fwpConditionValueTypeUInt16,
+				value:     53, // DNS
+			},
+		},
+	}
+	weight := fwpValue0{valueType: fwpEmptyValue}
+	filter := &fwpmFilter0{
+		filterKey:     filterKey,
+		displayData:   fwpmDisplayData0{name: filterName},
+		layerKey:      fwpmLayerALEAuthConnectV4,
+		sublayerKey:   sublayerKey,
+		weight:        weight,
+		numConditions: 2,
+		conditions:    &conditions[0],
+		action:        fwpmAction0{actionType: fwpActionBlock},
+	}
+	var filterId uint64
+	r, _, _ = procFwpmFilterAdd0.Call(engine, uintptr(unsafe.Pointer(filter)), 0, uintptr(unsafe.Pointer(&filterId)))
+	if r != 0 {
+		k := sublayerKey
+		procFwpmSubLayerDeleteByKey0.Call(engine, uintptr(unsafe.Pointer(&k)))
+		procFwpmEngineClose0.Call(engine)
+		return fmt.Errorf("FwpmFilterAdd0 failed for UDP block: 0x%08x", r)
+	}
+
+	globalWfpUdpBlock = &WfpUdpBlock{
+		engine:      engine,
+		sublayerKey: sublayerKey,
+		filterKey:   filterKey,
+	}
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP UDP block: activated (filterId=%d)"), filterId)
+	return nil
+}
+
+// CloseUdpBlock explicitly tears down the dynamic WFP UDP block filter, sublayer, and engine.
+func CloseUdpBlock() {
+	udpBlockMu.Lock()
+	defer udpBlockMu.Unlock()
+	if globalWfpUdpBlock == nil {
+		return
+	}
+
+	kFilter := globalWfpUdpBlock.filterKey
+	procFwpmFilterDeleteByKey0.Call(globalWfpUdpBlock.engine, uintptr(unsafe.Pointer(&kFilter)))
+
+	kSublayer := globalWfpUdpBlock.sublayerKey
+	procFwpmSubLayerDeleteByKey0.Call(globalWfpUdpBlock.engine, uintptr(unsafe.Pointer(&kSublayer)))
+
+	procFwpmEngineClose0.Call(globalWfpUdpBlock.engine)
+	globalWfpUdpBlock = nil
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP UDP block: closed"))
+}
+
+// IsUdpBlockActive reports whether the dynamic WFP UDP block is currently applied.
+func IsUdpBlockActive() bool {
+	udpBlockMu.Lock()
+	defer udpBlockMu.Unlock()
+	return globalWfpUdpBlock != nil
 }
 
 func ApplyProcessBypasses() {
@@ -235,7 +355,6 @@ func ApplyProcessBypasses() {
 		return
 	}
 	var processes []string
-	processes = append(processes, defaultBypassProcesses...)
 	processes = append(processes, rawConfig.Setting.BypassProcesses...)
 	for _, raw := range rawConfig.Rules {
 		raw = strings.TrimSpace(raw)
@@ -268,9 +387,7 @@ func ApplyProcessBypasses() {
 		}
 		exePath := resolveProcessPath(proc)
 		if exePath == "" {
-			if !isDefaultProcess(proc) {
-				log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), proc)
-			}
+			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), proc)
 			continue
 		}
 		if err := AddProcessBypass(exePath); err != nil {
@@ -293,9 +410,6 @@ func resolveProcessPath(name string) string {
 		filepath.Join(os.Getenv("ProgramFiles"), name),
 		filepath.Join(os.Getenv("ProgramFiles(x86)"), name),
 		filepath.Join(os.Getenv("LOCALAPPDATA"), name),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "WhatsApp", name),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "WhatsApp", name),
-		filepath.Join(os.Getenv("ProgramFiles"), "WhatsApp", name),
 	}
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {

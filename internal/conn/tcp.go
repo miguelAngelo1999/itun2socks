@@ -34,21 +34,6 @@ func isUpstreamAuthError(err error) bool {
 		strings.Contains(s, "HTTP 407")
 }
 
-func isWhatsAppTraffic(metadata *C.Metadata) bool {
-	if metadata == nil {
-		return false
-	}
-	if metadata.DstPort == 5222 {
-		return true
-	}
-	host := strings.ToLower(metadata.Host)
-	if strings.HasSuffix(host, ".whatsapp.com") || host == "whatsapp.com" ||
-		strings.HasSuffix(host, ".whatsapp.net") || host == "whatsapp.net" {
-		return true
-	}
-	return false
-}
-
 type TcpConnContext struct {
 	ctx      context.Context
 	metadata *C.Metadata
@@ -132,19 +117,6 @@ func NewTcpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 	// route through whatever interface the proxy server's subnet requires.
 	if policy == constants.PolicyDirect {
 		return connDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
-	}
-
-	// WhatsApp signaling (port 5222 / XMPP) and WhatsApp traffic to non-SSL ports:
-	// HTTP proxies (Squid, etc.) only permit CONNECT to SSL port 443 and reject
-	// port 5222 with HTTP 403 Forbidden.
-	// Route WhatsApp signaling directly via physical interface, matching System proxy mode.
-	if policy != constants.PolicyDirect && isWhatsAppTraffic(metadata) && (metadata.DstPort == 5222 || connDialer.Type() == C.Http && metadata.DstPort != 443) {
-		log.Infoln(log.FormatLog(log.TcpPrefix, "WhatsApp signaling (%v:%v) bypasses proxy to DIRECT"),
-			metadata.Host, metadata.DstPort)
-		directDialer, dErr := GetProxy(constants.PolicyDirect)
-		if dErr == nil {
-			return directDialer.DialContext(ctx, metadata, dialer.WithInterface(defaultInterface))
-		}
 	}
 
 	// This is a proxy dial. If the upstream has already rejected our
