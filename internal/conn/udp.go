@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
+	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
@@ -184,7 +185,8 @@ func (uc *CopyableReaderWriterConn) WriteTo(data []byte, addr net.Addr) (int, er
 
 // NewUdpConn builds the outbound packet conn for a UDP flow.
 //
-// If the matched proxy does not support UDP, fail fast with an error.
+// If the matched proxy does not support UDP, or if the flow is STUN (port 3478),
+// route DIRECT via defaultInterface (physical NIC) using directDialer.
 //
 // One socket per flow is correct here: sing keys its UDP NAT sessions on the
 // client source address alone, so all destinations reached from a single client
@@ -197,8 +199,12 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 		return nil, err
 	}
 
-	if !connDialer.SupportUDP() {
-		return nil, fmt.Errorf("proxy does not support UDP")
+	if !connDialer.SupportUDP() || metadata.DstPort == 3478 {
+		directDialer, err := GetProxy(constants.PolicyDirect)
+		if err != nil {
+			return nil, err
+		}
+		connDialer = directDialer
 	}
 
 	rawConn, err := connDialer.ListenPacketContext(ctx, metadata, dialer.WithInterface(defaultInterface), dialer.WithAddrReuse(true))

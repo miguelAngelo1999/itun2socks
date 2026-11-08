@@ -102,7 +102,7 @@ func (d *dummyRule) GetPolicy() constants.Policy { return d.policy }
 func (d *dummyRule) Type() constants.RuleType   { return "" }
 func (d *dummyRule) Valid() bool                { return true }
 
-func TestNewUdpConnUnsupported(t *testing.T) {
+func TestNewUdpConnFallbackToDirect(t *testing.T) {
 	proxies = nil
 	namedProxies = map[constants.Policy]C.Proxy{}
 
@@ -113,8 +113,16 @@ func TestNewUdpConnUnsupported(t *testing.T) {
 	}))
 	UpdateProxy(httpProxy)
 
-	_, err := NewUdpConn(context.Background(), &C.Metadata{DstPort: 3478}, &dummyRule{policy: constants.PolicyProxy}, "")
-	require.Error(t, err)
-	assert.Equal(t, "proxy does not support UDP", err.Error())
+	// When proxy doesn't support UDP or DstPort == 3478, NewUdpConn routes DIRECT
+	conn, err := NewUdpConn(context.Background(), &C.Metadata{DstPort: 3478}, &dummyRule{policy: constants.PolicyProxy}, "")
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	_ = conn.Close()
+
+	// Non-3478 port with unsupported UDP proxy also routes DIRECT
+	conn2, err := NewUdpConn(context.Background(), &C.Metadata{DstPort: 1234}, &dummyRule{policy: constants.PolicyProxy}, "")
+	require.NoError(t, err)
+	require.NotNil(t, conn2)
+	_ = conn2.Close()
 }
 

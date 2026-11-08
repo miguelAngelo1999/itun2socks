@@ -12,7 +12,6 @@ import (
 	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/iface"
-	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	sTun "github.com/sagernet/sing-tun"
 )
@@ -73,14 +72,6 @@ func (c *TunClient) Start() error {
 	// Apply WFP per-process bypasses (Windows only — no-op on macOS).
 	ApplyProcessBypasses()
 
-	// Dynamic WFP UDP block when proxy does not support UDP (Windows only — no-op on macOS).
-	hasUdpSupport := c.config != nil && c.config.Proxy != nil && c.config.Proxy.SupportUDP()
-	if !hasUdpSupport {
-		if err := ApplyUdpBlock(); err != nil {
-			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP UDP block failed: %v"), err)
-		}
-	}
-
 	if c.config.HijackDns.Enabled {
 
 		_, err := dns.Hijack(c.config.HijackDns.NetworkService, constants.HijackedDns, c.config.HijackDns.AlwaysReset)
@@ -106,9 +97,6 @@ func (c *TunClient) Close() error {
 
 	// Clean up WFP bypass filters (Windows only — no-op on macOS).
 	CloseWfpBypass()
-
-	// Clean up dynamic WFP UDP block (Windows only — no-op on macOS).
-	CloseUdpBlock()
 
 	// Stop PAC refresh and clear the registry on disconnect.
 	pac.DefaultRegistry.StopRefreshLoop()
