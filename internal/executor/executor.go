@@ -147,7 +147,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 		Handler:    proxy_handler.New(tunnel.TcpQueue(), tunnel.UdpQueue()),
 		TunOptions: tunOptions,
 		Tun:        tun,
-		UDPTimeout: 5 * time.Second,
+		UDPTimeout: 5 * time.Minute,
 		Logger:     logrus.StandardLogger(),
 	})
 	if err != nil {

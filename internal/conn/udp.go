@@ -9,6 +9,7 @@ import (
 
 	"github.com/igoogolx/itun2socks/internal/cfg/distribution/rule_engine"
 	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
@@ -124,6 +125,21 @@ func (c *CopyablePacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error)
 func (c *CopyablePacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if !destination.IsValid() {
 		return fmt.Errorf("fail to write udp: invalid destination %v", destination)
+	}
+	if destination.Addr.Is4() {
+		as4 := destination.Addr.As4()
+		if as4[0] == 198 && (as4[1] == 18 || as4[1] == 19) {
+			if domain, ok := dns.FakeIpPool.LookBack(net.IP(destination.Addr.AsSlice())); ok && domain != "" {
+				if ips, err := net.LookupIP(domain); err == nil {
+					for _, ip := range ips {
+						if rip4 := ip.To4(); rip4 != nil {
+							destination = M.SocksaddrFromNet(&net.UDPAddr{IP: rip4, Port: int(destination.Port)})
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 	_, err := c.WriteTo(buffer.Bytes(), destination.UDPAddr())
 	return err

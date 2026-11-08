@@ -16,9 +16,19 @@ import (
 //  1. Explicit bypassCidrs from settings
 //  2. The upstream proxy server's IP (auto-extracted from selected proxy config)
 //  3. IP-CIDR rules with DIRECT policy from customized rules
+//  4. Default Meta/WhatsApp VoIP CIDRs
 //
 // This function is called once at TUN startup and feeds into sing-tun's
 // Inet4RouteExcludeAddress option.
+var defaultVoipBypassCidrs = []string{
+	"157.240.0.0/16", // Meta / WhatsApp
+	"31.13.0.0/16",   // Meta / WhatsApp
+	"185.60.216.0/22",// Meta / WhatsApp
+	"129.134.0.0/16", // Meta / WhatsApp
+	"179.60.192.0/22",// Meta / WhatsApp
+	"204.15.20.0/22", // Meta / WhatsApp
+}
+
 func collectBypassCidrs() []netip.Prefix {
 	var excludes []netip.Prefix
 
@@ -91,6 +101,17 @@ func collectBypassCidrs() []netip.Prefix {
 			payload += "/32"
 		}
 		prefix, parseErr := netip.ParsePrefix(payload)
+		if parseErr != nil {
+			continue
+		}
+		if prefix.Addr().Is4() {
+			excludes = append(excludes, prefix)
+		}
+	}
+
+	// 4. Default Meta/WhatsApp VoIP CIDRs
+	for _, cidr := range defaultVoipBypassCidrs {
+		prefix, parseErr := netip.ParsePrefix(cidr)
 		if parseErr != nil {
 			continue
 		}
