@@ -22,8 +22,8 @@ var (
 		Data4: [8]byte{0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82},
 	}
 	fwpmConditionALEAppID = windows.GUID{
-		Data1: 0xd78e1e87, Data2: 0x8644, Data3: 0x4f37,
-		Data4: [8]byte{0x9b, 0x9c, 0x7e, 0x8e, 0x5e, 0x98, 0xdf, 0x68},
+		Data1: 0xd78e1e87, Data2: 0x8644, Data3: 0x4ea5,
+		Data4: [8]byte{0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71},
 	}
 	fwpmConditionIPProtocol = windows.GUID{
 		Data1: 0x3971ef2b, Data2: 0x623e, Data3: 0x4f9a,
@@ -36,13 +36,13 @@ var (
 )
 
 const (
-	fwpActionPermit             = 0x00001000
+	fwpActionPermit             = 0x00001002
 	fwpActionBlock              = 0x00001001
 	fwpMatchEqual               = 0
 	fwpMatchNotEqual            = 10
 	fwpConditionValueTypeUInt8  = 1
 	fwpConditionValueTypeUInt16 = 2
-	fwpConditionValueTypeBLOB   = 13
+	fwpConditionValueTypeBLOB   = 12
 	fwpmSessionFlagDynamic      = 0x00000001
 	fwpEmptyValue               = 0
 )
@@ -126,6 +126,9 @@ var (
 	procFwpmSubLayerDeleteByKey0  = fwpuclnt.NewProc("FwpmSubLayerDeleteByKey0")
 	procFwpmGetAppIdFromFileName0 = fwpuclnt.NewProc("FwpmGetAppIdFromFileName0")
 	procFwpmFreeMemory0           = fwpuclnt.NewProc("FwpmFreeMemory0")
+
+	kernel32                      = windows.NewLazySystemDLL("kernel32.dll")
+	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
 )
 
 type WfpBypass struct {
@@ -410,10 +413,98 @@ func resolveProcessPath(name string) string {
 		filepath.Join(os.Getenv("ProgramFiles"), name),
 		filepath.Join(os.Getenv("ProgramFiles(x86)"), name),
 		filepath.Join(os.Getenv("LOCALAPPDATA"), name),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", name),
 	}
 	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return p
+		if p != "" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+
+	// 1. Check WindowsApps packages (e.g. C:\Program Files\WindowsApps\*\<name>)
+	if p := findWindowsAppsPath(name); p != "" {
+		return p
+	}
+
+	// 2. Inspect running processes via Toolhelp32 snapshot & QueryFullProcessImageNameW
+	if p := findRunningProcessPath(name); p != "" {
+		return p
+	}
+
+	return ""
+}
+
+func findWindowsAppsPath(name string) string {
+	progFiles := os.Getenv("ProgramFiles")
+	if progFiles == "" {
+		progFiles = `C:\Program Files`
+	}
+	if matches, err := filepath.Glob(filepath.Join(progFiles, "WindowsApps", "*", name)); err == nil {
+		for _, m := range matches {
+			if _, err := os.Stat(m); err == nil {
+				return m
+			}
+		}
+	}
+	if matches, err := filepath.Glob(filepath.Join(progFiles, "WindowsApps", "*", "app", name)); err == nil {
+		for _, m := range matches {
+			if _, err := os.Stat(m); err == nil {
+				return m
+			}
+		}
+	}
+	if progW64 := os.Getenv("ProgramW6432"); progW64 != "" && progW64 != progFiles {
+		if matches, err := filepath.Glob(filepath.Join(progW64, "WindowsApps", "*", name)); err == nil {
+			for _, m := range matches {
+				if _, err := os.Stat(m); err == nil {
+					return m
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func findRunningProcessPath(targetExe string) string {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(snap)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	if err := windows.Process32First(snap, &entry); err != nil {
+		return ""
+	}
+
+	for {
+		exeName := windows.UTF16ToString(entry.ExeFile[:])
+		if strings.EqualFold(exeName, targetExe) {
+			hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
+			if err == nil {
+				var buf [4096]uint16
+				size := uint32(len(buf))
+				r, _, _ := procQueryFullProcessImageNameW.Call(
+					uintptr(hProc),
+					0,
+					uintptr(unsafe.Pointer(&buf[0])),
+					uintptr(unsafe.Pointer(&size)),
+				)
+				windows.CloseHandle(hProc)
+				if r != 0 && size > 0 {
+					p := windows.UTF16ToString(buf[:size])
+					if _, err := os.Stat(p); err == nil {
+						return p
+					}
+				}
+			}
+		}
+		if err := windows.Process32Next(snap, &entry); err != nil {
+			break
 		}
 	}
 	return ""
