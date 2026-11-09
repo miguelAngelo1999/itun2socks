@@ -48,6 +48,7 @@ func main() {
 	_ = os.MkdirAll(homeDir, os.ModePerm)
 	constants.Path.SetHomeDir(homeDir)
 	log.InitLog()
+	ensureSingleInstance()
 	log.Infoln(log.FormatLog(log.InitPrefix, "using config: %v"), constants.Path.ConfigFilePath())
 	configuration.SetConfigFilePath(constants.Path.ConfigFilePath())
 	configuration.Init()
