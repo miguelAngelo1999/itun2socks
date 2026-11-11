@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/Dreamacro/protobytes v0.0.0-20250322142947-26d5983b9568
 	github.com/dlclark/regexp2 v1.12.0
+	github.com/dop251/goja v0.0.0-20261110204830-f493a2b600d6
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-chi/cors v1.2.2
 	github.com/go-chi/render v1.0.3
@@ -30,7 +31,6 @@ require (
 	github.com/ajg/form v1.7.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dlclark/regexp2/v2 v2.11.0 // indirect
-	github.com/dop251/goja v0.0.0-20261110204830-f493a2b600d6 // indirect
 	github.com/florianl/go-nfqueue/v2 v2.0.3 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
