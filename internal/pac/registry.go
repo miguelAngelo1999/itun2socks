@@ -2,6 +2,7 @@ package pac
 
 import (
 	"fmt"
+	"net/url"
 	"sync"
 	"time"
 
@@ -11,12 +12,8 @@ import (
 // Registry holds a compiled PAC per proxy. Each proxy can declare its own PAC URL,
 // and routing consults it after a rule has chosen that proxy but before dialing.
 //
-// This replaces the former global singleton, which was consulted in the clash
-// match() fallback and broke streaming traffic by re-proxying already-proxied
-// connections.
-//
 // The registry is safe for concurrent use. Hot-path reads (Eval) take an RLock;
-// refreshes take a full Lock but run in a background goroutine at 30min intervals.
+// refreshes and updates do not hold locks during network fetches.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry // keyed by proxy id
@@ -43,51 +40,127 @@ func NewRegistry() *Registry {
 
 // Update synchronises the registry with the current proxy list. Proxies without
 // a pacUrl are removed (no PAC = all traffic goes through the proxy). New or
-// changed URLs are fetched and compiled. Unchanged entries keep their compiled
-// state to avoid re-fetching on every config read.
-//
-// fetchProxy is the proxy to use when fetching PAC scripts. It must NOT be the
-// proxy the PAC belongs to (chicken-and-egg). Pass "" for DIRECT or a preproxy
-// address like "http://127.0.0.1:8079".
+// changed URLs are fetched and compiled without holding the registry lock.
 func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	type toFetch struct {
+		id      string
+		pacUrl  string
+		pacOnly bool
+	}
 
+	var needed []toFetch
 	seen := make(map[string]bool, len(proxies))
+
+	r.mu.Lock()
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
-		url, _ := p["pacUrl"].(string)
+		pacUrl, _ := p["pacUrl"].(string)
 		server, _ := p["server"].(string)
 		pacOnly := server == ""
-		if id == "" || url == "" {
+		if id == "" || pacUrl == "" {
 			continue
 		}
 		seen[id] = true
 
 		existing := r.entries[id]
-		if existing != nil && existing.pacUrl == url {
-			// URL unchanged — keep the compiled version, but refresh the
-			// pacOnly flag in case the server field changed.
+		if existing != nil && existing.pacUrl == pacUrl {
+			// URL unchanged — keep compiled PAC, but update pacOnly in case server changed
 			existing.pacOnly = pacOnly
 			continue
 		}
 
-		// New or changed: fetch and compile.
-		compiled := fetchAndCompile(url, fetchProxy)
-		r.entries[id] = &entry{proxyId: id, pacUrl: url, pacOnly: pacOnly, compiled: compiled}
-		if compiled != nil {
-			log.Infoln("[pac-registry] compiled PAC for proxy %s from %s", id, url)
-		} else {
-			log.Warnln("[pac-registry] failed to compile PAC for proxy %s from %s", id, url)
-		}
+		needed = append(needed, toFetch{id: id, pacUrl: pacUrl, pacOnly: pacOnly})
 	}
 
-	// Remove entries for proxies that no longer carry a PAC URL.
+	// Remove entries for proxies that no longer carry a PAC URL
 	for id := range r.entries {
 		if !seen[id] {
 			delete(r.entries, id)
 		}
 	}
+	r.mu.Unlock()
+
+	// Fetch and compile outside lock to avoid blocking readers during network I/O
+	type fetchResult struct {
+		id       string
+		pacUrl   string
+		pacOnly  bool
+		compiled *CompiledPAC
+	}
+	results := make([]fetchResult, 0, len(needed))
+	for _, item := range needed {
+		compiled := fetchAndCompile(item.pacUrl, fetchProxy)
+		results = append(results, fetchResult{
+			id:       item.id,
+			pacUrl:   item.pacUrl,
+			pacOnly:  item.pacOnly,
+			compiled: compiled,
+		})
+	}
+
+	// Re-lock to apply compiled entries
+	r.mu.Lock()
+	for _, res := range results {
+		if seen[res.id] {
+			r.entries[res.id] = &entry{
+				proxyId:  res.id,
+				pacUrl:   res.pacUrl,
+				pacOnly:  res.pacOnly,
+				compiled: res.compiled,
+			}
+			if res.compiled != nil {
+				log.Infoln("[pac-registry] compiled PAC for proxy %s from %s", res.id, res.pacUrl)
+			} else {
+				log.Warnln("[pac-registry] failed to compile PAC for proxy %s from %s", res.id, res.pacUrl)
+			}
+		}
+	}
+	r.mu.Unlock()
+}
+
+// GetPacHosts returns unique hostnames of all registered PAC URLs.
+func (r *Registry) GetPacHosts() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var hosts []string
+	for _, e := range r.entries {
+		if e.pacUrl == "" {
+			continue
+		}
+		u, err := url.Parse(e.pacUrl)
+		if err != nil {
+			continue
+		}
+		h := u.Hostname()
+		if h != "" && !seen[h] {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
+
+// GetUpstreamHosts returns unique hostnames of all upstreams declared across all compiled PACs.
+func (r *Registry) GetUpstreamHosts() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var hosts []string
+	for _, e := range r.entries {
+		if e.compiled == nil {
+			continue
+		}
+		for _, h := range e.compiled.ExtractUpstreamHosts() {
+			if h != "" && !seen[h] {
+				seen[h] = true
+				hosts = append(hosts, h)
+			}
+		}
+	}
+	return hosts
 }
 
 // Eval evaluates the PAC for proxy [proxyId] against the given URL and host.
@@ -113,16 +186,6 @@ func (r *Registry) Eval(proxyId, url, host string) (result string, hasPAC bool) 
 
 // EvalDirective evaluates the PAC for proxy [proxyId] against the given URL and
 // host and returns the RAW directive without collapsing it to DIRECT/PROXY.
-//
-// Unlike Eval, this preserves the upstream address the PAC chose, e.g.
-// "PROXY 10.0.0.1:8080" or "SOCKS5 10.0.0.1:1080". This is what a PAC-only
-// (dynamic) outbound needs so it can dial the exact upstream the PAC selected
-// per connection.
-//
-// Returns:
-//   - (directive, true, false)  the raw directive string if this proxy has a compiled PAC
-//   - ("", false, false)        if this proxy has no PAC
-//   - ("", true, true)          if the PAC evaluation timed out (caller should fail, not DIRECT)
 func (r *Registry) EvalDirective(proxyId, url, host string) (directive string, hasPAC bool, timedOut bool) {
 	r.mu.RLock()
 	e := r.entries[proxyId]
@@ -139,11 +202,7 @@ func (r *Registry) EvalDirective(proxyId, url, host string) (directive string, h
 	return res, true, false
 }
 
-// IsPacOnly reports whether proxy [proxyId] is a PAC-only proxy (no fixed
-// server; the PAC supplies the upstream per connection). The dial-time
-// ShouldDirect gate is skipped for these so the dynamic outbound is the single
-// PAC-eval authority — it honors per-connection DIRECT and fails (never leaks
-// DIRECT) on eval timeout.
+// IsPacOnly reports whether proxy [proxyId] is a PAC-only proxy (no fixed server).
 func (r *Registry) IsPacOnly(proxyId string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -151,8 +210,7 @@ func (r *Registry) IsPacOnly(proxyId string) bool {
 	return e != nil && e.pacOnly
 }
 
-// ShouldDirect is the convenience check for the routing hook: does proxy P's PAC
-// say this host should go DIRECT?
+// ShouldDirect is the convenience check for the routing hook.
 func (r *Registry) ShouldDirect(proxyId, host string, port string, isTLS bool) bool {
 	if proxyId == "" {
 		return false
@@ -168,7 +226,6 @@ func (r *Registry) ShouldDirect(proxyId, host string, port string, isTLS bool) b
 }
 
 // StartRefreshLoop re-fetches and re-compiles all registered PACs every interval.
-// Call this once after Update on manager start.
 func (r *Registry) StartRefreshLoop(interval time.Duration, fetchProxy string) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
@@ -211,16 +268,50 @@ func (r *Registry) Clear() {
 }
 
 func (r *Registry) refresh(fetchProxy string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for id, e := range r.entries {
-		compiled := fetchAndCompile(e.pacUrl, fetchProxy)
-		if compiled != nil {
-			r.entries[id] = &entry{proxyId: id, pacUrl: e.pacUrl, pacOnly: e.pacOnly, compiled: compiled}
-		}
-		// On failure, keep the old compiled version rather than clearing it.
+	type refreshTarget struct {
+		id      string
+		pacUrl  string
+		pacOnly bool
 	}
+
+	r.mu.RLock()
+	targets := make([]refreshTarget, 0, len(r.entries))
+	for id, e := range r.entries {
+		targets = append(targets, refreshTarget{id: id, pacUrl: e.pacUrl, pacOnly: e.pacOnly})
+	}
+	r.mu.RUnlock()
+
+	type refreshResult struct {
+		id       string
+		pacUrl   string
+		pacOnly  bool
+		compiled *CompiledPAC
+	}
+	var results []refreshResult
+	for _, t := range targets {
+		compiled := fetchAndCompile(t.pacUrl, fetchProxy)
+		if compiled != nil {
+			results = append(results, refreshResult{
+				id:       t.id,
+				pacUrl:   t.pacUrl,
+				pacOnly:  t.pacOnly,
+				compiled: compiled,
+			})
+		}
+	}
+
+	r.mu.Lock()
+	for _, res := range results {
+		if cur, ok := r.entries[res.id]; ok && cur.pacUrl == res.pacUrl {
+			r.entries[res.id] = &entry{
+				proxyId:  res.id,
+				pacUrl:   res.pacUrl,
+				pacOnly:  res.pacOnly,
+				compiled: res.compiled,
+			}
+		}
+	}
+	r.mu.Unlock()
 }
 
 // fetchAndCompile downloads and compiles a PAC script. Returns nil on failure.
@@ -239,11 +330,6 @@ func fetchAndCompile(pacURL, fetchProxy string) *CompiledPAC {
 }
 
 // FetchViaProxy downloads a PAC script using a specific proxy (or DIRECT if empty).
-// This must NOT use the proxy the PAC belongs to.
 func FetchViaProxy(pacURL, proxy string) (string, error) {
-	// Reuse the existing Fetch which uses http.DefaultClient. If a proxy is
-	// specified, we temporarily set the env and use a custom transport.
-	// For now, use the existing Fetch — it works via the preproxy at 8079
-	// because the caller sets http_proxy before starting the core.
 	return Fetch(pacURL)
 }

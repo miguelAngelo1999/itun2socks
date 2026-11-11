@@ -124,6 +124,29 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	rawConfig, err := configuration.Read()
+	if err != nil {
+		return nil, err
+	}
+
+	pac.SetExcludedTunIface(config.Device.Name)
+	if config.Rule.Dns.Local.Client != nil {
+		pac.SetLocalLookup(func(ctx context.Context, host string) ([]string, error) {
+			ips, err := config.Rule.Dns.Local.Client.LookupIPv4(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			var res []string
+			for _, ip := range ips {
+				res = append(res, ip.String())
+			}
+			return res, nil
+		})
+	}
+	pac.SetIsBypassed(IsBypassedFromTun)
+	pac.DefaultRegistry.Update(rawConfig.Proxy, "")
+
 	tunOptions := sTun.Options{
 		Name:                    config.Device.Name,
 		MTU:                     uint32(config.Device.Mtu),
@@ -189,6 +212,11 @@ func newSysProxy() (*SystemProxyClient, error) {
 	config, err := cfg.NewSystemProxy()
 	if err != nil {
 		return nil, err
+	}
+
+	rawConfig, err := configuration.Read()
+	if err == nil {
+		pac.DefaultRegistry.Update(rawConfig.Proxy, "")
 	}
 
 	tunnel.UpdateShouldFindProcess(false)

@@ -133,7 +133,25 @@ func (p *PacDynamic) DialContext(ctx context.Context, metadata *C.Metadata, opts
 	var lastErr error
 	for _, d := range directives {
 		if d.IsDirect() {
-			c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), p.Base.DialOptions(opts...)...)
+			var targetIP net.IP
+			if ip := net.ParseIP(metadata.Host); ip != nil {
+				targetIP = ip
+			} else if metadata.DstIP != nil {
+				targetIP = metadata.DstIP
+			} else if ipStr := pac.GoLookup(metadata.Host); ipStr != "" {
+				targetIP = net.ParseIP(ipStr)
+			}
+
+			directOpts := opts
+			defIface := dialer.DefaultInterface.Load()
+			// If target IP is NOT covered by bypass excluded prefixes and is NOT a private IP
+			// (which could be routed over a corporate VPN utun interface), bind default interface
+			// to prevent entering TUN and creating a routing loop (matching conn/tcp.go:118).
+			if defIface != "" && targetIP != nil && !pac.IsBypassed(targetIP) && !targetIP.IsPrivate() {
+				directOpts = append(directOpts, dialer.WithInterface(defIface))
+			}
+
+			c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), p.Base.DialOptions(directOpts...)...)
 			if err != nil {
 				lastErr = err
 				continue
@@ -142,12 +160,25 @@ func (p *PacDynamic) DialContext(ctx context.Context, metadata *C.Metadata, opts
 			return NewConn(c, p), nil
 		}
 
+		var upstreamIP net.IP
+		if ip := net.ParseIP(d.Host); ip != nil {
+			upstreamIP = ip
+		} else if ipStr := pac.GoLookup(d.Host); ipStr != "" {
+			upstreamIP = net.ParseIP(ipStr)
+		}
+
+		childOpts := opts
+		defIface := dialer.DefaultInterface.Load()
+		if defIface != "" && upstreamIP != nil && !pac.IsBypassed(upstreamIP) && !upstreamIP.IsPrivate() {
+			childOpts = append(childOpts, dialer.WithInterface(defIface))
+		}
+
 		upstream, err := p.upstreamFor(d)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		conn, err := upstream.DialContext(ctx, metadata, opts...)
+		conn, err := upstream.DialContext(ctx, metadata, childOpts...)
 		if err != nil {
 			lastErr = err
 			log.Debugln("[pac-dynamic] upstream %s://%s dial failed for %s: %v", d.Scheme, net.JoinHostPort(d.Host, d.Port), host, err)

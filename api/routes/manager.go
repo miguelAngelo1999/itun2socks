@@ -14,6 +14,7 @@ import (
 func managerRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getStatus)
+	r.Get("/status", getStatus)
 	r.Post("/start", start)
 	r.Post("/stop", stop)
 	r.Post("/exit", exit)

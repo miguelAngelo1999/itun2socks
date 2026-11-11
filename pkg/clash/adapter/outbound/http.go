@@ -145,7 +145,7 @@ func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
 
 	req.Header.Add("Proxy-Connection", "Keep-Alive")
 
-	if h.user != "" && h.pass != "" {
+	if h.user != "" {
 		auth := h.user + ":" + h.pass
 		req.Header.Add("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
 	}

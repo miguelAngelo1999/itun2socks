@@ -43,6 +43,7 @@ func newBuiltIn(payload string, policy constants.Policy) (*builtIn, error) {
 }
 
 var (
+	BuiltInDirectRule, _ = newBuiltIn("*", constants.PolicyDirect)
 	BuiltInProxyRule, _  = newBuiltIn("*", constants.PolicyProxy)
 	BuiltInRejectRule, _ = newBuiltIn("*", constants.PolicyReject)
 )

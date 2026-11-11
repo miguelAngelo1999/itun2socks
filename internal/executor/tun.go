@@ -101,6 +101,9 @@ func (c *TunClient) Close() error {
 	// Stop PAC refresh and clear the registry on disconnect.
 	pac.DefaultRegistry.StopRefreshLoop()
 	pac.DefaultRegistry.Clear()
+	pac.SetExcludedTunIface("")
+	pac.SetLocalLookup(nil)
+	pac.SetIsBypassed(nil)
 
 	if c.config.HijackDns.Enabled {
 		err := dns.Resume(c.config.HijackDns.NetworkService, c.config.HijackDns.AlwaysReset)

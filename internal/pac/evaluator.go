@@ -1,20 +1,7 @@
 // Package pac provides PAC (Proxy Auto-Config) evaluation.
 //
-// EvalForURL executes FindProxyForURL(url, host) against a cached PAC script
-// using a purpose-built interpreter for the frozen PAC/ES3 function subset.
-// No external JS engine is required — PAC defines exactly 12 helper functions
-// and a predictable control-flow grammar that we can evaluate natively.
-//
-// Supported PAC functions:
-//   dnsDomainIs, shExpMatch, isInNet, dnsResolve, myIpAddress,
-//   isPlainHostName, localHostOrDomainIs, dnsDomainLevels,
-//   isResolvable, weekdayRange, dateRange, timeRange
-//
-// The interpreter handles:
-//   - if / else if / else chains
-//   - return "DIRECT" / return "PROXY host:port"
-//   - boolean &&, ||, ! operators
-//   - Nested function calls to the helpers above
+// Eval evaluates FindProxyForURL(url, host) using an embedded ECMAScript runtime
+// (github.com/dop251/goja) with standard PAC helper functions.
 package pac
 
 import (
@@ -26,18 +13,33 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/dop251/goja"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
-// ── DNS cache ────────────────────────────────────────────────────────────────
+// ── DNS cache & lookups ──────────────────────────────────────────────────────
 
-var dnsCache *lru.Cache[string, string]
-var dnsCacheOnce sync.Once
+type LocalLookupFunc func(ctx context.Context, host string) ([]string, error)
+
+var (
+	dnsCache      *lru.Cache[string, string]
+	dnsCacheOnce  sync.Once
+	localLookup   LocalLookupFunc
+	localLookupMu sync.RWMutex
+
+	excludedTunIface string
+	excludedTunMu    sync.RWMutex
+
+	isBypassedFn func(net.IP) bool
+	isBypassedMu sync.RWMutex
+)
 
 func getDNSCache() *lru.Cache[string, string] {
 	dnsCacheOnce.Do(func() {
@@ -47,35 +49,116 @@ func getDNSCache() *lru.Cache[string, string] {
 	return dnsCache
 }
 
-// goLookup resolves host to its first IPv4 address with a 500ms timeout.
-// Results are cached in a 512-entry LRU.
+// SetLocalLookup sets the local DNS resolver callback (e.g. from local DHCP client).
+func SetLocalLookup(fn LocalLookupFunc) {
+	localLookupMu.Lock()
+	defer localLookupMu.Unlock()
+	localLookup = fn
+}
+
+// SetExcludedTunIface registers the Lux TUN device name so detectMyIP will skip it.
+func SetExcludedTunIface(name string) {
+	excludedTunMu.Lock()
+	defer excludedTunMu.Unlock()
+	excludedTunIface = name
+}
+
+// SetIsBypassed registers the bypass predicate checking if an IP is excluded from TUN routing.
+func SetIsBypassed(fn func(net.IP) bool) {
+	isBypassedMu.Lock()
+	defer isBypassedMu.Unlock()
+	isBypassedFn = fn
+}
+
+// IsBypassed reports whether the given IP is covered by the active bypass prefixes.
+func IsBypassed(ip net.IP) bool {
+	isBypassedMu.RLock()
+	defer isBypassedMu.RUnlock()
+	if isBypassedFn != nil {
+		return isBypassedFn(ip)
+	}
+	return false
+}
+
+func isFakeIP(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	// 198.18.0.0/15 RFC 2544
+	return ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+}
+
+func isExcludedIP(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return true
+	}
+	// 198.18.0.0/15
+	if ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19) {
+		return true
+	}
+	// 10.255.0.0/16
+	if ip4[0] == 10 && ip4[1] == 255 {
+		return true
+	}
+	return false
+}
+
+// GoLookup resolves host to its first IPv4 address, ignoring Fake-IPs (198.18.0.0/15).
+func GoLookup(host string) string {
+	return goLookup(host)
+}
+
 func goLookup(host string) string {
 	cache := getDNSCache()
 	if v, ok := cache.Get(host); ok {
 		return v
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-	if err != nil || len(addrs) == 0 {
+
+	if ip := net.ParseIP(host); ip != nil {
+		if !isFakeIP(ip) && ip.To4() != nil {
+			return host
+		}
 		return ""
 	}
-	// Prefer IPv4
-	result := addrs[0]
-	for _, a := range addrs {
-		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
-			result = a
-			break
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// 1. Try local lookup if registered
+	localLookupMu.RLock()
+	fn := localLookup
+	localLookupMu.RUnlock()
+	if fn != nil {
+		addrs, err := fn(ctx, host)
+		if err == nil {
+			for _, a := range addrs {
+				if ip := net.ParseIP(a); ip != nil && ip.To4() != nil && !isFakeIP(ip) {
+					cache.Add(host, a)
+					return a
+				}
+			}
 		}
 	}
-	cache.Add(host, result)
-	return result
+
+	// 2. Fallback to system resolver
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err == nil {
+		for _, a := range addrs {
+			if ip := net.ParseIP(a); ip != nil && ip.To4() != nil && !isFakeIP(ip) {
+				cache.Add(host, a)
+				return a
+			}
+		}
+	}
+
+	return ""
 }
 
 // ── myIpAddress ──────────────────────────────────────────────────────────────
 
 var (
-	myIPOnce  sync.Once
 	myIPCache string
 	myIPMu    sync.RWMutex
 )
@@ -88,17 +171,35 @@ func RefreshMyIP() {
 }
 
 func detectMyIP() string {
-	// In TUN/Mixed mode, dialling 8.8.8.8 routes through the TUN interface
-	// and returns the TUN IP (198.18.x.x) instead of the real LAN IP.
-	// Instead, find the first non-loopback, non-TUN IPv4 from physical interfaces.
+	excludedTunMu.RLock()
+	excludedIface := excludedTunIface
+	excludedTunMu.RUnlock()
+
+	// 1. Prefer dialer.DefaultInterface if set and valid
+	if defIface := dialer.DefaultInterface.Load(); defIface != "" && defIface != excludedIface {
+		if iface, err := net.InterfaceByName(defIface); err == nil &&
+			iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			if addrs, err := iface.Addrs(); err == nil {
+				for _, a := range addrs {
+					var ip net.IP
+					if ipn, ok := a.(*net.IPNet); ok {
+						ip = ipn.IP
+					}
+					if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !isExcludedIP(ip) {
+						return ip.String()
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Physical non-Lux interfaces (skip ONLY the Lux TUN interface, preserving corporate VPNs)
 	ifaces, _ := net.Interfaces()
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
 			continue
 		}
-		// Skip TUN/utun interfaces
-		name := iface.Name
-		if len(name) >= 4 && (name[:4] == "utun" || name[:3] == "tun") {
+		if excludedIface != "" && iface.Name == excludedIface {
 			continue
 		}
 		addrs, _ := iface.Addrs()
@@ -107,24 +208,35 @@ func detectMyIP() string {
 			if ipn, ok := a.(*net.IPNet); ok {
 				ip = ipn.IP
 			}
-			if ip == nil || ip.To4() == nil || ip.IsLoopback() {
-				continue
-			}
-			// Skip TUN address range (198.18.0.0/15 — RFC 2544 benchmarking)
-			if ip[0] == 198 && ip[1] >= 18 && ip[1] <= 19 {
+			if ip == nil || ip.To4() == nil || ip.IsLoopback() || isExcludedIP(ip) {
 				continue
 			}
 			return ip.String()
 		}
 	}
-	// Fallback: dial to get outbound IP
-	conn, err := net.DialTimeout("udp", "8.8.8.8:53", 1*time.Second)
-	if err == nil {
-		defer conn.Close()
-		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-			return udpAddr.IP.String()
+
+	// 3. Fallback: dial UDP to outbound target (prefer PAC host if known, else 8.8.8.8)
+	var targets []string
+	if DefaultRegistry != nil {
+		for _, ph := range DefaultRegistry.GetPacHosts() {
+			if ipStr := goLookup(ph); ipStr != "" {
+				targets = append(targets, ipStr+":80")
+			}
 		}
 	}
+	targets = append(targets, "8.8.8.8:53", "1.1.1.1:53")
+	for _, t := range targets {
+		conn, err := net.DialTimeout("udp", t, 500*time.Millisecond)
+		if err == nil {
+			defer conn.Close()
+			if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+				if !isExcludedIP(udpAddr.IP) && udpAddr.IP.To4() != nil {
+					return udpAddr.IP.String()
+				}
+			}
+		}
+	}
+
 	return "127.0.0.1"
 }
 
@@ -145,7 +257,6 @@ func getMyIP() string {
 
 // ── PAC helper functions ─────────────────────────────────────────────────────
 
-// pacDnsDomainIs implements dnsDomainIs(host, domain).
 func pacDnsDomainIs(host, domain string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	domain = strings.ToLower(strings.TrimSpace(domain))
@@ -158,10 +269,8 @@ func pacDnsDomainIs(host, domain string) bool {
 	return strings.HasSuffix(host, domain)
 }
 
-// pacShExpMatch implements shExpMatch(str, pattern) — shell glob to regexp.
 func pacShExpMatch(str, pattern string) bool {
 	str = strings.ToLower(str)
-	// Convert shell pattern to regexp.
 	var sb strings.Builder
 	sb.WriteString("(?i)^")
 	for _, ch := range pattern {
@@ -185,9 +294,10 @@ func pacShExpMatch(str, pattern string) bool {
 	return re.MatchString(str)
 }
 
-// pacIsInNet implements isInNet(host, pattern, mask).
 func pacIsInNet(host, pattern, mask string) bool {
-	// host may already be an IP, or a hostname to resolve.
+	if host == "" || pattern == "" || mask == "" {
+		return false
+	}
 	ipStr := host
 	if net.ParseIP(host) == nil {
 		ipStr = goLookup(host)
@@ -209,19 +319,16 @@ func pacIsInNet(host, pattern, mask string) bool {
 	return true
 }
 
-// pacIsPlainHostName implements isPlainHostName(host) — no dots.
 func pacIsPlainHostName(host string) bool {
 	return !strings.Contains(host, ".")
 }
 
-// pacLocalHostOrDomainIs implements localHostOrDomainIs(host, hostdom).
 func pacLocalHostOrDomainIs(host, hostdom string) bool {
 	host = strings.ToLower(host)
 	hostdom = strings.ToLower(hostdom)
 	if host == hostdom {
 		return true
 	}
-	// short host matches if hostdom starts with host+"."
 	dot := strings.Index(hostdom, ".")
 	if dot == -1 {
 		return false
@@ -229,787 +336,345 @@ func pacLocalHostOrDomainIs(host, hostdom string) bool {
 	return host == hostdom[:dot]
 }
 
-// pacDnsDomainLevels implements dnsDomainLevels(host).
 func pacDnsDomainLevels(host string) int {
 	return strings.Count(host, ".")
 }
 
-// pacIsResolvable implements isResolvable(host).
 func pacIsResolvable(host string) bool {
 	return goLookup(host) != ""
 }
 
-// ── Script extraction ─────────────────────────────────────────────────────────
+// ── Time / Date PAC Helpers ──────────────────────────────────────────────────
 
-// extractBody pulls the text of FindProxyForURL's body from the PAC JS source.
-// Returns the raw body between the outermost { }.
-func extractBody(js string) string {
-	// Find the function declaration
-	idx := strings.Index(js, "FindProxyForURL")
-	if idx == -1 {
-		return ""
-	}
-	// Scan forward for the opening brace
-	start := strings.Index(js[idx:], "{")
-	if start == -1 {
-		return ""
-	}
-	start += idx + 1
-	depth := 1
-	for i := start; i < len(js); i++ {
-		switch js[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return js[start:i]
-			}
-		}
-	}
-	return ""
+var weekdayMap = map[string]time.Weekday{
+	"SUN": time.Sunday,
+	"MON": time.Monday,
+	"TUE": time.Tuesday,
+	"WED": time.Wednesday,
+	"THU": time.Thursday,
+	"FRI": time.Friday,
+	"SAT": time.Saturday,
 }
 
-// stripComments removes // and /* */ comments from JS source.
-func stripComments(js string) string {
-	// Remove block comments
-	var out strings.Builder
-	i := 0
-	for i < len(js) {
-		if i+1 < len(js) && js[i] == '/' && js[i+1] == '*' {
-			end := strings.Index(js[i+2:], "*/")
-			if end == -1 {
-				break
-			}
-			// Preserve newlines for line-oriented parsing
-			for _, c := range js[i : i+2+end+2] {
-				if c == '\n' {
-					out.WriteByte('\n')
-				}
-			}
-			i = i + 2 + end + 2
-			continue
-		}
-		if i+1 < len(js) && js[i] == '/' && js[i+1] == '/' {
-			end := strings.Index(js[i:], "\n")
-			if end == -1 {
-				break
-			}
-			out.WriteByte('\n')
-			i = i + end + 1
-			continue
-		}
-		out.WriteByte(js[i])
-		i++
-	}
-	return out.String()
+var monthMap = map[string]int{
+	"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+	"JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-// ── Tokenizer ─────────────────────────────────────────────────────────────────
-
-type tokenKind int
-
-const (
-	tokEOF tokenKind = iota
-	tokIdent
-	tokString
-	tokNumber
-	tokLParen
-	tokRParen
-	tokLBrace
-	tokRBrace
-	tokComma
-	tokSemicolon
-	tokAnd // &&
-	tokOr  // ||
-	tokNot // !
-	tokEq  // ==
-	tokNeq // !=
-	tokLt  // <
-	tokGt  // >
-	tokLte // <=
-	tokGte // >=
-)
-
-type token struct {
-	kind tokenKind
-	val  string
-}
-
-type lexer struct {
-	src []rune
-	pos int
-}
-
-func newLexer(src string) *lexer { return &lexer{src: []rune(src)} }
-
-func (l *lexer) peek() rune {
-	if l.pos >= len(l.src) {
-		return 0
-	}
-	return l.src[l.pos]
-}
-
-func (l *lexer) read() rune {
-	if l.pos >= len(l.src) {
-		return 0
-	}
-	ch := l.src[l.pos]
-	l.pos++
-	return ch
-}
-
-func (l *lexer) skipWS() {
-	for l.pos < len(l.src) {
-		ch := l.src[l.pos]
-		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == ';' {
-			l.pos++
-		} else {
-			break
-		}
-	}
-}
-
-func (l *lexer) next() token {
-	l.skipWS()
-	if l.pos >= len(l.src) {
-		return token{tokEOF, ""}
-	}
-	ch := l.peek()
-
-	// Two-char operators
-	if l.pos+1 < len(l.src) {
-		two := string(l.src[l.pos : l.pos+2])
-		switch two {
-		case "&&":
-			l.pos += 2
-			return token{tokAnd, "&&"}
-		case "||":
-			l.pos += 2
-			return token{tokOr, "||"}
-		case "==":
-			l.pos += 2
-			return token{tokEq, "=="}
-		case "!=":
-			l.pos += 2
-			return token{tokNeq, "!="}
-		case "<=":
-			l.pos += 2
-			return token{tokLte, "<="}
-		case ">=":
-			l.pos += 2
-			return token{tokGte, ">="}
-		}
-	}
-
-	switch ch {
-	case '(':
-		l.pos++
-		return token{tokLParen, "("}
-	case ')':
-		l.pos++
-		return token{tokRParen, ")"}
-	case '{':
-		l.pos++
-		return token{tokLBrace, "{"}
-	case '}':
-		l.pos++
-		return token{tokRBrace, "}"}
-	case ',':
-		l.pos++
-		return token{tokComma, ","}
-	case ';':
-		l.pos++
-		return token{tokSemicolon, ";"}
-	case '!':
-		l.pos++
-		return token{tokNot, "!"}
-	case '<':
-		l.pos++
-		return token{tokLt, "<"}
-	case '>':
-		l.pos++
-		return token{tokGt, ">"}
-	case '"', '\'':
-		return l.readString(ch)
-	}
-
-	if ch >= '0' && ch <= '9' {
-		return l.readNumber()
-	}
-	if isIdentStart(ch) {
-		return l.readIdent()
-	}
-	// Skip unknown character
-	l.pos++
-	return l.next()
-}
-
-func isIdentStart(ch rune) bool {
-	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == '$'
-}
-
-func isIdentPart(ch rune) bool {
-	return isIdentStart(ch) || (ch >= '0' && ch <= '9')
-}
-
-func (l *lexer) readString(quote rune) token {
-	l.pos++ // skip opening quote
-	var sb strings.Builder
-	for l.pos < len(l.src) {
-		ch := l.src[l.pos]
-		l.pos++
-		if ch == quote {
-			break
-		}
-		if ch == '\\' && l.pos < len(l.src) {
-			next := l.src[l.pos]
-			l.pos++
-			switch next {
-			case 'n':
-				sb.WriteByte('\n')
-			case 't':
-				sb.WriteByte('\t')
-			default:
-				sb.WriteRune(next)
-			}
-			continue
-		}
-		sb.WriteRune(ch)
-	}
-	return token{tokString, sb.String()}
-}
-
-func (l *lexer) readNumber() token {
-	start := l.pos
-	for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
-		l.pos++
-	}
-	return token{tokNumber, string(l.src[start:l.pos])}
-}
-
-func (l *lexer) readIdent() token {
-	start := l.pos
-	for l.pos < len(l.src) && isIdentPart(l.src[l.pos]) {
-		l.pos++
-	}
-	return token{tokIdent, string(l.src[start:l.pos])}
-}
-
-// ── Parser / Evaluator ────────────────────────────────────────────────────────
-
-// parser evaluates PAC body statements directly during parsing.
-type parser struct {
-	lex    *lexer
-	peeked *token
-	host   string // the "host" variable in FindProxyForURL scope
-	url    string // the "url" variable
-}
-
-func (p *parser) peek() token {
-	if p.peeked != nil {
-		return *p.peeked
-	}
-	t := p.lex.next()
-	p.peeked = &t
-	return t
-}
-
-func (p *parser) consume() token {
-	if p.peeked != nil {
-		t := *p.peeked
-		p.peeked = nil
-		return t
-	}
-	return p.lex.next()
-}
-
-func (p *parser) expect(k tokenKind) {
-	t := p.consume()
-	_ = t // error handling is best-effort in PAC evaluation
-	if t.kind == tokEOF {
-		// Unexpected EOF — ignore
-	}
-}
-
-// parseBlock executes a { } block and returns a result string if a return was hit.
-func (p *parser) parseBlock() (string, bool) {
-	p.expect(tokLBrace)
-	for {
-		t := p.peek()
-		if t.kind == tokRBrace || t.kind == tokEOF {
-			p.consume()
-			return "", false
-		}
-		if result, ok := p.parseStatement(); ok {
-			// drain remaining statements
-			p.drainBlock()
-			return result, true
-		}
-	}
-}
-
-// drainBlock skips tokens until the matching } is consumed.
-func (p *parser) drainBlock() {
-	depth := 1
-	for depth > 0 {
-		t := p.consume()
-		switch t.kind {
-		case tokLBrace:
-			depth++
-		case tokRBrace:
-			depth--
-		case tokEOF:
-			return
-		}
-	}
-}
-
-// parseStatement executes one statement (if/return/var/expr).
-// Returns (result, true) if a return was encountered.
-func (p *parser) parseStatement() (string, bool) {
-	t := p.peek()
-	if t.kind == tokEOF || t.kind == tokRBrace {
-		return "", false
-	}
-	if t.kind == tokIdent {
-		switch t.val {
-		case "if":
-			return p.parseIf()
-		case "return":
-			return p.parseReturn()
-		case "var", "let", "const":
-			p.consume() // skip keyword
-			p.skipToSemicolon()
-			return "", false
-		case "function":
-			// Nested function def — skip entirely
-			p.consume()
-			p.skipToBlockEnd()
-			return "", false
-		}
-	}
-	// Expression statement — evaluate and discard
-	p.skipToSemicolon()
-	return "", false
-}
-
-func (p *parser) skipToSemicolon() {
-	depth := 0
-	for {
-		t := p.peek()
-		if t.kind == tokEOF {
-			return
-		}
-		if t.kind == tokLBrace {
-			depth++
-		}
-		if t.kind == tokRBrace {
-			if depth == 0 {
-				return
-			}
-			depth--
-		}
-		if t.kind == tokSemicolon && depth == 0 {
-			p.consume()
-			return
-		}
-		p.consume()
-	}
-}
-
-func (p *parser) skipToBlockEnd() {
-	// Skip optional function name + param list
-	for {
-		t := p.peek()
-		if t.kind == tokLBrace || t.kind == tokEOF {
-			break
-		}
-		p.consume()
-	}
-	if p.peek().kind == tokLBrace {
-		p.drainBlock()
-		p.lex.pos-- // drainBlock consumes the }, undo to balance
-		p.consume() // re-consume }
-	}
-}
-
-// parseIf evaluates an if/else if/else chain.
-func (p *parser) parseIf() (string, bool) {
-	p.consume() // consume "if"
-	p.expect(tokLParen)
-	cond := p.parseExpr()
-	p.expect(tokRParen)
-
-	if cond {
-		result, ok := p.parseBlockOrStatement()
-		if ok {
-			// Drain any else branches
-			p.skipElseChain()
-			return result, true
-		}
-		p.skipElseChain()
-		return "", false
-	}
-	// Condition false — skip the then-branch
-	p.skipBlockOrStatement()
-	// Check for else/else-if
-	if p.peek().kind == tokIdent && p.peek().val == "else" {
-		p.consume() // consume "else"
-		if p.peek().kind == tokIdent && p.peek().val == "if" {
-			return p.parseIf()
-		}
-		return p.parseBlockOrStatement()
-	}
-	return "", false
-}
-
-func (p *parser) parseBlockOrStatement() (string, bool) {
-	if p.peek().kind == tokLBrace {
-		return p.parseBlock()
-	}
-	return p.parseStatement()
-}
-
-func (p *parser) skipBlockOrStatement() {
-	if p.peek().kind == tokLBrace {
-		p.consume() // {
-		p.drainBlock()
-		return
-	}
-	p.skipToSemicolon()
-}
-
-func (p *parser) skipElseChain() {
-	for p.peek().kind == tokIdent && p.peek().val == "else" {
-		p.consume() // else
-		if p.peek().kind == tokIdent && p.peek().val == "if" {
-			p.consume() // if
-			// skip condition
-			depth := 0
-			for {
-				t := p.consume()
-				if t.kind == tokEOF {
-					return
-				}
-				if t.kind == tokLParen {
-					depth++
-				}
-				if t.kind == tokRParen {
-					depth--
-					if depth == 0 {
-						break
-					}
-				}
-			}
-		}
-		p.skipBlockOrStatement()
-	}
-}
-
-// parseReturn parses: return "DIRECT"; or return "PROXY host:port";
-func (p *parser) parseReturn() (string, bool) {
-	p.consume() // consume "return"
-	t := p.peek()
-	if t.kind == tokString {
-		p.consume()
-		return t.val, true
-	}
-	if t.kind == tokIdent {
-		// Some PAC files do: return "DIRECT" without quotes on old impls — ignore
-	}
-	p.skipToSemicolon()
-	return "DIRECT", true // conservative: unknown return → DIRECT
-}
-
-// ── Expression evaluator ──────────────────────────────────────────────────────
-
-// parseExpr evaluates a boolean expression (||, &&, !, function calls).
-func (p *parser) parseExpr() bool {
-	return p.parseOr()
-}
-
-func (p *parser) parseOr() bool {
-	left := p.parseAnd()
-	for p.peek().kind == tokOr {
-		p.consume()
-		right := p.parseAnd()
-		left = left || right
-	}
-	return left
-}
-
-func (p *parser) parseAnd() bool {
-	left := p.parseUnary()
-	for p.peek().kind == tokAnd {
-		p.consume()
-		right := p.parseUnary()
-		left = left && right
-	}
-	return left
-}
-
-func (p *parser) parseUnary() bool {
-	if p.peek().kind == tokNot {
-		p.consume()
-		return !p.parsePrimary()
-	}
-	return p.parsePrimary()
-}
-
-func (p *parser) parsePrimary() bool {
-	t := p.peek()
-
-	// Parenthesised expression
-	if t.kind == tokLParen {
-		p.consume()
-		val := p.parseExpr()
-		if p.peek().kind == tokRParen {
-			p.consume()
-		}
-		return val
-	}
-
-	// Boolean literals
-	if t.kind == tokIdent && t.val == "true" {
-		p.consume()
-		return true
-	}
-	if t.kind == tokIdent && t.val == "false" {
-		p.consume()
+func evalWeekdayRange(args []goja.Value, now time.Time) bool {
+	if len(args) == 0 {
 		return false
 	}
+	useGMT := false
+	var strArgs []string
+	for _, a := range args {
+		s := strings.ToUpper(strings.TrimSpace(a.String()))
+		if s == "GMT" {
+			useGMT = true
+		} else if s != "" {
+			strArgs = append(strArgs, s)
+		}
+	}
+	if len(strArgs) == 0 {
+		return false
+	}
+	if useGMT {
+		now = now.UTC()
+	}
+	curW := now.Weekday()
 
-	// Function call or identifier
-	if t.kind == tokIdent {
-		return p.parseFuncCallOrCompare()
+	wd1, ok1 := weekdayMap[strArgs[0]]
+	if !ok1 {
+		return false
+	}
+	if len(strArgs) == 1 {
+		return curW == wd1
 	}
 
-	// String literal in a boolean context — truthy if non-empty
-	if t.kind == tokString {
-		p.consume()
-		return t.val != ""
+	wd2, ok2 := weekdayMap[strArgs[1]]
+	if !ok2 {
+		return false
+	}
+	if wd1 <= wd2 {
+		return curW >= wd1 && curW <= wd2
+	}
+	return curW >= wd1 || curW <= wd2
+}
+
+func evalTimeRange(args []goja.Value, now time.Time) bool {
+	if len(args) == 0 {
+		return false
+	}
+	useGMT := false
+	var nums []int
+	for _, a := range args {
+		s := strings.ToUpper(strings.TrimSpace(a.String()))
+		if s == "GMT" {
+			useGMT = true
+			continue
+		}
+		n, err := strconv.Atoi(s)
+		if err == nil {
+			nums = append(nums, n)
+		}
+	}
+	if len(nums) == 0 {
+		return false
+	}
+	if useGMT {
+		now = now.UTC()
 	}
 
-	// Number literal — truthy if non-zero
-	if t.kind == tokNumber {
-		p.consume()
-		return t.val != "0" && t.val != ""
+	curH, curM, curS := now.Hour(), now.Minute(), now.Second()
+
+	switch len(nums) {
+	case 1:
+		return curH == nums[0]
+	case 2:
+		h1, h2 := nums[0], nums[1]
+		if h1 <= h2 {
+			return curH >= h1 && curH <= h2
+		}
+		return curH >= h1 || curH <= h2
+	case 4:
+		t1 := nums[0]*60 + nums[1]
+		t2 := nums[2]*60 + nums[3]
+		cur := curH*60 + curM
+		if t1 <= t2 {
+			return cur >= t1 && cur <= t2
+		}
+		return cur >= t1 || cur <= t2
+	case 6:
+		t1 := nums[0]*3600 + nums[1]*60 + nums[2]
+		t2 := nums[3]*3600 + nums[4]*60 + nums[5]
+		cur := curH*3600 + curM*60 + curS
+		if t1 <= t2 {
+			return cur >= t1 && cur <= t2
+		}
+		return cur >= t1 || cur <= t2
+	}
+	return false
+}
+
+type dateArgType int
+
+const (
+	dateTypeUnknown dateArgType = iota
+	dateTypeDay
+	dateTypeMonth
+	dateTypeYear
+)
+
+type parsedDateArg struct {
+	kind dateArgType
+	val  int
+}
+
+func parseDateArg(s string) parsedDateArg {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if m, ok := monthMap[s]; ok {
+		return parsedDateArg{kind: dateTypeMonth, val: m}
+	}
+	n, err := strconv.Atoi(s)
+	if err == nil {
+		if n > 31 {
+			return parsedDateArg{kind: dateTypeYear, val: n}
+		}
+		return parsedDateArg{kind: dateTypeDay, val: n}
+	}
+	return parsedDateArg{kind: dateTypeUnknown}
+}
+
+func evalDateRange(args []goja.Value, now time.Time) bool {
+	if len(args) == 0 {
+		return false
+	}
+	useGMT := false
+	var parsed []parsedDateArg
+	for _, a := range args {
+		s := strings.ToUpper(strings.TrimSpace(a.String()))
+		if s == "GMT" {
+			useGMT = true
+			continue
+		}
+		p := parseDateArg(s)
+		if p.kind != dateTypeUnknown {
+			parsed = append(parsed, p)
+		}
+	}
+	if len(parsed) == 0 {
+		return false
+	}
+	if useGMT {
+		now = now.UTC()
+	}
+
+	curYear := now.Year()
+	curMonth := int(now.Month())
+	curDay := now.Day()
+
+	switch len(parsed) {
+	case 1:
+		p := parsed[0]
+		switch p.kind {
+		case dateTypeDay:
+			return curDay == p.val
+		case dateTypeMonth:
+			return curMonth == p.val
+		case dateTypeYear:
+			return curYear == p.val
+		}
+	case 2:
+		p1, p2 := parsed[0], parsed[1]
+		if p1.kind == dateTypeDay && p2.kind == dateTypeDay {
+			if p1.val <= p2.val {
+				return curDay >= p1.val && curDay <= p2.val
+			}
+			return curDay >= p1.val || curDay <= p2.val
+		}
+		if p1.kind == dateTypeMonth && p2.kind == dateTypeMonth {
+			if p1.val <= p2.val {
+				return curMonth >= p1.val && curMonth <= p2.val
+			}
+			return curMonth >= p1.val || curMonth <= p2.val
+		}
+		if p1.kind == dateTypeYear && p2.kind == dateTypeYear {
+			return curYear >= p1.val && curYear <= p2.val
+		}
+		if p1.kind == dateTypeDay && p2.kind == dateTypeMonth {
+			return curDay == p1.val && curMonth == p2.val
+		}
+		if p1.kind == dateTypeMonth && p2.kind == dateTypeYear {
+			return curMonth == p1.val && curYear == p2.val
+		}
+	case 4:
+		// day1, month1, day2, month2 OR month1, year1, month2, year2
+		if parsed[0].kind == dateTypeDay && parsed[1].kind == dateTypeMonth &&
+			parsed[2].kind == dateTypeDay && parsed[3].kind == dateTypeMonth {
+			loc := now.Location()
+			start := time.Date(curYear, time.Month(parsed[1].val), parsed[0].val, 0, 0, 0, 0, loc)
+			end := time.Date(curYear, time.Month(parsed[3].val), parsed[2].val, 23, 59, 59, 0, loc)
+			if start.After(end) {
+				if now.Before(start) {
+					start = start.AddDate(-1, 0, 0)
+				} else {
+					end = end.AddDate(1, 0, 0)
+				}
+			}
+			return !now.Before(start) && !now.After(end)
+		}
+		if parsed[0].kind == dateTypeMonth && parsed[1].kind == dateTypeYear &&
+			parsed[2].kind == dateTypeMonth && parsed[3].kind == dateTypeYear {
+			loc := now.Location()
+			start := time.Date(parsed[1].val, time.Month(parsed[0].val), 1, 0, 0, 0, 0, loc)
+			end := time.Date(parsed[3].val, time.Month(parsed[2].val)+1, 0, 23, 59, 59, 0, loc)
+			return !now.Before(start) && !now.After(end)
+		}
+	case 6:
+		// day1, month1, year1, day2, month2, year2
+		loc := now.Location()
+		start := time.Date(parsed[2].val, time.Month(parsed[1].val), parsed[0].val, 0, 0, 0, 0, loc)
+		end := time.Date(parsed[5].val, time.Month(parsed[4].val), parsed[3].val, 23, 59, 59, 0, loc)
+		return !now.Before(start) && !now.After(end)
 	}
 
 	return false
 }
 
-// parseFuncCallOrCompare handles: func(args...) [== / != / < / > value]
-func (p *parser) parseFuncCallOrCompare() bool {
-	name := p.consume().val // consume the identifier
+// ── Goja Runtime Setup ───────────────────────────────────────────────────────
 
-	// Not a function call — just a variable name in boolean context
-	if p.peek().kind != tokLParen {
-		// treat as truthy if it's "host" or "url" etc.
-		return true
-	}
+func bindPacHelpers(vm *goja.Runtime) {
+	vm.Set("dnsDomainIs", pacDnsDomainIs)
+	vm.Set("shExpMatch", pacShExpMatch)
+	vm.Set("isInNet", pacIsInNet)
+	vm.Set("dnsResolve", func(host string) string { return goLookup(host) })
+	vm.Set("myIpAddress", func() string { return getMyIP() })
+	vm.Set("myIpAddressEx", func() string { return getMyIP() })
+	vm.Set("isPlainHostName", pacIsPlainHostName)
+	vm.Set("localHostOrDomainIs", pacLocalHostOrDomainIs)
+	vm.Set("dnsDomainLevels", pacDnsDomainLevels)
+	vm.Set("isResolvable", pacIsResolvable)
+	vm.Set("convert_addr", func(addr string) string { return addr })
+	vm.Set("alert", func(call goja.FunctionCall) goja.Value { return goja.Undefined() })
 
-	// Parse argument list
-	p.consume() // (
-	args := p.parseArgList()
-
-	// Evaluate the function
-	result := p.callPACFunc(name, args)
-
-	// Check for comparison operator after the call: func() == "value"
-	op := p.peek()
-	if op.kind == tokEq || op.kind == tokNeq || op.kind == tokLt ||
-		op.kind == tokGt || op.kind == tokLte || op.kind == tokGte {
-		p.consume()
-		rhs := p.parseValue()
-		switch op.kind {
-		case tokEq:
-			return strings.EqualFold(result, rhs)
-		case tokNeq:
-			return !strings.EqualFold(result, rhs)
-		}
-		return false
-	}
-
-	// Boolean result from function
-	return result != "" && result != "false" && result != "0" && result != "undefined"
+	vm.Set("weekdayRange", func(call goja.FunctionCall) goja.Value {
+		return vm.ToValue(evalWeekdayRange(call.Arguments, time.Now()))
+	})
+	vm.Set("dateRange", func(call goja.FunctionCall) goja.Value {
+		return vm.ToValue(evalDateRange(call.Arguments, time.Now()))
+	})
+	vm.Set("timeRange", func(call goja.FunctionCall) goja.Value {
+		return vm.ToValue(evalTimeRange(call.Arguments, time.Now()))
+	})
 }
 
-// parseArgList collects all arguments (strings, identifiers, nested calls)
-// until the closing ) is consumed.
-func (p *parser) parseArgList() []string {
-	var args []string
-	for {
-		t := p.peek()
-		if t.kind == tokRParen || t.kind == tokEOF {
-			p.consume()
-			break
-		}
-		if t.kind == tokComma {
-			p.consume()
-			continue
-		}
-		args = append(args, p.parseValue())
-	}
-	return args
-}
+// ── CompiledPAC ──────────────────────────────────────────────────────────────
 
-// parseValue evaluates a single value token or nested function call.
-// Returns a string representation of the value.
-func (p *parser) parseValue() string {
-	t := p.peek()
-	switch t.kind {
-	case tokString:
-		p.consume()
-		return t.val
-	case tokNumber:
-		p.consume()
-		return t.val
-	case tokIdent:
-		name := p.consume().val
-		// Variable references
-		switch name {
-		case "host":
-			return p.host
-		case "url":
-			return p.url
-		}
-		// Nested function call
-		if p.peek().kind == tokLParen {
-			p.consume()
-			args := p.parseArgList()
-			return p.callPACFunc(name, args)
-		}
-		return name
-	case tokLParen:
-		p.consume()
-		val := p.parseValue()
-		if p.peek().kind == tokRParen {
-			p.consume()
-		}
-		return val
-	}
-	p.consume()
-	return ""
-}
-
-// callPACFunc dispatches to the appropriate PAC helper.
-// Returns the string result of the function (for functions that return booleans,
-// returns "true"/"false" or "" for falsy).
-func (p *parser) callPACFunc(name string, args []string) string {
-	arg := func(i int) string {
-		if i < len(args) {
-			return args[i]
-		}
-		return ""
-	}
-	boolStr := func(b bool) string {
-		if b {
-			return "true"
-		}
-		return ""
-	}
-
-	switch name {
-	case "dnsDomainIs":
-		return boolStr(pacDnsDomainIs(arg(0), arg(1)))
-	case "shExpMatch":
-		return boolStr(pacShExpMatch(arg(0), arg(1)))
-	case "isInNet":
-		return boolStr(pacIsInNet(arg(0), arg(1), arg(2)))
-	case "isPlainHostName":
-		return boolStr(pacIsPlainHostName(arg(0)))
-	case "localHostOrDomainIs":
-		return boolStr(pacLocalHostOrDomainIs(arg(0), arg(1)))
-	case "dnsDomainLevels":
-		return fmt.Sprintf("%d", pacDnsDomainLevels(arg(0)))
-	case "isResolvable":
-		return boolStr(pacIsResolvable(arg(0)))
-	case "dnsResolve":
-		return goLookup(arg(0))
-	case "myIpAddress":
-		return getMyIP()
-	case "convert_addr":
-		// Some old PAC files use this — return the arg unchanged
-		return arg(0)
-	case "weekdayRange", "dateRange", "timeRange":
-		// Time-based rules — always return true (assume in range).
-		// These are rarely used in routing decisions; false negatives are safe.
-		return "true"
-	}
-	return ""
-}
-
-// ── CompiledPAC ────────────────────────────────────────────────────────────────
-
-// CompiledPAC holds a pre-stripped PAC function body ready for evaluation.
-// Create once via Compile(), then call Eval() concurrently.
+// CompiledPAC holds a compiled JS program and a sync.Pool of pre-initialized
+// goja.Runtime VMs ready for evaluation.
 type CompiledPAC struct {
-	body string // stripped, comment-free function body
+	prg   *goja.Program
+	rawJS string
+	pool  sync.Pool
 }
 
-// Compile strips comments and extracts the FindProxyForURL body.
-// Returns an error if no FindProxyForURL function is found.
-func Compile(js string) (*CompiledPAC, error) {
-	clean := stripComments(js)
-	body := extractBody(clean)
-	if body == "" {
-		return nil, fmt.Errorf("pac: FindProxyForURL not found in script")
+func (c *CompiledPAC) newVM() (*goja.Runtime, error) {
+	vm := goja.New()
+	bindPacHelpers(vm)
+	_, err := vm.RunProgram(c.prg)
+	if err != nil {
+		return nil, err
 	}
-	return &CompiledPAC{body: body}, nil
+	return vm, nil
 }
 
-// Eval evaluates FindProxyForURL(url, host) against the compiled body.
-// Returns the proxy directive string, e.g. "DIRECT", "PROXY 10.0.0.1:8080".
-// On any error or timeout, returns "DIRECT" (fail-safe for corporate routing).
-func (c *CompiledPAC) Eval(url, host string) (result string) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Warnln("[pac] evaluator panic for %s: %v — returning DIRECT", host, r)
-			result = "DIRECT"
-		}
-	}()
+// Compile compiles the PAC JavaScript source via goja.Compile, verifies FindProxyForURL
+// exists as a callable function, and initializes the VM pool.
+func Compile(js string) (*CompiledPAC, error) {
+	prg, err := goja.Compile("pac.js", js, false)
+	if err != nil {
+		return nil, fmt.Errorf("pac: compile error: %w", err)
+	}
 
-	done := make(chan string, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- "DIRECT"
-			}
-		}()
-		lex := newLexer(c.body)
-		p := &parser{lex: lex, host: host, url: url}
-		// Execute statements until a return is found or body ends
-		for {
-			t := p.peek()
-			if t.kind == tokEOF {
-				done <- "DIRECT" // no explicit return — fall through to DIRECT
-				return
-			}
-			if res, ok := p.parseStatement(); ok {
-				done <- res
-				return
-			}
+	c := &CompiledPAC{
+		prg:   prg,
+		rawJS: js,
+	}
+	c.pool.New = func() any {
+		vm, err := c.newVM()
+		if err != nil {
+			log.Warnln("[pac] pool newVM error: %v", err)
+			return nil
 		}
-	}()
+		return vm
+	}
 
-	select {
-	case res := <-done:
-		return res
-	case <-time.After(200 * time.Millisecond):
-		log.Warnln("[pac] eval timeout for %s — returning DIRECT", host)
+	// Verify FindProxyForURL is present and callable
+	testVM, err := c.newVM()
+	if err != nil {
+		return nil, fmt.Errorf("pac: initialization error: %w", err)
+	}
+	if _, ok := goja.AssertFunction(testVM.Get("FindProxyForURL")); !ok {
+		return nil, fmt.Errorf("pac: FindProxyForURL not found or not a function in script")
+	}
+
+	c.pool.Put(testVM)
+	return c, nil
+}
+
+// Eval evaluates FindProxyForURL(url, host).
+// On any error or timeout, returns "DIRECT" (fail-safe).
+func (c *CompiledPAC) Eval(url, host string) string {
+	res, timedOut := c.EvalRaw(url, host)
+	if timedOut || res == "" {
 		return "DIRECT"
 	}
+	return res
 }
 
-// EvalRaw is like Eval but reports whether evaluation timed out instead of
-// collapsing a timeout to a conservative "DIRECT". A PAC-only (dynamic) outbound
-// uses this so it can FAIL a dial on timeout rather than silently connecting
-// direct — a silent DIRECT there would leak traffic around the proxy.
-//
-// On a panic (malformed body) it still returns ("DIRECT", false): a parse panic
-// is a definitive result, not a transient timeout.
+// EvalRaw evaluates FindProxyForURL(url, host) with a 1500ms timeout.
+// Returns ("", true) on timeout so PAC-only outbounds can fail the dial rather
+// than silently connecting direct.
 func (c *CompiledPAC) EvalRaw(url, host string) (result string, timedOut bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1019,49 +684,98 @@ func (c *CompiledPAC) EvalRaw(url, host string) (result string, timedOut bool) {
 		}
 	}()
 
-	done := make(chan string, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- "DIRECT"
-			}
-		}()
-		lex := newLexer(c.body)
-		p := &parser{lex: lex, host: host, url: url}
-		for {
-			t := p.peek()
-			if t.kind == tokEOF {
-				done <- "DIRECT"
-				return
-			}
-			if res, ok := p.parseStatement(); ok {
-				done <- res
-				return
-			}
+	v := c.pool.Get()
+	if v == nil {
+		var err error
+		v, err = c.newVM()
+		if err != nil {
+			log.Warnln("[pac] newVM error for %s: %v", host, err)
+			return "DIRECT", false
 		}
-	}()
-
-	select {
-	case res := <-done:
-		return res, false
-	case <-time.After(200 * time.Millisecond):
-		log.Warnln("[pac] eval timeout for %s", host)
-		return "", true
 	}
+	vm := v.(*goja.Runtime)
+
+	timer := time.AfterFunc(1500*time.Millisecond, func() {
+		vm.Interrupt("pac timeout")
+	})
+	defer timer.Stop()
+
+	fn, ok := goja.AssertFunction(vm.Get("FindProxyForURL"))
+	if !ok {
+		log.Warnln("[pac] FindProxyForURL missing during eval for %s", host)
+		vm.ClearInterrupt()
+		c.pool.Put(vm)
+		return "DIRECT", false
+	}
+
+	res, err := fn(goja.Undefined(), vm.ToValue(url), vm.ToValue(host))
+	if err != nil {
+		if strings.Contains(err.Error(), "pac timeout") {
+			log.Warnln("[pac] eval timeout for %s", host)
+			// Discard interrupted VM so timeout state does not leak to pool
+			return "", true
+		}
+		log.Warnln("[pac] eval error for %s: %v — returning DIRECT", host, err)
+		vm.ClearInterrupt()
+		c.pool.Put(vm)
+		return "DIRECT", false
+	}
+
+	vm.ClearInterrupt()
+	c.pool.Put(vm)
+	return res.String(), false
 }
 
-// ── wpad helper ──────────────────────────────────────────────────────────────
+// ── Upstream extraction ──────────────────────────────────────────────────────
 
-// ProbeWPADUrl tries to find a PAC URL via:
-//  1. OS-authoritative source first (DHCP option 252 / system proxy config /
-//     Windows registry) — no network probe needed, instant result.
-//  2. Parallel HTTP probes against all candidate WPAD URLs.
-//
-// All network probes run concurrently so the worst-case wait equals one probe
-// timeout, not N probes × timeout. Returns an empty string if not found.
+var upstreamRe = regexp.MustCompile(`(?i)\b(?:PROXY|HTTP|HTTPS|SOCKS|SOCKS5)\s+([a-zA-Z0-9.\-_]+):(\d+)\b`)
+
+// ExtractUpstreamsFromJS extracts all PROXY|HTTP|HTTPS|SOCKS|SOCKS5 host:port targets declared in js.
+func ExtractUpstreamsFromJS(js string) []Directive {
+	matches := upstreamRe.FindAllString(js, -1)
+	seen := make(map[string]bool)
+	var dirs []Directive
+	for _, m := range matches {
+		for _, d := range ParseDirectives(m) {
+			if d.IsDirect() {
+				continue
+			}
+			key := d.Scheme + "|" + d.Host + ":" + d.Port
+			if !seen[key] {
+				seen[key] = true
+				dirs = append(dirs, d)
+			}
+		}
+	}
+	return dirs
+}
+
+// ExtractUpstreams returns all upstream directives declared in the script.
+func (c *CompiledPAC) ExtractUpstreams() []Directive {
+	return ExtractUpstreamsFromJS(c.rawJS)
+}
+
+// ExtractUpstreamHosts returns unique hostnames of all upstreams declared in the script.
+func (c *CompiledPAC) ExtractUpstreamHosts() []string {
+	dirs := c.ExtractUpstreams()
+	seen := make(map[string]bool)
+	var hosts []string
+	for _, d := range dirs {
+		if d.Host != "" && !seen[d.Host] {
+			seen[d.Host] = true
+			hosts = append(hosts, d.Host)
+		}
+	}
+	return hosts
+}
+
+// ── WPAD helper ──────────────────────────────────────────────────────────────
+
+// ProbeWPADUrl tries to find a PAC URL via OS DHCP option 252, scutil/registry,
+// and parallel LAN probes.
 func ProbeWPADUrl() string {
 	if runtime.GOOS == "darwin" {
-		// ── Fast path: DHCP option 252 ──────────────────────────────────────
+		// Fast path: DHCP option 252
 		defaultIface := getDefaultIfaceName()
 		if defaultIface != "" {
 			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
@@ -1081,7 +795,7 @@ func ProbeWPADUrl() string {
 			}
 		}
 
-		// ── Fast path: scutil --proxy (system proxy config) ─────────────────
+		// Fast path: scutil --proxy (system proxy config)
 		out, err := exec.Command("scutil", "--proxy").Output()
 		if err == nil {
 			for _, line := range strings.Split(string(out), "\n") {
@@ -1099,10 +813,8 @@ func ProbeWPADUrl() string {
 			}
 		}
 
-		// ── Slow path: parallel probes ──────────────────────────────────────
+		// Slow path: parallel probes
 		var candidates []string
-
-		// wpad.<domain> from DHCP domain_name
 		if defaultIface != "" {
 			out2, err2 := exec.Command("ipconfig", "getpacket", defaultIface).Output()
 			if err2 == nil {
@@ -1120,7 +832,6 @@ func ProbeWPADUrl() string {
 			}
 		}
 
-		// http://<gateway>/wpad.dat
 		if gw := getDefaultGateway(); gw != "" {
 			candidates = append(candidates, "http://"+gw+"/wpad.dat")
 		}
@@ -1131,7 +842,7 @@ func ProbeWPADUrl() string {
 	}
 
 	if runtime.GOOS == "windows" {
-		// ── Fast path: Windows registry AutoConfigURL ────────────────────────
+		// Fast path: Windows registry AutoConfigURL
 		for _, hive := range []string{"HKCU", "HKLM"} {
 			out, err := exec.Command("powershell.exe",
 				"-noprofile", "-NonInteractive", "-command",
@@ -1146,7 +857,7 @@ func ProbeWPADUrl() string {
 			}
 		}
 
-		// ── Slow path: parallel probes ──────────────────────────────────────
+		// Slow path: parallel probes
 		candidates := []string{"http://wpad/wpad.dat"}
 		if domain := getWindowsDNSSuffix(); domain != "" {
 			candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
@@ -1163,9 +874,6 @@ func ProbeWPADUrl() string {
 	return ""
 }
 
-// probeURLsParallel fires all candidate URLs concurrently and returns the first
-// one that responds with a valid PAC script. Returns "" if none do.
-// Each probe has a 1.5s timeout — WPAD is always local LAN so this is generous.
 func probeURLsParallel(candidates []string) string {
 	if len(candidates) == 0 {
 		return ""
@@ -1187,7 +895,6 @@ func probeURLsParallel(candidates []string) string {
 		}()
 	}
 
-	// Collect results; return first success.
 	for range candidates {
 		r := <-ch
 		if r.url != "" {
@@ -1199,7 +906,6 @@ func probeURLsParallel(candidates []string) string {
 }
 
 func getDefaultIfaceName() string {
-	// Attempt to read via "route get default" on macOS
 	out, err := exec.Command("route", "get", "default").Output()
 	if err != nil {
 		return ""
@@ -1215,8 +921,6 @@ func getDefaultIfaceName() string {
 
 func getDefaultGateway() string {
 	if runtime.GOOS == "windows" {
-		// route.exe output is localised, so ask PowerShell for the lowest
-		// metric default route instead of parsing text.
 		out, err := exec.Command("powershell.exe",
 			"-noprofile", "-NonInteractive", "-command",
 			`(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop`,
@@ -1239,13 +943,7 @@ func getDefaultGateway() string {
 	return ""
 }
 
-// probeURL does a quick HEAD/GET to see if a URL is reachable and returns content.
 func probeURL(url string) bool {
-	// Discovery must go direct. The default transport honours HTTP_PROXY, and
-	// lux exports it while proxying, so an upstream proxy answers 200 for
-	// hostnames that do not resolve and every candidate looks reachable.
-	// WPAD is always local LAN — 1.5s is generous; 4s caused detection to feel
-	// broken on networks where the gateway is slow to reject.
 	client := &http.Client{
 		Timeout:   1500 * time.Millisecond,
 		Transport: &http.Transport{Proxy: nil},
@@ -1258,8 +956,6 @@ func probeURL(url string) bool {
 	if resp.StatusCode != 200 {
 		return false
 	}
-	// A 200 on its own proves nothing: captive portals and proxy error pages
-	// return 200 with HTML. Require the entry point a PAC must declare.
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return false
@@ -1267,9 +963,6 @@ func probeURL(url string) bool {
 	return strings.Contains(string(b), "FindProxyForURL")
 }
 
-// getWindowsDNSSuffix returns the connection-specific DNS suffix of the
-// interface holding the default route, which is what DHCP hands out and what
-// WPAD name devolution is based on. Empty when the network advertises none.
 func getWindowsDNSSuffix() string {
 	if runtime.GOOS != "windows" {
 		return ""
@@ -1284,10 +977,6 @@ func getWindowsDNSSuffix() string {
 	return strings.TrimSpace(string(out))
 }
 
-// NoPacFoundMessage explains what was actually probed, per platform. The old
-// wording claimed DHCP option 252 had been consulted on every OS, which was
-// untrue on Windows and sent people looking for a DHCP problem that did not
-// exist.
 func NoPacFoundMessage() string {
 	if runtime.GOOS == "windows" {
 		return "No PAC URL found: registry AutoConfigURL (HKCU and HKLM) is empty, " +

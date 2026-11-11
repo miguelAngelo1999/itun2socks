@@ -3,9 +3,11 @@ package executor
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/igoogolx/itun2socks/internal/configuration"
 	localserver "github.com/igoogolx/itun2socks/internal/local_server"
+	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
 	"github.com/igoogolx/itun2socks/pkg/sysproxy"
@@ -44,10 +46,13 @@ func (c *SystemProxyClient) Start() error {
 	if err != nil {
 		return err
 	}
+	pac.DefaultRegistry.StartRefreshLoop(30*time.Minute, "")
 	return nil
 }
 
 func (c *SystemProxyClient) Close() error {
+	pac.DefaultRegistry.StopRefreshLoop()
+	pac.DefaultRegistry.Clear()
 	statistic.DefaultManager.CloseAllConnections()
 
 	sysErr := sysproxy.Clear(c.activeInterface)

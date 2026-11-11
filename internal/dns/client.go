@@ -79,6 +79,12 @@ func convertRulePolicyToResolver(rule rule_engine.Rule) (rule_engine.Rule, error
 }
 
 func getDnsResolver(domain string, metadata *constant.Metadata, curRuleEngine *rule_engine.Engine) (rule_engine.Rule, error) {
+	// Single-label plain hostnames (e.g. "wpad", "localhost") or ".local" must route
+	// to local DHCP DNS (BuiltInDirectRule) so TUN Fake-IP/remote DNS doesn't hijack them.
+	if !strings.Contains(domain, ".") || strings.HasSuffix(strings.ToLower(domain), ".local") {
+		return rule_engine.BuiltInDirectRule, nil
+	}
+
 	processPath := metadata.ProcessPath
 	var rule rule_engine.Rule
 	var err error

@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -26,7 +25,8 @@ func Start() error {
 		}
 	}()
 	if GetIsStarted() {
-		return errors.New("the client has started")
+		log.Infoln("%s", log.FormatLog(log.ExecutorPrefix, "client is already started"))
+		return nil
 	}
 	client, err = executor.New()
 	if err != nil {

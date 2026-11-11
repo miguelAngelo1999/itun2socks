@@ -14,15 +14,18 @@
 package pac
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -39,34 +42,12 @@ func (r Rule) String() string {
 }
 
 // FetchAndParse downloads a PAC file from the given URL and parses it into rules.
-// Uses a direct dialer that bypasses the TUN interface — necessary in Mixed/TUN mode
-// where lux intercepts all traffic but the PAC URL must be reached without the proxy
-// (because the PAC file IS what tells us where the proxy is).
 func FetchAndParse(pacURL string) ([]Rule, error) {
-	// Custom dialer: resolve DNS using system resolver directly (not lux's TUN DNS)
-	// and connect directly to the IP, bypassing the TUN interface.
-	directDialer := &net.Dialer{
-		Timeout: 8 * time.Second,
-	}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			Proxy:       nil, // bypass system proxy
-			DialContext: directDialer.DialContext,
-		},
-	}
-	resp, err := client.Get(pacURL)
+	body, err := Fetch(pacURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch PAC: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read PAC body: %w", err)
-	}
-
-	return Parse(string(body))
+	return Parse(body)
 }
 
 // Parse extracts routing rules from PAC JavaScript source code.
@@ -242,17 +223,60 @@ func maskToCIDR(network, mask string) string {
 // CRITICAL: the fetch must bypass BOTH the system proxy and lux's own TUN
 // interface. In TUN mode lux_core's own outbound connections are captured by
 // the tun device and routed through the tunnel; for a PAC-ONLY proxy whose PAC
-// is not yet compiled, that connection has no upstream and times out — a
-// chicken-and-egg deadlock ("context deadline exceeded" fetching the PAC while
-// the PAC is what tells us where to connect). So we dial DIRECT with Proxy:nil,
-// exactly like FetchAndParse, instead of the default transport.
+// is not yet compiled, that connection has no upstream and times out.
+// Hostnames are resolved using goLookup (avoiding Fake-IP 198.18.x.x) and
+// dialed via dialer.DialContext with bypass awareness.
 func Fetch(pacURL string) (string, error) {
-	directDialer := &net.Dialer{Timeout: 10 * time.Second}
+	u, err := neturl.Parse(pacURL)
+	if err != nil {
+		return "", fmt.Errorf("parse %s: %w", pacURL, err)
+	}
+
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+			port = u.Port()
+			if port == "" {
+				if u.Scheme == "https" {
+					port = "443"
+				} else {
+					port = "80"
+				}
+			}
+		}
+
+		targetHost := host
+		ipStr := goLookup(host)
+		if ipStr != "" {
+			targetHost = ipStr
+		}
+
+		var targetIP net.IP
+		if ip := net.ParseIP(targetHost); ip != nil {
+			targetIP = ip
+		}
+
+		var opts []dialer.Option
+		defIface := dialer.DefaultInterface.Load()
+
+		// If target IP is bypassed from TUN (or TUN not active / in bypass CIDRs),
+		// WithInterface("") routes over LAN or VPN utun.
+		// If TUN is up and host is NOT bypassed and not private/VPN, bind defIface.
+		if targetIP != nil && !IsBypassed(targetIP) && !targetIP.IsPrivate() && defIface != "" {
+			opts = append(opts, dialer.WithInterface(defIface))
+		} else {
+			opts = append(opts, dialer.WithInterface(""))
+		}
+
+		return dialer.DialContext(ctx, network, net.JoinHostPort(targetHost, port), opts...)
+	}
+
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			Proxy:           nil, // bypass system proxy (http_proxy=127.0.0.1:1090)
-			DialContext:     directDialer.DialContext, // bypass the TUN tunnel
+			Proxy:           nil, // bypass system proxy
+			DialContext:     dialContext,
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
