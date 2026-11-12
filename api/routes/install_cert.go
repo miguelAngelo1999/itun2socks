@@ -53,11 +53,9 @@ func installCert(w http.ResponseWriter, r *http.Request) {
 	// Install to the system trust store.
 	// macOS: Two-step process:
 	//   1. Add cert to System.keychain (physical storage, requires root — we have it)
-	//   2. Set trust settings in the USER domain via `security add-trusted-cert`
-	//      WITHOUT -d. The admin/system trust domain (-d) requires a SecAuthorization
-	//      dialog even as root on macOS 12+, and silently succeeds without writing
-	//      trust settings. The user trust domain works without auth and is read by
-	//      Go's x509.SystemCertPool() and by all system TLS consumers.
+	//   2. Set trust settings in the admin domain (-d) into System.keychain.
+	//      lux_core runs as root, so this directly updates the system trust settings
+	//      without requiring a GUI authentication dialog.
 	// Windows: certutil -addstore Root (lux_core runs elevated via LuxApp task).
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -78,13 +76,13 @@ func installCert(w http.ResponseWriter, r *http.Request) {
 			log.Infoln("[install-cert] add-certificates output: %s", string(out))
 		}
 
-		// Step 2: set trust in the user domain — no SecAuthorization needed,
-		// works reliably on macOS 12+ even as root. Both ssl and basic policies
-		// cover the typical corporate proxy use case.
+		// Step 2: set trust in the admin domain (-d) into System.keychain.
+		// lux_core runs as root, so this directly updates the system trust settings
+		// without requiring a GUI authentication prompt.
 		trustCmd := exec.Command("security", "add-trusted-cert",
+			"-d",
 			"-r", "trustRoot",
-			"-p", "ssl",
-			"-p", "basic",
+			"-k", "/Library/Keychains/System.keychain",
 			tmpFile.Name())
 		out, err := trustCmd.CombinedOutput()
 		if err != nil {
