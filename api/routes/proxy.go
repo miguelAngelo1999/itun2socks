@@ -104,6 +104,15 @@ func testProxyUdp(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, NewError(err.Error()))
 		return
 	}
+	if s, ok := proxyOption["server"].(string); ok {
+		proxyOption["server"] = strings.TrimSpace(s)
+	}
+	if u, ok := proxyOption["username"].(string); ok {
+		proxyOption["username"] = strings.TrimSpace(u)
+	}
+	if n, ok := proxyOption["name"].(string); ok {
+		proxyOption["name"] = strings.TrimSpace(n)
+	}
 	p, err := adapter.ParseProxy(proxyOption)
 	if err != nil {
 		render.Status(r, http.StatusInternalServerError)
@@ -149,6 +158,15 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, NewError(err.Error()))
 		return
+	}
+	if s, ok := proxyOption["server"].(string); ok {
+		proxyOption["server"] = strings.TrimSpace(s)
+	}
+	if u, ok := proxyOption["username"].(string); ok {
+		proxyOption["username"] = strings.TrimSpace(u)
+	}
+	if n, ok := proxyOption["name"].(string); ok {
+		proxyOption["name"] = strings.TrimSpace(n)
 	}
 	p, err := adapter.ParseProxy(proxyOption)
 	if err != nil {

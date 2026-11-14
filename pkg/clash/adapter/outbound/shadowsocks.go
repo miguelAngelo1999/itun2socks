@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 
 	"github.com/igoogolx/itun2socks/pkg/clash/common/structure"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
@@ -107,6 +108,8 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
 }
 
 func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
+	option.Server = strings.TrimSpace(option.Server)
+	option.Name = strings.TrimSpace(option.Name)
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	cipher := option.Cipher
 	password := option.Password

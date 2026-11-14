@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
@@ -183,6 +184,10 @@ func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
 }
 
 func NewHttp(option HttpOption) *Http {
+	option.Server = strings.TrimSpace(option.Server)
+	option.UserName = strings.TrimSpace(option.UserName)
+	option.Name = strings.TrimSpace(option.Name)
+
 	var tlsConfig *tls.Config
 	if option.TLS {
 		sni := option.Server

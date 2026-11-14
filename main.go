@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/igoogolx/itun2socks/api"
@@ -45,6 +47,9 @@ func main() {
 		currentDir, _ := os.Getwd()
 		homeDir = filepath.Join(currentDir, homeDir)
 	}
+	if runtime.GOOS == "windows" {
+		homeDir = reconcileWindowsHomeDir(homeDir, userConfigDir)
+	}
 	_ = os.MkdirAll(homeDir, os.ModePerm)
 	constants.Path.SetHomeDir(homeDir)
 	log.InitLog()
@@ -66,4 +71,39 @@ func main() {
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGHUP)
 	<-osSignals
+}
+
+func reconcileWindowsHomeDir(homeDir, userConfigDir string) string {
+	canonicalDir := filepath.Join(userConfigDir, "com.github.igoogolx", "lux", "1.0")
+	legacyDir := filepath.Join(userConfigDir, "com.github.igoogolx.lux", "1.0")
+
+	targetDir := homeDir
+	if strings.Contains(homeDir, "com.github.igoogolx.lux") {
+		targetDir = canonicalDir
+	} else if strings.Contains(homeDir, filepath.Join("com.github.igoogolx", "lux")) {
+		targetDir = canonicalDir
+	}
+
+	_ = os.MkdirAll(targetDir, os.ModePerm)
+
+	legacyCfg := filepath.Join(legacyDir, "config.json")
+	targetCfg := filepath.Join(targetDir, "config.json")
+
+	if lfi, err := os.Stat(legacyCfg); err == nil {
+		tfi, terr := os.Stat(targetCfg)
+		shouldMigrate := false
+		if os.IsNotExist(terr) {
+			shouldMigrate = true
+		} else if terr == nil && lfi.ModTime().After(tfi.ModTime()) {
+			shouldMigrate = true
+		}
+
+		if shouldMigrate {
+			if data, err := os.ReadFile(legacyCfg); err == nil && len(data) > 0 {
+				_ = os.WriteFile(targetCfg, data, 0666)
+			}
+		}
+	}
+
+	return targetDir
 }

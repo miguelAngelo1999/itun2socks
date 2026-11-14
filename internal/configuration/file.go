@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,6 +122,18 @@ func readFile() (*Config, error) {
 		}
 	}
 
+	for _, p := range c.Proxy {
+		if s, ok := p["server"].(string); ok {
+			p["server"] = strings.TrimSpace(s)
+		}
+		if u, ok := p["username"].(string); ok {
+			p["username"] = strings.TrimSpace(u)
+		}
+		if n, ok := p["name"].(string); ok {
+			p["name"] = strings.TrimSpace(n)
+		}
+	}
+
 
 	// Validate critical settings — bad values in config.json cause broken startup.
 	switch c.Setting.Stack {
@@ -143,7 +158,27 @@ func writeFile(config Config) error {
 	if err != nil {
 		return fmt.Errorf("fail to marchal json, err:%v", err)
 	}
-	return write(buf)
+	err = write(buf)
+	if err != nil {
+		return err
+	}
+	mirrorLegacyWindowsConfig(buf)
+	return nil
+}
+
+func mirrorLegacyWindowsConfig(data []byte) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil || userConfigDir == "" {
+		return
+	}
+	legacyDir := filepath.Join(userConfigDir, "com.github.igoogolx.lux", "1.0")
+	if fi, err := os.Stat(legacyDir); err == nil && fi.IsDir() {
+		legacyFile := filepath.Join(legacyDir, "config.json")
+		_ = os.WriteFile(legacyFile, data, 0666)
+	}
 }
 
 func write(data []byte) error {

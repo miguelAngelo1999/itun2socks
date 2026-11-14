@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
@@ -149,6 +150,10 @@ func (ss *Socks5) ListenPacketContext(ctx context.Context, metadata *C.Metadata,
 }
 
 func NewSocks5(option Socks5Option) *Socks5 {
+	option.Server = strings.TrimSpace(option.Server)
+	option.UserName = strings.TrimSpace(option.UserName)
+	option.Name = strings.TrimSpace(option.Name)
+
 	var tlsConfig *tls.Config
 	if option.TLS {
 		tlsConfig = &tls.Config{

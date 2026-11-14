@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/igoogolx/itun2socks/pkg/clash/adapter/outbound"
 	"github.com/igoogolx/itun2socks/pkg/clash/common/structure"
@@ -9,6 +10,16 @@ import (
 )
 
 func ParseProxy(mapping map[string]any) (C.Proxy, error) {
+	if s, ok := mapping["server"].(string); ok {
+		mapping["server"] = strings.TrimSpace(s)
+	}
+	if u, ok := mapping["username"].(string); ok {
+		mapping["username"] = strings.TrimSpace(u)
+	}
+	if n, ok := mapping["name"].(string); ok {
+		mapping["name"] = strings.TrimSpace(n)
+	}
+
 	decoder := structure.NewDecoder(structure.Option{TagName: "proxy", WeaklyTypedInput: true})
 	proxyType, existType := mapping["type"].(string)
 	if !existType {
