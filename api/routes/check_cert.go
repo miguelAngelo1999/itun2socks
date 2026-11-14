@@ -8,16 +8,33 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
-	"strings"
-	"unicode/utf8"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/render"
+	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
+
+var (
+	extraRootsMu  sync.RWMutex
+	extraRootsPEM []byte
+)
+
+// AddExtraRoot appends PEM certificate bytes to in-memory roots so newly installed
+// certificates are recognized immediately without restarting lux_core.
+func AddExtraRoot(pemBytes []byte) {
+	extraRootsMu.Lock()
+	defer extraRootsMu.Unlock()
+	extraRootsPEM = append(extraRootsPEM, append([]byte("\n"), pemBytes...)...)
+}
 
 // CertCheckResult describes the TLS interceptor (if any) seen through a proxy.
 type CertCheckResult struct {
@@ -181,6 +198,19 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 	systemRoots, err := x509.SystemCertPool()
 	if err != nil {
 		systemRoots = x509.NewCertPool()
+	}
+
+	// 1. Append in-memory dynamically installed certificates (bypasses Go's sync.Once SystemCertPool cache)
+	extraRootsMu.RLock()
+	if len(extraRootsPEM) > 0 {
+		systemRoots.AppendCertsFromPEM(extraRootsPEM)
+	}
+	extraRootsMu.RUnlock()
+
+	// 2. Append any certificates from proxy_ca_bundle.pem if present on disk
+	bundlePath := filepath.Join(constants.Path.HomeDir(), "proxy_ca_bundle.pem")
+	if data, err := os.ReadFile(bundlePath); err == nil && len(data) > 0 {
+		systemRoots.AppendCertsFromPEM(data)
 	}
 
 	intermediates := x509.NewCertPool()

@@ -102,6 +102,10 @@ func installCert(w http.ResponseWriter, r *http.Request) {
 		sysproxy.ExportCACertsAndSetEnv()
 	}
 
+	// Add to in-memory extra roots so subsequent /proxies/check-cert calls
+	// immediately trust this certificate without waiting for a core restart.
+	AddExtraRoot([]byte(req.PEM))
+
 	log.Infoln("[install-cert] certificate installed successfully")
 	render.JSON(w, r, render.M{"success": true})
 }
