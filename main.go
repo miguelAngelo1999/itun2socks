@@ -74,14 +74,24 @@ func main() {
 }
 
 func reconcileWindowsHomeDir(homeDir, userConfigDir string) string {
-	canonicalDir := filepath.Join(userConfigDir, "com.github.igoogolx", "lux", "1.0")
-	legacyDir := filepath.Join(userConfigDir, "com.github.igoogolx.lux", "1.0")
-
 	targetDir := homeDir
+	var legacyDir, canonicalDir string
+
 	if strings.Contains(homeDir, "com.github.igoogolx.lux") {
+		// homeDir is legacy, derive canonical sibling in same parent directory
+		parent := filepath.Dir(filepath.Dir(homeDir)) // 1.0 -> com.github.igoogolx.lux -> Roaming
+		canonicalDir = filepath.Join(parent, "com.github.igoogolx", "lux", filepath.Base(homeDir))
+		legacyDir = homeDir
 		targetDir = canonicalDir
 	} else if strings.Contains(homeDir, filepath.Join("com.github.igoogolx", "lux")) {
+		// homeDir is already canonical, derive legacy sibling in same parent directory
+		parent := filepath.Dir(filepath.Dir(filepath.Dir(homeDir))) // 1.0 -> lux -> com.github.igoogolx -> Roaming
+		legacyDir = filepath.Join(parent, "com.github.igoogolx.lux", filepath.Base(homeDir))
+		canonicalDir = homeDir
 		targetDir = canonicalDir
+	} else {
+		// Custom home directory, honor it directly without rewriting
+		return homeDir
 	}
 
 	_ = os.MkdirAll(targetDir, os.ModePerm)

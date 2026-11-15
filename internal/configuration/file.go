@@ -170,11 +170,19 @@ func mirrorLegacyWindowsConfig(data []byte) {
 	if runtime.GOOS != "windows" {
 		return
 	}
-	userConfigDir, err := os.UserConfigDir()
-	if err != nil || userConfigDir == "" {
-		return
+	cfgPath := configFilePath.Load()
+	var legacyDir string
+	if cfgPath != "" && strings.Contains(cfgPath, filepath.Join("com.github.igoogolx", "lux")) {
+		home := filepath.Dir(cfgPath)
+		parent := filepath.Dir(filepath.Dir(filepath.Dir(home)))
+		legacyDir = filepath.Join(parent, "com.github.igoogolx.lux", filepath.Base(home))
+	} else {
+		userConfigDir, err := os.UserConfigDir()
+		if err != nil || userConfigDir == "" {
+			return
+		}
+		legacyDir = filepath.Join(userConfigDir, "com.github.igoogolx.lux", "1.0")
 	}
-	legacyDir := filepath.Join(userConfigDir, "com.github.igoogolx.lux", "1.0")
 	if fi, err := os.Stat(legacyDir); err == nil && fi.IsDir() {
 		legacyFile := filepath.Join(legacyDir, "config.json")
 		_ = os.WriteFile(legacyFile, data, 0666)

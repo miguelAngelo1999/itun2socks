@@ -3,6 +3,7 @@ package local_server
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,13 +106,32 @@ func init() {
 }
 
 func (l *Listener) Start() error {
-	tcpListener, err := mixed.New(l.Addr, tcpIn)
-	if err != nil {
+	var tcpListener C.Listener
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		tcpListener, err = mixed.New(l.Addr, tcpIn)
+		if err == nil {
+			break
+		}
+		if attempt < 3 && strings.Contains(strings.ToLower(err.Error()), "use") {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
 		return err
 	}
 	l.tcpListener = tcpListener
-	udpListener, err := socks.NewUDP(l.Addr, udpIn)
-	if err != nil {
+
+	var udpListener C.Listener
+	for attempt := 1; attempt <= 3; attempt++ {
+		udpListener, err = socks.NewUDP(l.Addr, udpIn)
+		if err == nil {
+			break
+		}
+		if attempt < 3 && strings.Contains(strings.ToLower(err.Error()), "use") {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		_ = l.tcpListener.Close()
 		return err
 	}
 	l.udpListener = udpListener
