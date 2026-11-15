@@ -44,6 +44,7 @@ func proxyRouter() http.Handler {
 	r.Get("/udp-test/{proxyId}", testProxyUdp)
 	r.Post("/detect", detectProxies)
 	r.Post("/check-cert", checkCert)
+	r.Post("/fetch-root-ca", fetchRootCA)
 	r.Post("/install-cert", installCert)
 	r.Get("/{proxyId}/pac-rules", getPACRules)
 	r.Get("/{proxyId}/pac-upstream", getPACUpstream)
