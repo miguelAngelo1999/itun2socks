@@ -119,6 +119,16 @@ func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
 }
 
 // GetPacHosts returns unique hostnames of all registered PAC URLs.
+func (r *Registry) GetRawScript(proxyId string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e := r.entries[proxyId]
+	if e != nil && e.compiled != nil {
+		return e.compiled.RawJS()
+	}
+	return ""
+}
+
 func (r *Registry) GetPacHosts() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

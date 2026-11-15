@@ -48,6 +48,8 @@ func proxyRouter() http.Handler {
 	r.Post("/install-cert", installCert)
 	r.Get("/{proxyId}/pac-rules", getPACRules)
 	r.Get("/{proxyId}/pac-upstream", getPACUpstream)
+	r.Post("/{proxyId}/pac-test", testPACUrl)
+	r.Get("/{proxyId}/pac-test", testPACUrl)
 	return r
 }
 

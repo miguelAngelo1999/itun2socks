@@ -618,6 +618,13 @@ type CompiledPAC struct {
 	pool  sync.Pool
 }
 
+func (c *CompiledPAC) RawJS() string {
+	if c == nil {
+		return ""
+	}
+	return c.rawJS
+}
+
 func (c *CompiledPAC) newVM() (*goja.Runtime, error) {
 	vm := goja.New()
 	bindPacHelpers(vm)

@@ -31,9 +31,10 @@ import (
 
 // Rule represents a single extracted routing rule from a PAC file.
 type Rule struct {
-	Type    string // "DOMAIN-SUFFIX", "DOMAIN", "IP-CIDR"
-	Payload string // e.g. "example.com", "10.0.0.0/8"
-	Policy  string // "DIRECT" or "PROXY"
+	Type     string // "DOMAIN-SUFFIX", "DOMAIN", "IP-CIDR"
+	Payload  string // e.g. "example.com", "10.0.0.0/8"
+	Policy   string // "DIRECT" or "PROXY"
+	Function string // "dnsDomainIs", "shExpMatch", "isInNet"
 }
 
 // String formats the rule in Lux rule syntax.
@@ -118,9 +119,10 @@ func Parse(js string) ([]Rule, error) {
 				if !seen[key] {
 					seen[key] = true
 					rules = append(rules, Rule{
-						Type:    "DOMAIN-SUFFIX",
-						Payload: domain,
-						Policy:  block.returnStmt,
+						Type:     "DOMAIN-SUFFIX",
+						Payload:  domain,
+						Policy:   block.returnStmt,
+						Function: "dnsDomainIs",
 					})
 				}
 			}
@@ -137,9 +139,10 @@ func Parse(js string) ([]Rule, error) {
 					if !seen[key] {
 						seen[key] = true
 						rules = append(rules, Rule{
-							Type:    "DOMAIN-SUFFIX",
-							Payload: suffix,
-							Policy:  block.returnStmt,
+							Type:     "DOMAIN-SUFFIX",
+							Payload:  suffix,
+							Policy:   block.returnStmt,
+							Function: "shExpMatch",
 						})
 					}
 				} else if strings.HasPrefix(pattern, "*") {
@@ -148,9 +151,10 @@ func Parse(js string) ([]Rule, error) {
 					if !seen[key] {
 						seen[key] = true
 						rules = append(rules, Rule{
-							Type:    "DOMAIN-SUFFIX",
-							Payload: suffix,
-							Policy:  block.returnStmt,
+							Type:     "DOMAIN-SUFFIX",
+							Payload:  suffix,
+							Policy:   block.returnStmt,
+							Function: "shExpMatch",
 						})
 					}
 				}
@@ -166,9 +170,10 @@ func Parse(js string) ([]Rule, error) {
 					if !seen[key] {
 						seen[key] = true
 						rules = append(rules, Rule{
-							Type:    "IP-CIDR",
-							Payload: cidr,
-							Policy:  block.returnStmt,
+							Type:     "IP-CIDR",
+							Payload:  cidr,
+							Policy:   block.returnStmt,
+							Function: "isInNet",
 						})
 					}
 				}
@@ -183,9 +188,10 @@ func Parse(js string) ([]Rule, error) {
 					if !seen[key] {
 						seen[key] = true
 						rules = append(rules, Rule{
-							Type:    "IP-CIDR",
-							Payload: cidr,
-							Policy:  block.returnStmt,
+							Type:     "IP-CIDR",
+							Payload:  cidr,
+							Policy:   block.returnStmt,
+							Function: "dnsDomainIs",
 						})
 					}
 				}
