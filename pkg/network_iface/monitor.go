@@ -118,6 +118,8 @@ func StopMonitor() error {
 		defaultInterfaceMonitor = nil
 		networkUpdateMonitor = nil
 		monitorCallback = nil
+		defaultInterfaceName.Store("")
+		dialer.DefaultInterface.Store("")
 	}()
 	if monitorCallback != nil {
 		defaultInterfaceMonitor.UnregisterCallback(monitorCallback)

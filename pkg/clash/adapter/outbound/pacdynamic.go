@@ -117,6 +117,9 @@ func (p *PacDynamic) DialContext(ctx context.Context, metadata *C.Metadata, opts
 	url, host := evalURL(metadata)
 
 	directive, hasPAC, timedOut := pac.DefaultRegistry.EvalDirective(p.proxyId, url, host)
+	if !hasPAC && pac.DefaultRegistry.RetryCompile(p.proxyId) {
+		directive, hasPAC, timedOut = pac.DefaultRegistry.EvalDirective(p.proxyId, url, host)
+	}
 	if !hasPAC {
 		// No compiled PAC for this PAC-only proxy means we have no upstream to
 		// dial. Fail the dial rather than leak traffic DIRECT.

@@ -123,15 +123,14 @@ func goLookup(host string) string {
 		return ""
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
 	// 1. Try local lookup if registered
 	localLookupMu.RLock()
 	fn := localLookup
 	localLookupMu.RUnlock()
 	if fn != nil {
-		addrs, err := fn(ctx, host)
+		localCtx, localCancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		addrs, err := fn(localCtx, host)
+		localCancel()
 		if err == nil {
 			for _, a := range addrs {
 				if ip := net.ParseIP(a); ip != nil && ip.To4() != nil && !isFakeIP(ip) {
@@ -142,13 +141,15 @@ func goLookup(host string) string {
 		}
 	}
 
-	// 2. Fallback to system resolver
-	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-	if err == nil {
-		for _, a := range addrs {
-			if ip := net.ParseIP(a); ip != nil && ip.To4() != nil && !isFakeIP(ip) {
-				cache.Add(host, a)
-				return a
+	// 2. Fallback to OS native resolver directly (uses DHCP search domains, /etc/hosts, mDNS/LLMNR)
+	osCtx, osCancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer osCancel()
+	if ips, err := net.DefaultResolver.LookupIP(osCtx, "ip4", host); err == nil {
+		for _, ip := range ips {
+			if ip4 := ip.To4(); ip4 != nil && !isFakeIP(ip4) {
+				s := ip4.String()
+				cache.Add(host, s)
+				return s
 			}
 		}
 	}
@@ -757,9 +758,29 @@ func ExtractUpstreamsFromJS(js string) []Directive {
 	return dirs
 }
 
-// ExtractUpstreams returns all upstream directives declared in the script.
+// ExtractUpstreams returns all upstream directives declared in the script,
+// combining static regex extraction with a dynamic probe evaluation so PACs
+// that construct "PROXY " + host dynamically are also covered.
 func (c *CompiledPAC) ExtractUpstreams() []Directive {
-	return ExtractUpstreamsFromJS(c.rawJS)
+	dirs := ExtractUpstreamsFromJS(c.rawJS)
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		seen[d.Scheme+"|"+d.Host+":"+d.Port] = true
+	}
+
+	if res, timedOut := c.EvalRaw("http://www.google.com/", "www.google.com"); !timedOut && res != "" {
+		for _, d := range ParseDirectives(res) {
+			if d.IsDirect() || d.Host == "" {
+				continue
+			}
+			key := d.Scheme + "|" + d.Host + ":" + d.Port
+			if !seen[key] {
+				seen[key] = true
+				dirs = append(dirs, d)
+			}
+		}
+	}
+	return dirs
 }
 
 // ExtractUpstreamHosts returns unique hostnames of all upstreams declared in the script.

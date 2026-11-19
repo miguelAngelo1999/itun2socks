@@ -18,16 +18,21 @@ type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry // keyed by proxy id
 
+	fetchProxy  string
 	refreshStop chan struct{}
 	refreshMu   sync.Mutex
 }
 
 type entry struct {
-	proxyId  string
-	pacUrl   string
-	pacOnly  bool         // true when this proxy has no fixed server (PAC supplies the upstream)
-	compiled *CompiledPAC // nil means fetch/compile failed; traffic goes through the proxy
+	proxyId   string
+	pacUrl    string
+	pacOnly   bool         // true when this proxy has no fixed server (PAC supplies the upstream)
+	compiled  *CompiledPAC // nil means fetch/compile failed; traffic goes through the proxy
+	lastRetry time.Time
+	retrying  bool
 }
+
+const retryCompileCooldown = 5 * time.Second
 
 // DefaultRegistry is the process-wide PAC registry, populated on manager start.
 var DefaultRegistry = NewRegistry()
@@ -52,6 +57,7 @@ func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
 	seen := make(map[string]bool, len(proxies))
 
 	r.mu.Lock()
+	r.fetchProxy = fetchProxy
 	for _, p := range proxies {
 		id, _ := p["id"].(string)
 		pacUrl, _ := p["pacUrl"].(string)
@@ -63,8 +69,8 @@ func (r *Registry) Update(proxies []map[string]any, fetchProxy string) {
 		seen[id] = true
 
 		existing := r.entries[id]
-		if existing != nil && existing.pacUrl == pacUrl {
-			// URL unchanged — keep compiled PAC, but update pacOnly in case server changed
+		if existing != nil && existing.pacUrl == pacUrl && existing.compiled != nil {
+			// URL unchanged and already compiled — keep compiled PAC, but update pacOnly in case server changed
 			existing.pacOnly = pacOnly
 			continue
 		}
@@ -235,10 +241,58 @@ func (r *Registry) ShouldDirect(proxyId, host string, port string, isTLS bool) b
 	return hasPAC && result == "DIRECT"
 }
 
-// StartRefreshLoop re-fetches and re-compiles all registered PACs every interval.
+// RetryCompile performs a rate-limited on-demand fetch and compile for proxyId
+// when its PAC is not yet compiled. Returns true if a compiled PAC is available.
+func (r *Registry) RetryCompile(proxyId string) bool {
+	if proxyId == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	e := r.entries[proxyId]
+	if e == nil || e.pacUrl == "" {
+		r.mu.Unlock()
+		return false
+	}
+	if e.compiled != nil {
+		r.mu.Unlock()
+		return true
+	}
+	if e.retrying || (!e.lastRetry.IsZero() && time.Since(e.lastRetry) < retryCompileCooldown) {
+		r.mu.Unlock()
+		return false
+	}
+	e.retrying = true
+	e.lastRetry = time.Now()
+	pacUrl := e.pacUrl
+	fetchProxy := r.fetchProxy
+	r.mu.Unlock()
+
+	compiled := fetchAndCompile(pacUrl, fetchProxy)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur := r.entries[proxyId]; cur != nil && cur.pacUrl == pacUrl {
+		cur.retrying = false
+		if compiled != nil {
+			cur.compiled = compiled
+			log.Infoln("[pac-registry] compiled PAC on demand for proxy %s from %s", proxyId, pacUrl)
+			return true
+		}
+		return cur.compiled != nil
+	}
+	return false
+}
+
+// StartRefreshLoop re-fetches and re-compiles all registered PACs every interval,
+// and retries any uncompiled PAC entries every 10 seconds.
 func (r *Registry) StartRefreshLoop(interval time.Duration, fetchProxy string) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
+
+	r.mu.Lock()
+	r.fetchProxy = fetchProxy
+	r.mu.Unlock()
 
 	if r.refreshStop != nil {
 		close(r.refreshStop)
@@ -248,11 +302,17 @@ func (r *Registry) StartRefreshLoop(interval time.Duration, fetchProxy string) {
 
 	go func() {
 		ticker := time.NewTicker(interval)
+		retryTicker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
+		defer retryTicker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				r.refresh(fetchProxy)
+			case <-retryTicker.C:
+				if r.hasUncompiled() {
+					r.refreshEntries(fetchProxy, true)
+				}
 			case <-stop:
 				return
 			}
@@ -277,7 +337,22 @@ func (r *Registry) Clear() {
 	r.entries = make(map[string]*entry)
 }
 
+func (r *Registry) hasUncompiled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.entries {
+		if e.compiled == nil && e.pacUrl != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Registry) refresh(fetchProxy string) {
+	r.refreshEntries(fetchProxy, false)
+}
+
+func (r *Registry) refreshEntries(fetchProxy string, onlyUncompiled bool) {
 	type refreshTarget struct {
 		id      string
 		pacUrl  string
@@ -287,9 +362,16 @@ func (r *Registry) refresh(fetchProxy string) {
 	r.mu.RLock()
 	targets := make([]refreshTarget, 0, len(r.entries))
 	for id, e := range r.entries {
+		if onlyUncompiled && e.compiled != nil {
+			continue
+		}
 		targets = append(targets, refreshTarget{id: id, pacUrl: e.pacUrl, pacOnly: e.pacOnly})
 	}
 	r.mu.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
 
 	type refreshResult struct {
 		id       string
@@ -313,11 +395,15 @@ func (r *Registry) refresh(fetchProxy string) {
 	r.mu.Lock()
 	for _, res := range results {
 		if cur, ok := r.entries[res.id]; ok && cur.pacUrl == res.pacUrl {
+			wasNil := cur.compiled == nil
 			r.entries[res.id] = &entry{
 				proxyId:  res.id,
 				pacUrl:   res.pacUrl,
 				pacOnly:  res.pacOnly,
 				compiled: res.compiled,
+			}
+			if wasNil {
+				log.Infoln("[pac-registry] compiled PAC on retry for proxy %s from %s", res.id, res.pacUrl)
 			}
 		}
 	}

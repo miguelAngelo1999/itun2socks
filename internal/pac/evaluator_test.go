@@ -246,6 +246,24 @@ function FindProxyForURL(url, host) {
 	}
 }
 
+func TestExtractUpstreams_DynamicScript(t *testing.T) {
+	js := `
+function FindProxyForURL(url, host) {
+    var h = "dyn-" + "proxy.corp";
+    return "PROXY " + h + ":8082";
+}
+`
+	p, err := Compile(js)
+	if err != nil {
+		t.Fatalf("Compile error: %v", err)
+	}
+
+	hosts := p.ExtractUpstreamHosts()
+	if len(hosts) != 1 || hosts[0] != "dyn-proxy.corp" {
+		t.Fatalf("expected [dyn-proxy.corp], got %+v", hosts)
+	}
+}
+
 func TestLocalLookupAndFakeIP(t *testing.T) {
 	// Set custom local lookup that returns Fake-IP and a real IP
 	SetLocalLookup(func(ctx context.Context, host string) ([]string, error) {
@@ -271,13 +289,20 @@ func TestLocalLookupAndFakeIP(t *testing.T) {
 }
 
 func TestLiveWPAD(t *testing.T) {
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	resp, err := client.Get("http://wpad/wpad.dat")
 	if err != nil {
 		t.Skipf("http://wpad/wpad.dat not reachable: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Skipf("http://wpad/wpad.dat returned HTTP %d", resp.StatusCode)
+		return
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -263,13 +263,19 @@ func Fetch(pacURL string) (string, error) {
 			targetIP = ip
 		}
 
+		if targetIP == nil {
+			// Avoid falling back to dialer.DialContext with an unresolved hostname,
+			// which would route DNS through cResolver.DefaultResolver (e.g. 114.114.114.114).
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(host, port))
+		}
+
 		var opts []dialer.Option
 		defIface := dialer.DefaultInterface.Load()
 
 		// If target IP is bypassed from TUN (or TUN not active / in bypass CIDRs),
 		// WithInterface("") routes over LAN or VPN utun.
 		// If TUN is up and host is NOT bypassed and not private/VPN, bind defIface.
-		if targetIP != nil && !IsBypassed(targetIP) && !targetIP.IsPrivate() && defIface != "" {
+		if !IsBypassed(targetIP) && !targetIP.IsPrivate() && defIface != "" {
 			opts = append(opts, dialer.WithInterface(defIface))
 		} else {
 			opts = append(opts, dialer.WithInterface(""))

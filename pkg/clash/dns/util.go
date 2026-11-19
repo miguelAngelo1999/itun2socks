@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/igoogolx/itun2socks/pkg/clash/component/fakeip"
@@ -158,28 +159,44 @@ func msgToIP(msg *D.Msg) []net.IP {
 
 func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, err error) {
 	fast, ctx := picker.WithContext(ctx)
+	var (
+		nxMu        sync.Mutex
+		nxdomainMsg *D.Msg
+	)
 	for _, client := range clients {
 		r := client
 		fast.Go(func() (any, error) {
-			m, err := r.ExchangeContext(ctx, m)
+			resp, err := r.ExchangeContext(ctx, m)
 			if err != nil {
 				return nil, err
-			} else if m.Rcode == D.RcodeServerFailure || m.Rcode == D.RcodeRefused {
+			}
+			if resp.Rcode == D.RcodeServerFailure || resp.Rcode == D.RcodeRefused {
 				return nil, errors.New("server failure")
 			}
-			return m, nil
+			if resp.Rcode == D.RcodeNameError {
+				nxMu.Lock()
+				if nxdomainMsg == nil {
+					nxdomainMsg = resp
+				}
+				nxMu.Unlock()
+				return nil, errors.New("name error")
+			}
+			return resp, nil
 		})
 	}
 
 	elm := fast.Wait()
-	if elm == nil {
-		err := errors.New("all DNS requests failed")
-		if fErr := fast.Error(); fErr != nil {
-			err = fmt.Errorf("%w, first error: %s", err, fErr.Error())
-		}
-		return nil, err
+	if elm != nil {
+		return elm.(*D.Msg), nil
 	}
 
-	msg = elm.(*D.Msg)
-	return
+	if nxdomainMsg != nil {
+		return nxdomainMsg, nil
+	}
+
+	err = errors.New("all DNS requests failed")
+	if fErr := fast.Error(); fErr != nil {
+		err = fmt.Errorf("%w, first error: %s", err, fErr.Error())
+	}
+	return nil, err
 }
