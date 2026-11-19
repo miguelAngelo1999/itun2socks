@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	defaultDelayTimeout = 5 * time.Second
+	defaultDelayTimeout = 10 * time.Second
 	defaultDelayTestUrl = "https://www.google.com"
 )
 
@@ -179,13 +179,11 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultDelayTimeout)
 	defer cancel()
-	// Clear the default interface binding so the proxy can be reached via
-	// whatever interface its subnet requires (e.g. VPN on utun7).
-	// Without this, lux_core binds to en0 and cannot reach proxies on VPN subnets.
-	savedIface := dialer.DefaultInterface.Load()
-	dialer.DefaultInterface.Store("")
-	delay, _, err := p.URLTest(ctx, url)
-	dialer.DefaultInterface.Store(savedIface)
+	// Pass dialer.WithInterface("") per-dial so the proxy can be reached via
+	// whatever interface its subnet requires (e.g. VPN on utun7) without
+	// mutating global dialer.DefaultInterface (which would race with concurrent
+	// delay tests and live DIRECT traffic).
+	delay, _, err := p.URLTest(ctx, url, dialer.WithInterface(""))
 	if err != nil {
 		// PAC-only proxies (empty server + pacUrl) route per connection through
 		// whatever upstream the PAC selects. A strict URLTest (HEAD through the
