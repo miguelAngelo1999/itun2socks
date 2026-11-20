@@ -105,22 +105,41 @@ func updateNamedProxies() {
 	conn.UpdateSelectedProxyId(rawConfig.Selected.Proxy)
 }
 
+const (
+	defaultInterfaceWaitAttempts = 8
+	defaultInterfaceWaitInterval = 1 * time.Second
+)
+
+func waitForDefaultInterface(getName func() string, maxAttempts int, interval time.Duration) (string, error) {
+	for i := 0; i < maxAttempts; i++ {
+		if name := getName(); len(name) != 0 {
+			return name, nil
+		}
+		if i+1 < maxAttempts {
+			log.Infoln("%s", log.FormatLog(log.InitPrefix, "waiting for default interface name"))
+			time.Sleep(interval)
+		}
+	}
+	return "", fmt.Errorf("no active default network interface")
+}
+
 func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	err := network_iface.StartMonitor()
 	if err != nil {
 		return nil, err
 	}
 
-	for {
-		defaultInterface := network_iface.GetDefaultInterfaceName()
-		if len(defaultInterface) != 0 {
-			break
-		}
-		log.Infoln("%s", log.FormatLog(log.InitPrefix, "waiting for default interface name"))
-		time.Sleep(1 * time.Second)
+	defaultInterface, err := waitForDefaultInterface(
+		network_iface.GetDefaultInterfaceName,
+		defaultInterfaceWaitAttempts,
+		defaultInterfaceWaitInterval,
+	)
+	if err != nil {
+		_ = network_iface.StopMonitor()
+		return nil, err
 	}
 
-	config, err := cfg.NewTun(network_iface.GetDefaultInterfaceName())
+	config, err := cfg.NewTun(defaultInterface)
 	if err != nil {
 		return nil, err
 	}
