@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/igoogolx/itun2socks/internal/cfg"
@@ -184,14 +185,19 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	stack, err := sTun.NewStack("system", sTun.StackOptions{
+	stackOpts := sTun.StackOptions{
 		Context:    context.Background(),
 		Handler:    proxy_handler.New(tunnel.TcpQueue(), tunnel.UdpQueue()),
 		TunOptions: tunOptions,
 		Tun:        tun,
 		UDPTimeout: 5 * time.Minute,
 		Logger:     logrus.StandardLogger(),
-	})
+	}
+	stack, err := sTun.NewStack("mixed", stackOpts)
+	if err != nil && strings.Contains(err.Error(), "gVisor") {
+		log.Warnln("[INIT] gVisor not compiled in, falling back to system TUN stack: %v", err)
+		stack, err = sTun.NewStack("system", stackOpts)
+	}
 	if err != nil {
 		return nil, err
 	}

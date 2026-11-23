@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
+	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/pool"
@@ -70,6 +72,71 @@ func NewUdpConnContext(ctx context.Context, conn network.PacketConn, metadata *C
 
 type CopyablePacketConn struct {
 	net.PacketConn
+
+	// Bidirectional Fake-IP (198.18.0.0/15) <-> Real-IP NAT table for relayed
+	// UDP flows (e.g. WhatsApp/WebRTC STUN/DTLS/SRTP). Outbound datagrams to a
+	// Fake-IP are resolved via Lux's non-Fake-IP resolver (never OS net.LookupIP,
+	// which loops into Wintun's Fake-IP DNS on Windows) and cached; inbound
+	// replies from the real IP are rewritten back to the Fake-IP so the app's
+	// connected UDP socket accepts them.
+	natMu       sync.RWMutex
+	fakeToReal  map[[4]byte][4]byte
+	realToFake  map[[4]byte][4]byte
+	resolveIPv4 func(ctx context.Context, host string) ([]net.IP, error)
+}
+
+func isFakeIPv4(as4 [4]byte) bool {
+	return as4[0] == 198 && (as4[1] == 18 || as4[1] == 19)
+}
+
+func (c *CopyablePacketConn) lookupRealForFake(fake4 [4]byte) ([4]byte, bool) {
+	c.natMu.RLock()
+	real4, ok := c.fakeToReal[fake4]
+	c.natMu.RUnlock()
+	return real4, ok
+}
+
+func (c *CopyablePacketConn) lookupFakeForReal(real4 [4]byte) ([4]byte, bool) {
+	c.natMu.RLock()
+	fake4, ok := c.realToFake[real4]
+	c.natMu.RUnlock()
+	return fake4, ok
+}
+
+func (c *CopyablePacketConn) recordNatMapping(fake4, real4 [4]byte) {
+	c.natMu.Lock()
+	if c.fakeToReal == nil {
+		c.fakeToReal = make(map[[4]byte][4]byte)
+	}
+	if c.realToFake == nil {
+		c.realToFake = make(map[[4]byte][4]byte)
+	}
+	c.fakeToReal[fake4] = real4
+	c.realToFake[real4] = fake4
+	c.natMu.Unlock()
+}
+
+func (c *CopyablePacketConn) resolveRealIPv4(domain string) ([4]byte, bool) {
+	lookup := c.resolveIPv4
+	if lookup == nil {
+		lookup = cResolver.LookupIPv4
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ips, err := lookup(ctx, domain)
+	if err != nil {
+		return [4]byte{}, false
+	}
+	for _, ip := range ips {
+		if rip4 := ip.To4(); rip4 != nil {
+			var as4 [4]byte
+			copy(as4[:], rip4)
+			if !isFakeIPv4(as4) {
+				return as4, true
+			}
+		}
+	}
+	return [4]byte{}, false
 }
 
 func shouldIgnorePacketError(err error) bool {
@@ -113,7 +180,17 @@ func (c *CopyablePacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error)
 		if _, err = buffer.Write(receivedBuf[:n]); err != nil {
 			return M.Socksaddr{}, fmt.Errorf("fail to write udp to buffer: %v", err)
 		}
-		return M.SocksaddrFromNet(addr), nil
+		src := M.SocksaddrFromNet(addr)
+		srcAddr := src.Addr.Unmap()
+		if srcAddr.Is4() {
+			if fake4, ok := c.lookupFakeForReal(srcAddr.As4()); ok {
+				src = M.Socksaddr{
+					Addr: netip.AddrFrom4(fake4),
+					Port: src.Port,
+				}
+			}
+		}
+		return src, nil
 	}
 }
 
@@ -126,18 +203,26 @@ func (c *CopyablePacketConn) WritePacket(buffer *buf.Buffer, destination M.Socks
 	if !destination.IsValid() {
 		return fmt.Errorf("fail to write udp: invalid destination %v", destination)
 	}
-	if destination.Addr.Is4() {
-		as4 := destination.Addr.As4()
-		if as4[0] == 198 && (as4[1] == 18 || as4[1] == 19) {
-			if domain, ok := dns.FakeIpPool.LookBack(net.IP(destination.Addr.AsSlice())); ok && domain != "" {
-				if ips, err := net.LookupIP(domain); err == nil {
-					for _, ip := range ips {
-						if rip4 := ip.To4(); rip4 != nil {
-							destination = M.SocksaddrFromNet(&net.UDPAddr{IP: rip4, Port: int(destination.Port)})
-							break
-						}
+	dstAddr := destination.Addr.Unmap()
+	if dstAddr.Is4() {
+		fake4 := dstAddr.As4()
+		if isFakeIPv4(fake4) {
+			real4, ok := c.lookupRealForFake(fake4)
+			if !ok {
+				if domain, found := dns.FakeIpPool.LookBack(net.IP(fake4[:])); found && domain != "" {
+					if resolved, resolvedOk := c.resolveRealIPv4(domain); resolvedOk {
+						real4 = resolved
+						ok = true
+						c.recordNatMapping(fake4, real4)
 					}
 				}
+			}
+			if !ok {
+				return fmt.Errorf("fail to resolve fake-ip udp destination %v", destination)
+			}
+			destination = M.Socksaddr{
+				Addr: netip.AddrFrom4(real4),
+				Port: destination.Port,
 			}
 		}
 	}
@@ -212,5 +297,5 @@ func NewUdpConn(ctx context.Context, metadata *C.Metadata, rule rule_engine.Rule
 		return nil, err
 	}
 	log.Debugln(log.FormatLog(log.UdpPrefix, "relay socket %v opened for %v"), rawConn.LocalAddr(), metadata.RemoteAddress())
-	return &CopyablePacketConn{rawConn}, nil
+	return &CopyablePacketConn{PacketConn: rawConn}, nil
 }

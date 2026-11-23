@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type TunClient struct {
 	localserver          localserver.Listener
 	config               *cfg.Config
 	isLocalServerEnabled bool
+	probeCancel          context.CancelFunc
 }
 
 func (c *TunClient) RuntimeDetail(hubAddress string) (any, error) {
@@ -72,6 +74,16 @@ func (c *TunClient) Start() error {
 	// Apply WFP per-process bypasses (Windows only — no-op on macOS).
 	ApplyProcessBypasses()
 
+	// If upstream proxy lacks UDP support (e.g. HTTP Squid), probe whether
+	// direct outbound UDP works on the physical NIC. If firewalled, activate
+	// WFP fast-fail UDP block on Windows so VoIP falls back to TURN-over-TCP.
+	hasUdpSupport := c.config != nil && c.config.Proxy != nil && c.config.Proxy.SupportUDP()
+	if !hasUdpSupport {
+		probeCtx, cancel := context.WithCancel(context.Background())
+		c.probeCancel = cancel
+		go probeAndConfigureUdpBlock(probeCtx, network_iface.GetDefaultInterfaceName())
+	}
+
 	if c.config.HijackDns.Enabled {
 
 		_, err := dns.Hijack(c.config.HijackDns.NetworkService, constants.HijackedDns, c.config.HijackDns.AlwaysReset)
@@ -95,7 +107,12 @@ func (c *TunClient) Start() error {
 func (c *TunClient) Close() error {
 	var err error
 
-	// Clean up WFP bypass filters (Windows only — no-op on macOS).
+	// Cancel any in-flight UDP probe and clean up WFP filters (Windows only — no-op on macOS).
+	if c.probeCancel != nil {
+		c.probeCancel()
+		c.probeCancel = nil
+	}
+	CloseUdpBlock()
 	CloseWfpBypass()
 
 	// Stop PAC refresh and clear the registry on disconnect.
