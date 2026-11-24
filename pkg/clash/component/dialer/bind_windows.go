@@ -15,7 +15,29 @@ import (
 const (
 	IP_UNICAST_IF   = 31
 	IPV6_UNICAST_IF = 31
+	// SIO_UDP_CONNRESET = IOC_IN | IOC_VENDOR | 12 (0x9800000C)
+	sioUdpConnReset = windows.IOC_IN | windows.IOC_VENDOR | 12
 )
+
+// disableUdpConnReset disables Winsock's default behavior of reporting ICMP
+// Port Unreachable as WSAECONNRESET on the next RecvFrom of an unconnected UDP
+// socket. Without this, one closed ICE/STUN candidate poisons the entire shared
+// UDP relay socket for WhatsApp/WebRTC calls.
+func disableUdpConnReset(handle windows.Handle) {
+	var zero uint32
+	var bytesReturned uint32
+	_ = windows.WSAIoctl(
+		handle,
+		sioUdpConnReset,
+		(*byte)(unsafe.Pointer(&zero)),
+		uint32(unsafe.Sizeof(zero)),
+		nil,
+		0,
+		&bytesReturned,
+		nil,
+		0,
+	)
+}
 
 type controlFn = func(network, address string, c syscall.RawConn) error
 
@@ -37,6 +59,9 @@ func bindControl(ifaceIdx int, chain controlFn) controlFn {
 
 		var innerErr error
 		err = c.Control(func(fd uintptr) {
+			if strings.HasPrefix(network, "udp") {
+				disableUdpConnReset(windows.Handle(fd))
+			}
 			if ipStr == "" && strings.HasPrefix(network, "udp") {
 				// When listening udp ":0", we should bind socket to interface4 and interface6 at the same time
 				// and ignore the error of bind6

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/sagernet/sing/common/buf"
@@ -74,6 +75,62 @@ func TestCopyablePacketConn_FakeIPBidirectionalNAT(t *testing.T) {
 	src, err := cpc.ReadPacket(inBuf)
 	require.NoError(t, err)
 	assert.Equal(t, fake4.String(), src.Addr.String())
+	assert.True(t, src.Addr.Is4())
+	assert.False(t, src.Addr.Is4In6())
 	assert.Equal(t, uint16(serverPort), src.Port)
 	assert.Equal(t, "stun-ping", string(inBuf.Bytes()))
+}
+
+type fakeDualStackPacketConn struct {
+	net.PacketConn
+	readPayload []byte
+	readAddr    net.Addr
+	writtenAddr net.Addr
+}
+
+func (f *fakeDualStackPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n := copy(p, f.readPayload)
+	return n, f.readAddr, nil
+}
+
+func (f *fakeDualStackPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	f.writtenAddr = addr
+	return len(p), nil
+}
+
+func (f *fakeDualStackPacketConn) SetReadDeadline(_ time.Time) error { return nil }
+
+func TestCopyablePacketConn_RawIPv4Unmaps4In6FromDualStackSocket(t *testing.T) {
+	// Simulate Windows dual-stack [::] UDP socket returning IPv4-mapped IPv6
+	// ::ffff:162.159.207.0:3478 (raw IPv4 STUN / WhatsApp ICE relay, NOT Fake-IP).
+	mappedIP := net.ParseIP("::ffff:162.159.207.0")
+	require.NotNil(t, mappedIP)
+	raw := &fakeDualStackPacketConn{
+		readPayload: []byte("stun-reply"),
+		readAddr:    &net.UDPAddr{IP: mappedIP, Port: 3478},
+	}
+
+	cpc := &CopyablePacketConn{PacketConn: raw}
+
+	// Outbound write to raw IPv4 literal works without NAT lookup.
+	outBuf := buf.NewPacket()
+	defer outBuf.Release()
+	_, err := outBuf.Write([]byte("stun-req"))
+	require.NoError(t, err)
+	require.NoError(t, cpc.WritePacket(outBuf, M.ParseSocksaddr("162.159.207.0:3478")))
+	require.NotNil(t, raw.writtenAddr)
+	assert.Equal(t, "162.159.207.0:3478", raw.writtenAddr.String())
+
+	// Inbound ReadPacket MUST return a pure IPv4 netip.Addr (Is4 && !Is4In6),
+	// otherwise sing-tun's gVisor IPv4 UDP endpoint drops it immediately with
+	// bytes=0, err=<nil>.
+	inBuf := buf.NewPacket()
+	defer inBuf.Release()
+	src, err := cpc.ReadPacket(inBuf)
+	require.NoError(t, err)
+	assert.True(t, src.Addr.Is4(), "expected pure IPv4 addr, got %v (is4In6=%v)", src.Addr, src.Addr.Is4In6())
+	assert.False(t, src.Addr.Is4In6(), "must not return IPv4-mapped IPv6 addr: %v", src.Addr)
+	assert.Equal(t, "162.159.207.0", src.Addr.String())
+	assert.Equal(t, uint16(3478), src.Port)
+	assert.Equal(t, "stun-reply", string(inBuf.Bytes()))
 }

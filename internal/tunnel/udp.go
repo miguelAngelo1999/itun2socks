@@ -61,7 +61,7 @@ func handleUdpConn(ct conn.UdpConnContext) {
 		}
 		return
 	}
-	lc = statistic.NewUDPTracker(*localConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())
+	lc = statistic.NewUDPTracker(localConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)

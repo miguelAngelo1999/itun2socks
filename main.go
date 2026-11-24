@@ -75,6 +75,9 @@ func main() {
 	configuration.SetConfigFilePath(constants.Path.ConfigFilePath())
 	configuration.Init()
 	api.Start(port, secret)
+	// On Windows, apply UWP loopback exemptions once in the background as soon
+	// as elevated lux_core starts so Store/iCloud apps work in System mode too.
+	go sysproxy.EnsureUWPLoopbackExemptions()
 
 	defer func() {
 		if p := recover(); p != nil {

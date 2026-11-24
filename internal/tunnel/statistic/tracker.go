@@ -11,6 +11,8 @@ import (
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 
 	"github.com/gofrs/uuid/v5"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
 	"go.uber.org/atomic"
 )
 
@@ -104,7 +106,7 @@ func NewTCPTracker(conn net.Conn, manager *Manager, metadata *C.Metadata, rule r
 }
 
 type UdpTracker struct {
-	conn.CopyablePacketConn `json:"-"`
+	*conn.CopyablePacketConn `json:"-"`
 	*trackerInfo
 	manager *Manager
 }
@@ -129,12 +131,32 @@ func (ut *UdpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return n, err
 }
 
+func (ut *UdpTracker) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	before := buffer.Len()
+	addr, err := ut.CopyablePacketConn.ReadPacket(buffer)
+	if delta := int64(buffer.Len() - before); delta > 0 {
+		ut.manager.PushDownloaded(delta, ut.Rule.GetPolicy(), ut)
+		ut.DownloadTotal.Add(delta)
+	}
+	return addr, err
+}
+
+func (ut *UdpTracker) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	upload := int64(buffer.Len())
+	err := ut.CopyablePacketConn.WritePacket(buffer, destination)
+	if err == nil && upload > 0 {
+		ut.manager.PushUploaded(upload, ut.Rule.GetPolicy(), ut)
+		ut.UploadTotal.Add(upload)
+	}
+	return err
+}
+
 func (ut *UdpTracker) Close() error {
 	ut.manager.Leave(ut)
 	return ut.PacketConn.Close()
 }
 
-func NewUDPTracker(conn conn.CopyablePacketConn, manager *Manager, metadata *C.Metadata, rule rule_engine.Rule) *UdpTracker {
+func NewUDPTracker(conn *conn.CopyablePacketConn, manager *Manager, metadata *C.Metadata, rule rule_engine.Rule) *UdpTracker {
 	uid, _ := uuid.NewV4()
 
 	ut := &UdpTracker{

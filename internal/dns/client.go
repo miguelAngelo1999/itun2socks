@@ -27,6 +27,20 @@ func UpdateDnsMap(local, remote cResolver.Resolver) {
 	dnsMap[constants.PolicyProxy] = remote
 }
 
+// LookupLocalIPv4 resolves host via Lux's configured non-Fake-IP local DNS
+// client (bound to the physical NIC). Direct UDP relays call this so Fake-IP
+// resolution never loops through OS/Wintun Fake-IP DNS when hijackDns is on
+// and cResolver.DefaultResolver is nil.
+func LookupLocalIPv4(ctx context.Context, host string) ([]net.IP, error) {
+	mux.RLock()
+	local := dnsMap[constants.PolicyDirect]
+	mux.RUnlock()
+	if local != nil {
+		return local.LookupIPv4(ctx, host)
+	}
+	return cResolver.LookupIPv4(ctx, host)
+}
+
 type Conn interface {
 	ReadFrom([]byte) (int, net.Addr, error)
 	WriteTo([]byte, net.Addr) (int, error)

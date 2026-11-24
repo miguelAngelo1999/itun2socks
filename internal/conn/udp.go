@@ -12,7 +12,6 @@ import (
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/dns"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
-	cResolver "github.com/igoogolx/itun2socks/pkg/clash/component/resolver"
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/pool"
@@ -25,7 +24,7 @@ import (
 // udpReadTimeout bounds how long a relayed UDP flow waits for an inbound packet
 // before it is torn down. Media flows (STUN/RTP) send continuously, so an idle
 // gap this long means the flow is really over.
-const udpReadTimeout = 30 * time.Second
+const udpReadTimeout = 60 * time.Second
 
 type UdpConnContext struct {
 	ctx      context.Context
@@ -119,7 +118,7 @@ func (c *CopyablePacketConn) recordNatMapping(fake4, real4 [4]byte) {
 func (c *CopyablePacketConn) resolveRealIPv4(domain string) ([4]byte, bool) {
 	lookup := c.resolveIPv4
 	if lookup == nil {
-		lookup = cResolver.LookupIPv4
+		lookup = dns.LookupLocalIPv4
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -172,6 +171,11 @@ func (c *CopyablePacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error)
 		}
 		n, addr, err := c.ReadFrom(receivedBuf)
 		if err != nil {
+			if isUdpConnResetError(err) {
+				// Windows Winsock ICMP Port Unreachable from one peer; keep relaying
+				// other peers/ICE candidates on this shared UDP socket.
+				continue
+			}
 			return M.Socksaddr{}, err
 		}
 		if n == 0 {
@@ -184,10 +188,15 @@ func (c *CopyablePacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error)
 		srcAddr := src.Addr.Unmap()
 		if srcAddr.Is4() {
 			if fake4, ok := c.lookupFakeForReal(srcAddr.As4()); ok {
-				src = M.Socksaddr{
-					Addr: netip.AddrFrom4(fake4),
-					Port: src.Port,
-				}
+				srcAddr = netip.AddrFrom4(fake4)
+			}
+			// Always return a pure IPv4 Socksaddr (never ::ffff:a.b.c.d from a
+			// dual-stack [::] socket). sing-tun's gVisor IPv4 UDP endpoint rejects
+			// Is4In6() addresses and ends the download loop with bytes=0, err=<nil>,
+			// breaking all raw-IPv4 UDP flows (e.g. WhatsApp ICE/STUN/media).
+			src = M.Socksaddr{
+				Addr: srcAddr,
+				Port: src.Port,
 			}
 		}
 		return src, nil
@@ -222,6 +231,11 @@ func (c *CopyablePacketConn) WritePacket(buffer *buf.Buffer, destination M.Socks
 			}
 			destination = M.Socksaddr{
 				Addr: netip.AddrFrom4(real4),
+				Port: destination.Port,
+			}
+		} else if destination.Addr.Is4In6() {
+			destination = M.Socksaddr{
+				Addr: dstAddr,
 				Port: destination.Port,
 			}
 		}

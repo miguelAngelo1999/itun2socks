@@ -3,5 +3,6 @@
 package sysproxy
 
 // No-ops on non-Windows platforms.
-func applyUWPLoopbackExemptions() {}
+func EnsureUWPLoopbackExemptions() {}
+func applyUWPLoopbackExemptions()  {}
 func clearUWPLoopbackExemptions()  {}

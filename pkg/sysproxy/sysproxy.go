@@ -59,8 +59,9 @@ func Set(addr string, activeInterface string) error {
 
 func Clear(activeInterface string) error {
 	clearEnvProxy()
-	// Restore default UWP network isolation.
-	go clearUWPLoopbackExemptions()
+	// Intentionally preserve UWP loopback exemptions on normal disconnect/reconnect
+	// so other apps aren't broken and reconnects never race with `-c`.
+	clearUWPLoopbackExemptions()
 	// Clear the proxy on ALL active network services (mirror of Set).
 	services := getAllNetworkServices()
 	if len(services) == 0 {
