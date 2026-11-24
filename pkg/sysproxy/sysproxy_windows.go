@@ -124,7 +124,7 @@ func clearAutoDetectBit(blob []byte) []byte {
 // from bit 0x08 of DefaultConnectionSettings, not from that DWORD. Saves the
 // originals into prevConn* for restoration.
 func disableWpadAutoDetect() {
-	k, err := registry.OpenKey(registry.CURRENT_USER, connectionsKeyPath, registry.QUERY_VALUE|registry.SET_VALUE)
+	k, err := openUserKey(connectionsKeyPath, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err != nil {
 		return
 	}
@@ -150,7 +150,7 @@ func restoreWpadAutoDetect() {
 	if !prevConnSaved {
 		return
 	}
-	k, err := registry.OpenKey(registry.CURRENT_USER, connectionsKeyPath, registry.SET_VALUE)
+	k, err := openUserKey(connectionsKeyPath, registry.SET_VALUE)
 	if err != nil {
 		return
 	}
@@ -226,7 +226,7 @@ func setProxySettings(settings *proxySettings) error {
 	// A PAC URL or WPAD auto-detect takes precedence over the manual proxy
 	// setting and causes traffic to bypass lux entirely.
 	if !prevSaved {
-		if k2, e2 := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE|registry.SET_VALUE); e2 == nil {
+		if k2, e2 := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE|registry.SET_VALUE); e2 == nil {
 			prevPACURL, _, _ = k2.GetStringValue("AutoConfigURL")
 			{ v64, _, _ := k2.GetIntegerValue("AutoDetect"); prevAutoDetect = uint32(v64) }
 			k2.SetStringValue("AutoConfigURL", "")
@@ -240,7 +240,7 @@ func setProxySettings(settings *proxySettings) error {
 	// binary DefaultConnectionSettings blob. Clear it there too, or traffic can
 	// still be diverted to a WPAD-discovered proxy and bypass lux.
 	disableWpadAutoDetect()
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	key, err := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
@@ -273,7 +273,7 @@ func setProxySettings(settings *proxySettings) error {
 func disableProxy() error {
 	// Restore the auto-proxy settings we saved when the proxy was enabled.
 	if prevSaved {
-		if k2, e2 := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE); e2 == nil {
+		if k2, e2 := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE); e2 == nil {
 			k2.SetStringValue("AutoConfigURL", prevPACURL)
 			if prevAutoDetect == 0 { k2.DeleteValue("AutoDetect") } else { k2.SetDWordValue("AutoDetect", prevAutoDetect) }
 			k2.Close()
@@ -283,7 +283,7 @@ func disableProxy() error {
 	// Restore the original binary connection-settings blob (and thus the user's
 	// prior "Automatically detect settings" state).
 	restoreWpadAutoDetect()
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	key, err := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
@@ -338,7 +338,7 @@ func notifyWinInetProxySettingsChanged() error {
 	return nil
 }
 func getWebProxy() (host string, port string, enabled bool, err error) {
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	key, err := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -364,7 +364,7 @@ func getWebProxy() (host string, port string, enabled bool, err error) {
 }
 
 func getSOCKSProxy() (host string, port string, enabled bool, err error) {
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	key, err := openUserKey(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err != nil {
 		return "", "", false, err
 	}

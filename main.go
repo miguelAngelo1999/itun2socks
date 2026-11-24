@@ -15,13 +15,16 @@ import (
 	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/manager"
 	"github.com/igoogolx/itun2socks/pkg/log"
+	"github.com/igoogolx/itun2socks/pkg/sysproxy"
 )
 
 var (
-	homeDir string
-	version bool
-	port    int
-	secret  string
+	homeDir     string
+	version     bool
+	port        int
+	secret      string
+	serviceMode bool
+	userSID     string
 )
 
 var packageName = "itun2socks"
@@ -36,11 +39,25 @@ func main() {
 	flag.StringVar(&homeDir, "home_dir", defaultHomeDir, "set configuration directory")
 	flag.BoolVar(&version, "version", false, "print current version of itun2socks")
 	flag.StringVar(&secret, "secret", "", "set secret")
+	flag.BoolVar(&serviceMode, "service", false, "run as Windows service supervisor (LuxCoreService)")
+	flag.StringVar(&userSID, "user_sid", "", "target Windows user SID for per-user proxy registry updates")
 	flag.Parse()
 
 	if version {
 		fmt.Printf("version: %v, build on: %v", constants.Version, constants.BuildTime)
 		os.Exit(0)
+	}
+
+	if serviceMode {
+		if err := runWindowsService(); err != nil {
+			fmt.Fprintf(os.Stderr, "service failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if userSID != "" {
+		sysproxy.SetTargetUserSID(userSID)
 	}
 
 	if !filepath.IsAbs(homeDir) {

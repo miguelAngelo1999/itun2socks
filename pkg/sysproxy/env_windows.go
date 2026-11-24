@@ -95,9 +95,9 @@ func exportProxyCACerts() string {
 // change so CLI tools launched afterwards route through lux.
 func setEnvProxyPlatform(addr string) {
 	url := "http://" + addr
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	k, err := openUserKey(`Environment`, registry.SET_VALUE)
 	if err != nil {
-		log.Warnln("[sysproxy] open HKCU\\Environment: %v", err)
+		log.Warnln("[sysproxy] open user Environment key: %v", err)
 		return
 	}
 	defer k.Close()
@@ -129,9 +129,9 @@ func setNodeExtraCAPlatform() {
 	if bundlePath == "" {
 		return
 	}
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	k, err := openUserKey(`Environment`, registry.SET_VALUE)
 	if err != nil {
-		log.Warnln("[sysproxy] open HKCU\\Environment: %v", err)
+		log.Warnln("[sysproxy] open user Environment key: %v", err)
 		return
 	}
 	defer k.Close()
@@ -142,7 +142,7 @@ func setNodeExtraCAPlatform() {
 
 // clearNodeExtraCAPlatform removes NODE_EXTRA_CA_CERTS from the per-user env.
 func clearNodeExtraCAPlatform() {
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	k, err := openUserKey(`Environment`, registry.SET_VALUE)
 	if err != nil {
 		return
 	}
@@ -156,9 +156,9 @@ func clearNodeExtraCAPlatform() {
 // clearEnvProxyPlatform deletes the env vars set by setEnvProxyPlatform and
 // broadcasts the change.
 func clearEnvProxyPlatform() {
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Environment`, registry.SET_VALUE)
+	k, err := openUserKey(`Environment`, registry.SET_VALUE)
 	if err != nil {
-		log.Warnln("[sysproxy] open HKCU\\Environment: %v", err)
+		log.Warnln("[sysproxy] open user Environment key: %v", err)
 		return
 	}
 	defer k.Close()
