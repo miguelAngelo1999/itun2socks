@@ -141,7 +141,21 @@ func goLookup(host string) string {
 		}
 	}
 
-	// 2. Fallback to OS native resolver directly (uses DHCP search domains, /etc/hosts, mDNS/LLMNR)
+	// 2. For single-label intranet hostnames (e.g. "wpad"), query physical
+	// LAN/DHCP DNS servers directly FIRST (~1-2ms). On Windows, GetAddrInfoW
+	// refuses to query DNS for single-label names when no DNS suffix is set and
+	// stalls for seconds in LLMNR/NetBIOS before failing with "no such host".
+	if !strings.Contains(host, ".") {
+		sysCtx, sysCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		ipStr := querySystemDNS(sysCtx, host)
+		sysCancel()
+		if ipStr != "" {
+			cache.Add(host, ipStr)
+			return ipStr
+		}
+	}
+
+	// 3. Fallback to OS native resolver directly (uses DHCP search domains, /etc/hosts, mDNS/LLMNR)
 	osCtx, osCancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer osCancel()
 	if ips, err := net.DefaultResolver.LookupIP(osCtx, "ip4", host); err == nil {
@@ -151,6 +165,17 @@ func goLookup(host string) string {
 				cache.Add(host, s)
 				return s
 			}
+		}
+	}
+
+	// 4. Direct UDP DNS fallback for multi-label hosts if OS resolver returned
+	// nothing or only Fake-IPs.
+	if strings.Contains(host, ".") {
+		sysCtx, sysCancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer sysCancel()
+		if ipStr := querySystemDNS(sysCtx, host); ipStr != "" {
+			cache.Add(host, ipStr)
+			return ipStr
 		}
 	}
 

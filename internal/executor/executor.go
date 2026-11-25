@@ -164,6 +164,9 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 			return res, nil
 		})
 	}
+	// Register DIRECT/PROXY dialers before PAC registry update so Local.Client
+	// can dial immediately if it needs to resolve PAC URL hosts (e.g. wpad).
+	conn.UpdateProxy(config.Proxy)
 	pac.SetIsBypassed(IsBypassedFromTun)
 	pac.DefaultRegistry.Update(rawConfig.Proxy, "")
 

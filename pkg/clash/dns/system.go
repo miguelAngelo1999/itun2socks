@@ -37,12 +37,17 @@ func (s *systemClient) Exchange(m *D.Msg) (msg *D.Msg, err error) {
 }
 
 func (s *systemClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
-	var clients = s.clients
+	s.lock.Lock()
+	clients := s.clients
+	s.lock.Unlock()
 	if len(clients) == 0 {
 		err = s.update()
 		if err != nil {
 			return nil, err
 		}
+		s.lock.Lock()
+		clients = s.clients
+		s.lock.Unlock()
 	}
 	mRes, err := batchExchange(ctx, clients, m)
 	if err != nil {
