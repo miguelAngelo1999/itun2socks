@@ -63,6 +63,22 @@ func SetExcludedTunIface(name string) {
 	excludedTunIface = name
 }
 
+// IsExcludedTunIface reports whether name matches the registered Lux TUN
+// interface (case-insensitive) or a known Wintun/itun2socks device name.
+func IsExcludedTunIface(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	excludedTunMu.RLock()
+	excl := strings.ToLower(strings.TrimSpace(excludedTunIface))
+	excludedTunMu.RUnlock()
+	if excl != "" && n == excl {
+		return true
+	}
+	return strings.Contains(n, "itun2socks") || strings.Contains(n, "wintun")
+}
+
 // SetIsBypassed registers the bypass predicate checking if an IP is excluded from TUN routing.
 func SetIsBypassed(fn func(net.IP) bool) {
 	isBypassedMu.Lock()

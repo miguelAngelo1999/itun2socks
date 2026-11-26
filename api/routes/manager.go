@@ -34,7 +34,8 @@ func start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = manager.Start()
+	// Atomically cancel any pending captive-portal auto-resume and start manager.
+	err = switchCtrl.ManualStart()
 	if err != nil {
 		log.Errorln(log.FormatLog(log.HubPrefix, "fail to start the client, err:%v"), err)
 		render.Status(r, http.StatusInternalServerError)
@@ -45,7 +46,9 @@ func start(w http.ResponseWriter, r *http.Request) {
 }
 
 func stop(w http.ResponseWriter, r *http.Request) {
-	err := manager.Close()
+	// Atomically cancel any active captive-portal auto-resume loop and close
+	// manager under switchCtrl.transitionMu so manual STOP is always respected.
+	err := switchCtrl.ManualStop()
 	if err != nil {
 		log.Errorln(log.FormatLog(log.HubPrefix, "fail to stop the client, err:%v"), err)
 		render.Status(r, http.StatusInternalServerError)

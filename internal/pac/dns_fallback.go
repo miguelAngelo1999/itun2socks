@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	D "github.com/miekg/dns"
 )
 
@@ -59,6 +60,11 @@ func querySystemDNS(ctx context.Context, host string) string {
 		Timeout: 350 * time.Millisecond,
 	}
 
+	defIface := dialer.DefaultInterface.Load()
+	if IsExcludedTunIface(defIface) {
+		defIface = ""
+	}
+
 	for _, srv := range servers {
 		addr := srv
 		srvIPStr := srv
@@ -67,10 +73,11 @@ func querySystemDNS(ctx context.Context, host string) string {
 		} else {
 			addr = net.JoinHostPort(addr, "53")
 		}
+		srvIP := net.ParseIP(srvIPStr)
 		// Single-label names (e.g. "wpad", "intranet") only exist on local/LAN
 		// DNS servers, never on public resolvers like 1.1.1.1 or 8.8.8.8.
 		if singleLabel {
-			if sip := net.ParseIP(srvIPStr); sip != nil && !sip.IsPrivate() && !sip.IsLoopback() {
+			if srvIP != nil && !srvIP.IsPrivate() && !srvIP.IsLoopback() {
 				continue
 			}
 		}
@@ -82,7 +89,24 @@ func querySystemDNS(ctx context.Context, host string) string {
 			msg.SetQuestion(qname, D.TypeA)
 			msg.RecursionDesired = true
 
-			resp, _, err := client.ExchangeContext(ctx, msg, addr)
+			var (
+				resp *D.Msg
+				err  error
+			)
+			// When TUN is active and the discovered DHCP DNS server is public
+			// (e.g. 8.8.8.8), bind UDP/53 to the physical interface so the query
+			// bypasses TUN and Fake-IP.
+			if defIface != "" && srvIP != nil && !srvIP.IsLoopback() && !srvIP.IsPrivate() {
+				rawConn, dialErr := dialer.DialContext(ctx, "udp4", addr, dialer.WithInterface(defIface))
+				if dialErr != nil {
+					continue
+				}
+				dConn := &D.Conn{Conn: rawConn}
+				resp, _, err = client.ExchangeWithConnContext(ctx, msg, dConn)
+				_ = dConn.Close()
+			} else {
+				resp, _, err = client.ExchangeContext(ctx, msg, addr)
+			}
 			if err != nil || resp == nil {
 				continue
 			}
@@ -96,5 +120,71 @@ func querySystemDNS(ctx context.Context, host string) string {
 			}
 		}
 	}
+	return ""
+}
+
+// LookupFreshIPv4 resolves host to an IPv4 address WITHOUT using the long-lived
+// PAC DNS cache and WITHOUT accepting Fake-IPs (198.18.0.0/15, 10.255.0.0/16).
+func LookupFreshIPv4(ctx context.Context, host string) string {
+	return LookupFreshIPv4Strict(ctx, host, false)
+}
+
+// LookupFreshIPv4Strict is LookupFreshIPv4 with an explicit skipOSResolver flag.
+// When TUN / DNS hijack is active, callers pass skipOSResolver=true so resolution
+// never falls back to net.DefaultResolver (which queries Lux's hijacked 10.255.0.2).
+func LookupFreshIPv4Strict(ctx context.Context, host string, skipOSResolver bool) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil && !isExcludedIP(ip4) {
+			return ip4.String()
+		}
+		return ""
+	}
+	if strings.EqualFold(host, "localhost") {
+		return "127.0.0.1"
+	}
+
+	// 1. Direct uncached query to physical LAN / DHCP DNS servers first.
+	sysCtx, sysCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	ipStr := querySystemDNS(sysCtx, host)
+	sysCancel()
+	if ipStr != "" {
+		return ipStr
+	}
+
+	// 2. Lux's configured non-Fake-IP local DNS resolver (if TUN is running).
+	localLookupMu.RLock()
+	fn := localLookup
+	localLookupMu.RUnlock()
+	if fn != nil {
+		localCtx, localCancel := context.WithTimeout(ctx, 700*time.Millisecond)
+		addrs, err := fn(localCtx, host)
+		localCancel()
+		if err == nil {
+			for _, a := range addrs {
+				if ip := net.ParseIP(a); ip != nil && ip.To4() != nil && !isExcludedIP(ip) && !ip.IsLoopback() {
+					return ip.To4().String()
+				}
+			}
+		}
+	}
+
+	// 3. Fallback to OS resolver only when TUN/DNS hijack is NOT active.
+	if skipOSResolver {
+		return ""
+	}
+	osCtx, osCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer osCancel()
+	if ips, err := net.DefaultResolver.LookupIP(osCtx, "ip4", host); err == nil {
+		for _, ip := range ips {
+			if ip4 := ip.To4(); ip4 != nil && !isExcludedIP(ip4) && !ip4.IsLoopback() {
+				return ip4.String()
+			}
+		}
+	}
+
 	return ""
 }
