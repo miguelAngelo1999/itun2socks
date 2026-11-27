@@ -36,15 +36,16 @@ var (
 )
 
 const (
-	fwpActionPermit             = 0x00001002
-	fwpActionBlock              = 0x00001001
-	fwpMatchEqual               = 0
-	fwpMatchNotEqual            = 10
-	fwpConditionValueTypeUInt8  = 1
-	fwpConditionValueTypeUInt16 = 2
-	fwpConditionValueTypeBLOB   = 12
-	fwpmSessionFlagDynamic      = 0x00000001
-	fwpEmptyValue               = 0
+	fwpActionPermit                = 0x00001002
+	fwpActionBlock                 = 0x00001001
+	fwpMatchEqual                  = 0
+	fwpMatchNotEqual               = 10
+	fwpConditionValueTypeUInt8     = 1
+	fwpConditionValueTypeUInt16    = 2
+	fwpConditionValueTypeBLOB      = 12
+	fwpmSessionFlagDynamic         = 0x00000001
+	fwpmFilterFlagClearActionRight = 0x00000008
+	fwpEmptyValue                  = 0
 )
 
 type fwpmSession0 struct {
@@ -78,21 +79,21 @@ type fwpByteBlob struct {
 }
 
 type fwpmFilter0 struct {
-	filterKey       windows.GUID
-	displayData     fwpmDisplayData0
-	flags           uint32
-	providerKey     *windows.GUID
-	providerData    fwpByteBlob
-	layerKey        windows.GUID
-	sublayerKey     windows.GUID
-	weight          fwpValue0
-	numConditions   uint32
-	conditions      *fwpmFilterCondition0
-	action          fwpmAction0
-	padding1        [8]byte
-	reserved        *windows.GUID
-	filterId        uint64
-	effectiveWeight fwpValue0
+	filterKey          windows.GUID
+	displayData        fwpmDisplayData0
+	flags              uint32
+	providerKey        *windows.GUID
+	providerData       fwpByteBlob
+	layerKey           windows.GUID
+	sublayerKey        windows.GUID
+	weight             fwpValue0
+	numConditions      uint32
+	conditions         *fwpmFilterCondition0
+	action             fwpmAction0
+	providerContextKey [2]uint64 // union { UINT64 rawContext; GUID providerContextKey; } (align 8, size 16)
+	reserved           *windows.GUID
+	filterId           uint64
+	effectiveWeight    fwpValue0
 }
 
 type fwpValue0 struct {
@@ -132,20 +133,34 @@ var (
 )
 
 type WfpBypass struct {
-	mu          sync.Mutex
 	engine      uintptr
 	sublayerKey windows.GUID
 	filterKeys  []windows.GUID
 }
 
-var globalWfpBypass *WfpBypass
+var (
+	wfpBypassMu     sync.Mutex
+	globalWfpBypass *WfpBypass
+)
 
 func InitWfpBypass() error {
+	wfpBypassMu.Lock()
+	defer wfpBypassMu.Unlock()
+	return initWfpBypassLocked()
+}
+
+func initWfpBypassLocked() error {
 	if globalWfpBypass != nil {
 		return nil
 	}
-	name, _ := windows.UTF16PtrFromString("Lux TUN Bypass")
-	desc, _ := windows.UTF16PtrFromString("Permits excluded processes to bypass TUN")
+	name, err := windows.UTF16PtrFromString("Lux TUN Bypass")
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(session name): %w", err)
+	}
+	desc, err := windows.UTF16PtrFromString("Permits excluded processes to bypass TUN")
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(session desc): %w", err)
+	}
 	session := &fwpmSession0{
 		displayData: fwpmDisplayData0{name: name, description: desc},
 		flags:       fwpmSessionFlagDynamic,
@@ -156,7 +171,11 @@ func InitWfpBypass() error {
 		return fmt.Errorf("FwpmEngineOpen0 failed: 0x%08x", r)
 	}
 	sublayerKey := newGUID()
-	sublayerName, _ := windows.UTF16PtrFromString("Lux Bypass Sublayer")
+	sublayerName, err := windows.UTF16PtrFromString("Lux Bypass Sublayer")
+	if err != nil {
+		procFwpmEngineClose0.Call(engine)
+		return fmt.Errorf("UTF16PtrFromString(sublayer name): %w", err)
+	}
 	sublayer := &fwpmSublayer0{
 		sublayerKey: sublayerKey,
 		displayData: fwpmDisplayData0{name: sublayerName},
@@ -172,19 +191,44 @@ func InitWfpBypass() error {
 }
 
 func AddProcessBypass(exePath string) error {
+	return AddProcessBypassWithProtocol(exePath, constants.RuleProtocolAny)
+}
+
+func AddProcessBypassWithProtocol(exePath string, proto constants.RuleProtocol) error {
+	wfpBypassMu.Lock()
+	defer wfpBypassMu.Unlock()
+	return addProcessBypassWithProtocolLocked(exePath, proto)
+}
+
+func addProcessBypassWithProtocolLocked(exePath string, proto constants.RuleProtocol) error {
+	var protoLabel string
+	var ipProto uintptr
+	switch proto {
+	case constants.RuleProtocolAny:
+		protoLabel = "any"
+	case constants.RuleProtocolTCP:
+		protoLabel = "tcp"
+		ipProto = 6 // IPPROTO_TCP
+	case constants.RuleProtocolUDP:
+		protoLabel = "udp"
+		ipProto = 17 // IPPROTO_UDP
+	default:
+		return fmt.Errorf("unsupported WFP bypass protocol %q", proto)
+	}
+
 	if globalWfpBypass == nil {
 		return fmt.Errorf("WFP bypass not initialized")
 	}
-	globalWfpBypass.mu.Lock()
-	defer globalWfpBypass.mu.Unlock()
+
 	appID, err := getWfpAppID(exePath)
 	if err != nil {
 		return fmt.Errorf("getWfpAppID(%q): %w", exePath, err)
 	}
 	defer freeWfpAppID(appID)
 	filterKey := newGUID()
-	filterName, _ := windows.UTF16PtrFromString(fmt.Sprintf("Lux Bypass: %s", filepath.Base(exePath)))
-	condition := fwpmFilterCondition0{
+
+	var conditions [2]fwpmFilterCondition0
+	conditions[0] = fwpmFilterCondition0{
 		fieldKey:  fwpmConditionALEAppID,
 		matchType: fwpMatchEqual,
 		conditionValue: fwpConditionValue0{
@@ -192,33 +236,57 @@ func AddProcessBypass(exePath string) error {
 			value:     uintptr(unsafe.Pointer(appID)),
 		},
 	}
+	numConditions := uint32(1)
+	if ipProto != 0 {
+		conditions[1] = fwpmFilterCondition0{
+			fieldKey:  fwpmConditionIPProtocol,
+			matchType: fwpMatchEqual,
+			conditionValue: fwpConditionValue0{
+				valueType: fwpConditionValueTypeUInt8,
+				value:     ipProto,
+			},
+		}
+		numConditions = 2
+	}
+
+	filterName, err := windows.UTF16PtrFromString(fmt.Sprintf("Lux Bypass (%s): %s", protoLabel, filepath.Base(exePath)))
+	if err != nil {
+		return fmt.Errorf("UTF16PtrFromString(filter name): %w", err)
+	}
 	weight := fwpValue0{valueType: fwpEmptyValue}
 	filter := &fwpmFilter0{
-		filterKey:     filterKey,
-		displayData:   fwpmDisplayData0{name: filterName},
+		filterKey:   filterKey,
+		displayData: fwpmDisplayData0{name: filterName},
+		// Clear action right (hard/veto permit) so explicit process permits in
+		// our 0xFFFF sublayer override ApplyUdpBlock's lower-weight 0x8000 block sublayer.
+		flags:         fwpmFilterFlagClearActionRight,
 		layerKey:      fwpmLayerALEAuthConnectV4,
 		sublayerKey:   globalWfpBypass.sublayerKey,
 		weight:        weight,
-		numConditions: 1,
-		conditions:    &condition,
+		numConditions: numConditions,
+		conditions:    &conditions[0],
 		action:        fwpmAction0{actionType: fwpActionPermit},
 	}
 	var filterId uint64
 	r, _, _ := procFwpmFilterAdd0.Call(globalWfpBypass.engine, uintptr(unsafe.Pointer(filter)), 0, uintptr(unsafe.Pointer(&filterId)))
 	if r != 0 {
-		return fmt.Errorf("FwpmFilterAdd0 failed for %q: 0x%08x", exePath, r)
+		return fmt.Errorf("FwpmFilterAdd0 failed for %q (%s): 0x%08x", exePath, protoLabel, r)
 	}
 	globalWfpBypass.filterKeys = append(globalWfpBypass.filterKeys, filterKey)
-	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: added permit for %v (filterId=%d)"), filepath.Base(exePath), filterId)
+	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: added %s permit for %v (filterId=%d)"), protoLabel, filepath.Base(exePath), filterId)
 	return nil
 }
 
 func CloseWfpBypass() {
+	wfpBypassMu.Lock()
+	defer wfpBypassMu.Unlock()
+	closeWfpBypassLocked()
+}
+
+func closeWfpBypassLocked() {
 	if globalWfpBypass == nil {
 		return
 	}
-	globalWfpBypass.mu.Lock()
-	defer globalWfpBypass.mu.Unlock()
 	for _, key := range globalWfpBypass.filterKeys {
 		k := key
 		procFwpmFilterDeleteByKey0.Call(globalWfpBypass.engine, uintptr(unsafe.Pointer(&k)))
@@ -228,7 +296,7 @@ func CloseWfpBypass() {
 	procFwpmEngineClose0.Call(globalWfpBypass.engine)
 	globalWfpBypass.filterKeys = nil
 	globalWfpBypass = nil
-	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: closed"))
+	log.Infoln("%s", log.FormatLog(log.ExecutorPrefix, "WFP bypass: closed"))
 }
 
 type WfpUdpBlock struct {
@@ -342,7 +410,7 @@ func CloseUdpBlock() {
 
 	procFwpmEngineClose0.Call(globalWfpUdpBlock.engine)
 	globalWfpUdpBlock = nil
-	log.Infoln(log.FormatLog(log.ExecutorPrefix, "WFP UDP block: closed"))
+	log.Infoln("%s", log.FormatLog(log.ExecutorPrefix, "WFP UDP block: closed"))
 }
 
 // IsUdpBlockActive reports whether the dynamic WFP UDP block is currently applied.
@@ -357,43 +425,61 @@ func ApplyProcessBypasses() {
 	if err != nil {
 		return
 	}
-	var processes []string
-	processes = append(processes, rawConfig.Setting.BypassProcesses...)
-	for _, raw := range rawConfig.Rules {
-		raw = strings.TrimSpace(raw)
-		if raw == "" || strings.HasPrefix(raw, "#") {
-			continue
-		}
-		parts := strings.SplitN(raw, ",", 4)
-		if len(parts) < 3 {
-			continue
-		}
-		ruleType := strings.ToUpper(strings.TrimSpace(parts[0]))
-		payload := strings.TrimSpace(parts[1])
-		policy := strings.ToUpper(strings.TrimSpace(parts[2]))
-		if ruleType != string(constants.RuleProcess) || policy != string(constants.PolicyDirect) {
-			continue
-		}
-		processes = append(processes, payload)
-	}
-	if len(processes) == 0 {
+	effective := configuration.EffectiveRulesFrom(rawConfig)
+	entries := collectProcessBypasses(rawConfig, effective)
+
+	wfpBypassMu.Lock()
+	defer wfpBypassMu.Unlock()
+
+	// Tear down any previous WFP bypass filters so repeated calls are idempotent
+	// and deleting all bypass entries removes stale permits.
+	closeWfpBypassLocked()
+	if len(entries) == 0 {
 		return
 	}
-	if err := InitWfpBypass(); err != nil {
+
+	// Resolve process names to executable paths and deduplicate on (exePath, protocol),
+	// dropping narrower protocol entries when an Any entry resolves to the same binary.
+	type resolvedEntry struct {
+		exePath  string
+		protocol constants.RuleProtocol
+	}
+	var resolved []resolvedEntry
+	hasAnyPath := make(map[string]bool)
+	for _, entry := range entries {
+		exePath := resolveProcessPath(entry.Process)
+		if exePath == "" {
+			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), entry.Process)
+			continue
+		}
+		if entry.Protocol == constants.RuleProtocolAny {
+			hasAnyPath[strings.ToLower(exePath)] = true
+		}
+		resolved = append(resolved, resolvedEntry{exePath: exePath, protocol: entry.Protocol})
+	}
+	if len(resolved) == 0 {
+		return
+	}
+	if err := initWfpBypassLocked(); err != nil {
 		log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass init failed: %v"), err)
 		return
 	}
-	for _, proc := range processes {
-		proc = strings.TrimSpace(proc)
-		if proc == "" {
+	type pathProtoKey struct {
+		path  string
+		proto constants.RuleProtocol
+	}
+	seen := make(map[pathProtoKey]bool)
+	for _, item := range resolved {
+		lowerPath := strings.ToLower(item.exePath)
+		if item.protocol != constants.RuleProtocolAny && hasAnyPath[lowerPath] {
 			continue
 		}
-		exePath := resolveProcessPath(proc)
-		if exePath == "" {
-			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: could not resolve path for %q"), proc)
+		k := pathProtoKey{path: lowerPath, proto: item.protocol}
+		if seen[k] {
 			continue
 		}
-		if err := AddProcessBypass(exePath); err != nil {
+		seen[k] = true
+		if err := addProcessBypassWithProtocolLocked(item.exePath, item.protocol); err != nil {
 			log.Warnln(log.FormatLog(log.ExecutorPrefix, "WFP bypass: %v"), err)
 		}
 	}

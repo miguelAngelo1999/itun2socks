@@ -16,6 +16,7 @@ package configuration
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,7 +79,13 @@ func EffectiveRules() ([]RuleItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	return effectiveFrom(c), nil
+	return EffectiveRulesFrom(c), nil
+}
+
+// EffectiveRulesFrom returns the rules to evaluate for a single Config snapshot,
+// in evaluation order, excluding disabled rules, disabled groups, and broken rules.
+func EffectiveRulesFrom(c Config) []RuleItem {
+	return effectiveFrom(c)
 }
 
 // DirectBypassEntries returns OS-proxy "exception list" patterns derived from
@@ -105,6 +112,14 @@ func DirectBypassEntries() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return DirectBypassEntriesFrom(c), nil
+}
+
+// DirectBypassEntriesFrom computes OS-proxy exception patterns from a single
+// Config snapshot, honoring rule evaluation order and skipping protocol-scoped,
+// compound, or shadowed DIRECT rules so earlier REJECT/PROXY rules cannot be
+// bypassed by the OS proxy exception list.
+func DirectBypassEntriesFrom(c Config) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(s string) {
@@ -115,29 +130,154 @@ func DirectBypassEntries() ([]string, error) {
 		seen[strings.ToLower(s)] = true
 		out = append(out, s)
 	}
+
+	var blockingCidrs []netip.Prefix
+	var blockingDomains []string
+	var blockingSuffixes []string
+	var blockingKeywords []string
+	hasBlockingDomainRegex := false
+
+	isShadowedCidr := func(val string) bool {
+		pfx, ok := parseNormalizedPrefix(val)
+		if !ok {
+			return false
+		}
+		for _, b := range blockingCidrs {
+			if b.Overlaps(pfx) {
+				return true
+			}
+		}
+		return false
+	}
+
+	isShadowedDomain := func(ruleType, val string) bool {
+		if hasBlockingDomainRegex {
+			return true
+		}
+		v := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(val), "."))
+		if v == "" {
+			return false
+		}
+		switch ruleType {
+		case string(constants.RuleDomain):
+			for _, d := range blockingDomains {
+				if v == d {
+					return true
+				}
+			}
+			for _, s := range blockingSuffixes {
+				if v == s || strings.HasSuffix(v, "."+s) {
+					return true
+				}
+			}
+			for _, k := range blockingKeywords {
+				if strings.Contains(v, k) {
+					return true
+				}
+			}
+		case string(constants.RuleDomainSuffix):
+			for _, d := range blockingDomains {
+				if d == v || strings.HasSuffix(d, "."+v) {
+					return true
+				}
+			}
+			for _, s := range blockingSuffixes {
+				if v == s || strings.HasSuffix(v, "."+s) || strings.HasSuffix(s, "."+v) {
+					return true
+				}
+			}
+			for _, k := range blockingKeywords {
+				if strings.Contains(v, k) || strings.Contains(k, v) {
+					return true
+				}
+			}
+		case string(constants.RuleDomainKeyword):
+			// Any earlier non-DIRECT domain/suffix/keyword could match a host
+			// containing this keyword, so be fail-closed if any exist.
+			if len(blockingDomains) > 0 || len(blockingSuffixes) > 0 || len(blockingKeywords) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+
 	for _, r := range effectiveFrom(c) {
 		if r.Policy.Kind != PolicyKindDirect {
+			for _, cond := range r.Conditions {
+				val := strings.TrimSpace(cond.Value)
+				if val == "" {
+					continue
+				}
+				switch strings.ToUpper(strings.TrimSpace(cond.Type)) {
+				case string(constants.RuleIpCidr):
+					if pfx, ok := parseNormalizedPrefix(val); ok {
+						blockingCidrs = append(blockingCidrs, pfx)
+					}
+				case string(constants.RuleDomain):
+					blockingDomains = append(blockingDomains, strings.ToLower(val))
+				case string(constants.RuleDomainSuffix):
+					blockingSuffixes = append(blockingSuffixes, strings.ToLower(strings.TrimPrefix(val, ".")))
+				case string(constants.RuleDomainKeyword):
+					blockingKeywords = append(blockingKeywords, strings.ToLower(val))
+				case string(constants.RuleDomainRegex):
+					hasBlockingDomainRegex = true
+				}
+			}
 			continue
 		}
-		for _, cond := range r.Conditions {
-			val := strings.TrimSpace(cond.Value)
-			if val == "" {
+
+		// Skip protocol-scoped rules (tcp/udp) and compound multi-condition rules
+		// so the OS HTTP proxy exception list does not over-broaden them.
+		if strings.TrimSpace(r.Network) != "" || len(r.Conditions) != 1 {
+			continue
+		}
+
+		cond := r.Conditions[0]
+		val := strings.TrimSpace(cond.Value)
+		if val == "" {
+			continue
+		}
+		condType := strings.ToUpper(strings.TrimSpace(cond.Type))
+		switch condType {
+		case string(constants.RuleIpCidr):
+			if isShadowedCidr(val) {
 				continue
 			}
-			switch strings.ToUpper(cond.Type) {
-			case string(constants.RuleIpCidr):
-				add(cidrToBypass(val))
-			case string(constants.RuleDomain):
-				add(val)
-			case string(constants.RuleDomainSuffix):
-				add("*." + strings.TrimPrefix(val, "."))
-				add(strings.TrimPrefix(val, "."))
-			case string(constants.RuleDomainKeyword):
-				add("*" + val + "*")
+			add(cidrToBypass(val))
+		case string(constants.RuleDomain):
+			if isShadowedDomain(condType, val) {
+				continue
 			}
+			add(val)
+		case string(constants.RuleDomainSuffix):
+			if isShadowedDomain(condType, val) {
+				continue
+			}
+			add("*." + strings.TrimPrefix(val, "."))
+			add(strings.TrimPrefix(val, "."))
+		case string(constants.RuleDomainKeyword):
+			if isShadowedDomain(condType, val) {
+				continue
+			}
+			add("*" + val + "*")
 		}
 	}
-	return out, nil
+	return out
+}
+
+func parseNormalizedPrefix(raw string) (netip.Prefix, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return netip.Prefix{}, false
+	}
+	if addr, err := netip.ParseAddr(raw); err == nil {
+		return netip.PrefixFrom(addr, addr.BitLen()), true
+	}
+	pfx, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return netip.Prefix{}, false
+	}
+	return pfx.Masked(), true
 }
 
 // cidrToBypass converts an IP-CIDR to a proxy-bypass wildcard. For common /8,

@@ -1324,10 +1324,8 @@ func defaultApplyCorporateMode(proxyID string, closeExisting bool) error {
 	}
 
 	if manager.GetIsStarted() {
-		conn.UpdateProxy(proxy)
-		if id, ok := rawProxy["id"].(string); ok && id != "" {
-			conn.UpdateSelectedProxyId(id)
-		}
+		id, _ := rawProxy["id"].(string)
+		conn.UpdateProxyWithId(proxy, id)
 		if _, err := executor.UpdateRule(); err != nil {
 			return err
 		}

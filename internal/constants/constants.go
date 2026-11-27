@@ -1,5 +1,7 @@
 package constants
 
+import "strings"
+
 // Policy is the routing outcome of a rule.
 //
 // The three constants below are built in. A Policy may also carry the id of a
@@ -37,10 +39,10 @@ const (
 // Unrecognised input yields RuleProtocolAny so an unknown value widens the
 // rule rather than silently disabling it.
 func ParseRuleProtocol(s string) RuleProtocol {
-	switch s {
-	case "tcp", "TCP":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "tcp":
 		return RuleProtocolTCP
-	case "udp", "UDP":
+	case "udp":
 		return RuleProtocolUDP
 	default:
 		return RuleProtocolAny

@@ -37,9 +37,7 @@ func RejectQuicMather(metadata *C.Metadata, prevRule rule_engine.Rule) (rule_eng
 	return nil, fmt.Errorf("not quic")
 }
 
-func UpdateProxy(remoteProxy C.Proxy) {
-	mux.Lock()
-	defer mux.Unlock()
+func setProxyLocked(remoteProxy C.Proxy) {
 	named := make(map[constants.Policy]C.Proxy, len(namedProxies))
 	for k, v := range namedProxies {
 		named[k] = v
@@ -48,6 +46,22 @@ func UpdateProxy(remoteProxy C.Proxy) {
 	proxies[constants.PolicyProxy] = remoteProxy
 	proxies[constants.PolicyDirect] = adapter.NewProxy(outbound.NewDirect())
 	proxies[constants.PolicyReject] = adapter.NewProxy(outbound.NewReject())
+}
+
+func UpdateProxy(remoteProxy C.Proxy) {
+	mux.Lock()
+	defer mux.Unlock()
+	setProxyLocked(remoteProxy)
+}
+
+// UpdateProxyWithId atomically updates both the active remote proxy dialer and
+// selectedProxyId under a single lock so NewTcpConn cannot observe a new dialer
+// paired with a stale proxy ID (or vice versa).
+func UpdateProxyWithId(remoteProxy C.Proxy, id string) {
+	mux.Lock()
+	defer mux.Unlock()
+	setProxyLocked(remoteProxy)
+	selectedProxyId = id
 }
 
 // selectedProxyId is the id of the currently selected proxy, so per-proxy PAC

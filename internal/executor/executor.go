@@ -217,7 +217,7 @@ func newTun(isLocalServerEnabled bool) (*TunClient, error) {
 	conn.UpdateConnMatcher(matchers)
 	conn.UpdateIsFakeIpEnabled(config.FakeIp)
 	updateNamedProxies()
-	conn.UpdateProxy(config.Proxy)
+	conn.UpdateProxyWithId(config.Proxy, rawConfig.Selected.Proxy)
 
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())
 	dns.UpdateDnsMap(config.Rule.Dns.Local.Client, config.Rule.Dns.Remote.Client)
@@ -252,7 +252,7 @@ func newSysProxy() (*SystemProxyClient, error) {
 		config.Rule.ConnMatcher,
 	})
 	updateNamedProxies()
-	conn.UpdateProxy(config.Proxy)
+	conn.UpdateProxyWithId(config.Proxy, rawConfig.Selected.Proxy)
 	log.Infoln(log.FormatLog(log.ExecutorPrefix, "set proxy: %v"), config.Proxy.Name())
 	_, err = UpdateRule()
 	if err != nil {

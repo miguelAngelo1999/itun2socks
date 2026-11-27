@@ -109,7 +109,7 @@ func addSubscription(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, NewError(err.Error()))
 			return
 		}
-		conn.UpdateProxy(proxy)
+		conn.UpdateProxyWithId(proxy, rawConfig.Selected.Proxy)
 	}
 	render.JSON(w, r, render.M{"proxies": newProxies, "subscriptions": newSubscriptions})
 }
