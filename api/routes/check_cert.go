@@ -2,6 +2,7 @@ package routes
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
@@ -25,6 +26,8 @@ import (
 
 	"github.com/go-chi/render"
 	"github.com/igoogolx/itun2socks/internal/constants"
+	"github.com/igoogolx/itun2socks/internal/pac"
+	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
 
@@ -42,15 +45,20 @@ func AddExtraRoot(pemBytes []byte) {
 }
 
 // CertCheckResult describes the TLS interceptor (if any) seen through a proxy.
+// Intercepted is true ONLY when an UNTRUSTED MITM CA is detected (so the UI
+// prompts the user to trust it). BumpDetected is true whenever SSL interception
+// is present — whether untrusted OR already trusted in the OS root store — so
+// the UI can still extract the organization name from Issuer cleanly.
 type CertCheckResult struct {
-	Intercepted bool   `json:"intercepted"`
-	Issuer      string `json:"issuer"`
-	Subject     string `json:"subject"`
-	NotBefore   string `json:"notBefore"`
-	NotAfter    string `json:"notAfter"`
-	SHA256      string `json:"sha256"`
-	PEM         string `json:"pem"`
-	Error       string `json:"error,omitempty"`
+	Intercepted  bool   `json:"intercepted"`
+	BumpDetected bool   `json:"bumpDetected"`
+	Issuer       string `json:"issuer"`
+	Subject      string `json:"subject"`
+	NotBefore    string `json:"notBefore"`
+	NotAfter     string `json:"notAfter"`
+	SHA256       string `json:"sha256"`
+	PEM          string `json:"pem"`
+	Error        string `json:"error,omitempty"`
 }
 
 // toLatin1UTF8 re-decodes a string that contains raw Latin-1 bytes as proper UTF-8.
@@ -261,7 +269,13 @@ func checkCert(w http.ResponseWriter, r *http.Request) {
 
 	var lastErr string
 	for _, target := range targets {
-		result := probeCert(proxyAddr, target, req.Username, req.Password)
+		result, dialFailed := probeCert(proxyAddr, target, req.Username, req.Password)
+		if dialFailed {
+			// Proxy TCP address itself is unreachable on all interfaces — no point
+			// repeating the same timeout across 4 targets.
+			lastErr = "connection failed"
+			break
+		}
 		if result == nil {
 			lastErr = "connection failed"
 			continue
@@ -318,12 +332,99 @@ func fetchRootCA(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dialProxyReachable connects to proxyAddr, trying the OS default route first
+// and falling back to active non-TUN physical interfaces in parallel (e.g. a
+// multi-homed laptop with Ethernet as default route plus corporate Wi-Fi where
+// the detected proxy lives).
+func dialProxyReachable(proxyAddr string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2500*time.Millisecond)
+	if err == nil {
+		return conn, nil
+	}
+
+	ifaces, ifErr := net.Interfaces()
+	if ifErr != nil {
+		return nil, err
+	}
+
+	var candidates []string
+	for _, nif := range ifaces {
+		if nif.Flags&net.FlagUp == 0 || nif.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if pac.IsExcludedTunIface(nif.Name) || strings.HasPrefix(nif.Name, "bridge") {
+			continue
+		}
+		// Only try interfaces with a real non-loopback IPv4 address.
+		addrs, _ := nif.Addrs()
+		hasV4 := false
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok {
+				ip4 := ipn.IP.To4()
+				if ip4 != nil && !ip4.IsLoopback() && !(ip4[0] == 10 && ip4[1] == 255) && !(ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)) {
+					hasV4 = true
+					break
+				}
+			}
+		}
+		if hasV4 {
+			candidates = append(candidates, nif.Name)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+
+	type dialRes struct {
+		c net.Conn
+	}
+	ch := make(chan dialRes, len(candidates))
+	var wg sync.WaitGroup
+	for _, name := range candidates {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, dErr := dialer.DialContext(ctx, "tcp4", proxyAddr, dialer.WithInterface(name))
+			if dErr == nil && c != nil {
+				select {
+				case ch <- dialRes{c: c}:
+					cancel()
+				default:
+					_ = c.Close()
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	if res, ok := <-ch; ok && res.c != nil {
+		// Drain any duplicate winner cleanly.
+		go func() {
+			for extra := range ch {
+				if extra.c != nil {
+					_ = extra.c.Close()
+				}
+			}
+		}()
+		return res.c, nil
+	}
+	return nil, err
+}
+
 // probeCert connects through a proxy to testHost and checks if the cert is MITM'd.
-// Returns nil if the connection failed (so caller can try next host).
-func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult {
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+// Returns (nil, true) if TCP connection to the proxy itself failed, or (nil, false)
+// if this specific testHost failed and another target should be tried.
+func probeCert(proxyAddr, testHost, username, password string) (*CertCheckResult, bool) {
+	conn, err := dialProxyReachable(proxyAddr)
 	if err != nil {
-		return nil
+		return nil, true
 	}
 	defer conn.Close()
 
@@ -340,19 +441,19 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 	connectReq += "\r\n"
 
 	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		return nil
+		return nil, false
 	}
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return &CertCheckResult{Error: fmt.Sprintf("proxy returned %d", resp.StatusCode)}
+		return &CertCheckResult{Error: fmt.Sprintf("proxy returned %d", resp.StatusCode)}, false
 	}
 
 	conn.SetReadDeadline(time.Time{})
@@ -361,13 +462,13 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 		InsecureSkipVerify: true,
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		return nil
+		return nil, false
 	}
 	defer tlsConn.Close()
 
 	certs := tlsConn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
-		return nil
+		return nil, false
 	}
 
 	leaf := certs[0]
@@ -394,14 +495,20 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 		intermediates.AddCert(c)
 	}
 
-	_, verifyErr := leaf.Verify(x509.VerifyOptions{
+	verifiedChains, verifyErr := leaf.Verify(x509.VerifyOptions{
 		DNSName:       sni,
 		Roots:         systemRoots,
 		Intermediates: intermediates,
 	})
 
 	if verifyErr == nil {
-		return &CertCheckResult{Intercepted: false, Issuer: certIssuerName(leaf.Issuer), Subject: certIssuerName(leaf.Subject)}
+		bump := isTrustedBumpCert(leaf, verifiedChains, intermediates, sni)
+		return &CertCheckResult{
+			Intercepted:  false,
+			BumpDetected: bump,
+			Issuer:       certIssuerName(leaf.Issuer),
+			Subject:      certIssuerName(leaf.Subject),
+		}, false
 	}
 
 	// Leaf verification failed — attempt direct CA retrieval from upstream proxy host
@@ -419,23 +526,25 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 			log.Infoln("[check-cert] Root CA (%s) is already installed in system store", directCA.Subject.CommonName)
 			AddExtraRoot(directPEM)
 			return &CertCheckResult{
-				Intercepted: false,
-				Issuer:      certIssuerName(directCA.Issuer),
-				Subject:     certIssuerName(directCA.Subject),
-			}
+				Intercepted:  false,
+				BumpDetected: true,
+				Issuer:       certIssuerName(directCA.Issuer),
+				Subject:      certIssuerName(directCA.Subject),
+			}, false
 		}
 
 		fingerprint := sha256.Sum256(directCA.Raw)
 		log.Infoln("[check-cert] Untrusted root CA detected via direct HTTP endpoint: %s", directCA.Subject.CommonName)
 		return &CertCheckResult{
-			Intercepted: true,
-			Issuer:      certIssuerName(directCA.Issuer),
-			Subject:     certIssuerName(directCA.Subject),
-			NotBefore:   directCA.NotBefore.Format("2006-01-02"),
-			NotAfter:    directCA.NotAfter.Format("2006-01-02"),
-			SHA256:      fmt.Sprintf("%x", fingerprint),
-			PEM:         string(directPEM),
-		}
+			Intercepted:  true,
+			BumpDetected: true,
+			Issuer:       certIssuerName(directCA.Issuer),
+			Subject:      certIssuerName(directCA.Subject),
+			NotBefore:    directCA.NotBefore.Format("2006-01-02"),
+			NotAfter:     directCA.NotAfter.Format("2006-01-02"),
+			SHA256:       fmt.Sprintf("%x", fingerprint),
+			PEM:          string(directPEM),
+		}, false
 	}
 
 	// Fallback 2: Proxy only exposes cert via TLS intercept (extract from handshake)
@@ -452,10 +561,11 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 		pemBlock := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuingCA.Raw})
 		AddExtraRoot(pemBlock)
 		return &CertCheckResult{
-			Intercepted: false,
-			Issuer:      certIssuerName(issuingCA.Issuer),
-			Subject:     certIssuerName(issuingCA.Subject),
-		}
+			Intercepted:  false,
+			BumpDetected: true,
+			Issuer:       certIssuerName(issuingCA.Issuer),
+			Subject:      certIssuerName(issuingCA.Subject),
+		}, false
 	}
 
 	pemBlock := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuingCA.Raw})
@@ -464,12 +574,13 @@ func probeCert(proxyAddr, testHost, username, password string) *CertCheckResult 
 	log.Infoln("[check-cert] Direct CA fetch failed (%v); MITM detected via %s TLS handshake: issuer=%s", err, testHost, issuingCA.Issuer.CommonName)
 
 	return &CertCheckResult{
-		Intercepted: true,
-		Issuer:      certIssuerName(issuingCA.Issuer),
-		Subject:     certIssuerName(issuingCA.Subject),
-		NotBefore:   issuingCA.NotBefore.Format("2006-01-02"),
-		NotAfter:    issuingCA.NotAfter.Format("2006-01-02"),
-		SHA256:      fmt.Sprintf("%x", fingerprint),
-		PEM:         string(pemBlock),
-	}
+		Intercepted:  true,
+		BumpDetected: true,
+		Issuer:       certIssuerName(issuingCA.Issuer),
+		Subject:      certIssuerName(issuingCA.Subject),
+		NotBefore:    issuingCA.NotBefore.Format("2006-01-02"),
+		NotAfter:     issuingCA.NotAfter.Format("2006-01-02"),
+		SHA256:       fmt.Sprintf("%x", fingerprint),
+		PEM:          string(pemBlock),
+	}, false
 }
