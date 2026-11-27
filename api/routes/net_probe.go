@@ -30,29 +30,38 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/igoogolx/itun2socks/internal/constants"
 	"github.com/igoogolx/itun2socks/internal/manager"
 	"github.com/igoogolx/itun2socks/internal/pac"
 	"github.com/igoogolx/itun2socks/pkg/clash/component/dialer"
 	"github.com/igoogolx/itun2socks/pkg/log"
 	"github.com/igoogolx/itun2socks/pkg/network_iface"
+	"os"
+	"path/filepath"
 )
 
 const (
 	probeConnectHost     = "captive.apple.com:443"
 	probeConnectHostName = "captive.apple.com"
+	healthCheckHost      = "www.gstatic.com:443"
+	healthCheckHostName  = "www.gstatic.com"
+	healthCheckPath      = "/generate_204"
 	probeDirectIP        = "1.1.1.1:443"
 	probeDirectTLSName   = "1.1.1.1"
 	probeTimeout         = 3 * time.Second
+	healthProbeTimeout   = 5 * time.Second
 	probeTLSTimeout      = 1500 * time.Millisecond
 
 	// OS-native captive portal URLs — same ones the OS uses internally.
@@ -213,27 +222,45 @@ func dialProxyBypassTun(ctx context.Context, addr string) (net.Conn, error) {
 
 // ProbeResult holds the outcome of probing one proxy.
 type ProbeResult struct {
-	ProxyID string
-	Alive   bool
-	Latency time.Duration
-	Err     error
+	ProxyID      string
+	Alive        bool
+	AuthRequired bool // true when proxy returned 407 / SOCKS5 auth rejection
+	Latency      time.Duration
+	Err          error
 }
 
-// probeProxy tests a proxy via HTTP CONNECT.
+// probeProxy tests an HTTP proxy via HTTP CONNECT (reachability probe).
 // Returns Alive=true for:
 //   - 200 OK followed by a completed TLS handshake to captive.apple.com
 //     (accepts system-trusted certs and institutional SSL-bump UnknownAuthorityError,
 //     rejects plaintext HTTP splash pages, resets, and wrong-host certs).
-//   - 407 Proxy Authentication Required with a Proxy-Authenticate header.
+//   - 407 Proxy Authentication Required with a Proxy-Authenticate header
+//     (sets AuthRequired=true so Stay-Connected skips bad-credential backups
+//     while Home/Office still knows the corporate proxy is reachable).
 func probeProxy(host string, port int, username, password string) ProbeResult {
-	return probeProxyWithTLS(host, port, username, password, nil)
+	return probeHTTPProxy(host, port, username, password, nil, false)
 }
 
 func probeProxyWithTLS(host string, port int, username, password string, rootCAs *x509.CertPool) ProbeResult {
+	return probeHTTPProxy(host, port, username, password, rootCAs, false)
+}
+
+// probeHTTPProxy probes an HTTP proxy. When requireHTTP204 is true (Stay-Connected
+// health check), it completes an end-to-end HTTPS GET www.gstatic.com/generate_204
+// through the proxy and treats 407 as Alive=false, AuthRequired=true.
+func probeHTTPProxy(host string, port int, username, password string, rootCAs *x509.CertPool, requireHTTP204 bool) ProbeResult {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	start := time.Now()
+	timeout := probeTimeout
+	targetAddr := probeConnectHost
+	targetHost := probeConnectHostName
+	if requireHTTP204 {
+		timeout = healthProbeTimeout
+		targetAddr = healthCheckHost
+		targetHost = healthCheckHostName
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	c, err := dialProxyBypassTun(ctx, addr)
@@ -241,9 +268,9 @@ func probeProxyWithTLS(host string, port int, username, password string, rootCAs
 		return ProbeResult{Alive: false, Err: err}
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(probeTimeout))
+	_ = c.SetDeadline(time.Now().Add(timeout))
 
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", probeConnectHost, probeConnectHost)
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
 	if username != "" {
 		raw := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 		req += "Proxy-Authorization: Basic " + raw + "\r\n"
@@ -270,35 +297,20 @@ func probeProxyWithTLS(host string, port int, username, password string, rootCAs
 				Err:     fmt.Errorf("proxy returned 407 without Proxy-Authenticate header"),
 			}
 		}
-		return ProbeResult{Alive: true, Latency: latency}
+		if requireHTTP204 {
+			return ProbeResult{
+				Alive:        false,
+				AuthRequired: true,
+				Latency:      latency,
+				Err:          fmt.Errorf("proxy auth required (407)"),
+			}
+		}
+		return ProbeResult{Alive: true, AuthRequired: true, Latency: latency}
 	}
 
 	if resp.StatusCode == http.StatusOK {
-		// Verify the CONNECT tunnel actually speaks TLS for captive.apple.com,
-		// so a rogue hotel/gateway HTTP responder returning bare 200 OK cannot
-		// spoof a healthy corporate proxy.
 		tunnelConn := &bufferedConn{Conn: c, r: br}
-		tlsCfg := &tls.Config{
-			ServerName: probeConnectHostName,
-			RootCAs:    rootCAs,
-		}
-		tlsConn := tls.Client(tunnelConn, tlsCfg)
-		tlsErr := tlsConn.HandshakeContext(ctx)
-		if tlsErr == nil {
-			return ProbeResult{Alive: true, Latency: time.Since(start)}
-		}
-		// Corporate Squid SSL-bump proxies may present an institutional CA not
-		// yet installed in the OS root store; x509.UnknownAuthorityError still
-		// proves a real TLS handshake for the requested hostname took place.
-		var unknownAuth x509.UnknownAuthorityError
-		if errors.As(tlsErr, &unknownAuth) {
-			return ProbeResult{Alive: true, Latency: time.Since(start)}
-		}
-		return ProbeResult{
-			Alive:   false,
-			Latency: time.Since(start),
-			Err:     fmt.Errorf("CONNECT 200 TLS check failed: %w", tlsErr),
-		}
+		return verifyTunnelTLSAndOptional204(ctx, tunnelConn, targetHost, rootCAs, requireHTTP204, start)
 	}
 
 	return ProbeResult{
@@ -306,6 +318,329 @@ func probeProxyWithTLS(host string, port int, username, password string, rootCAs
 		Latency: latency,
 		Err:     fmt.Errorf("proxy returned %d", resp.StatusCode),
 	}
+}
+
+// probeSOCKS5Proxy probes a SOCKS5 proxy (RFC 1928 + optional RFC 1929 user/pass),
+// establishes a CONNECT tunnel to targetAddr, and verifies TLS (plus optional HTTP 204).
+func probeSOCKS5Proxy(host string, port int, username, password string, rootCAs *x509.CertPool, requireHTTP204 bool) ProbeResult {
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	start := time.Now()
+	timeout := probeTimeout
+	targetHost := probeConnectHostName
+	targetPort := uint16(443)
+	if requireHTTP204 {
+		timeout = healthProbeTimeout
+		targetHost = healthCheckHostName
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c, err := dialProxyBypassTun(ctx, addr)
+	if err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(timeout))
+
+	// 1. Greeting: no-auth (0x00), plus user/pass (0x02) if credentials provided.
+	var greet []byte
+	if username != "" || password != "" {
+		greet = []byte{0x05, 0x02, 0x00, 0x02}
+	} else {
+		greet = []byte{0x05, 0x01, 0x00}
+	}
+	if _, err := c.Write(greet); err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+	var methodResp [2]byte
+	if _, err := io.ReadFull(c, methodResp[:]); err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+	if methodResp[0] != 0x05 {
+		return ProbeResult{Alive: false, Err: fmt.Errorf("not a SOCKS5 server")}
+	}
+	switch methodResp[1] {
+	case 0x00:
+		// No auth needed
+	case 0x02:
+		if len(username) > 255 || len(password) > 255 {
+			return ProbeResult{Alive: false, AuthRequired: true, Err: fmt.Errorf("credentials too long")}
+		}
+		authReq := make([]byte, 0, 3+len(username)+len(password))
+		authReq = append(authReq, 0x01, byte(len(username)))
+		authReq = append(authReq, username...)
+		authReq = append(authReq, byte(len(password)))
+		authReq = append(authReq, password...)
+		if _, err := c.Write(authReq); err != nil {
+			return ProbeResult{Alive: false, Err: err}
+		}
+		var authResp [2]byte
+		if _, err := io.ReadFull(c, authResp[:]); err != nil {
+			return ProbeResult{Alive: false, Err: err}
+		}
+		if authResp[1] != 0x00 {
+			return ProbeResult{
+				Alive:        !requireHTTP204,
+				AuthRequired: true,
+				Latency:      time.Since(start),
+				Err:          fmt.Errorf("SOCKS5 authentication failed"),
+			}
+		}
+	case 0xFF:
+		return ProbeResult{
+			Alive:        !requireHTTP204,
+			AuthRequired: true,
+			Latency:      time.Since(start),
+			Err:          fmt.Errorf("SOCKS5 requires authentication"),
+		}
+	default:
+		return ProbeResult{Alive: false, Err: fmt.Errorf("unsupported SOCKS5 auth method %d", methodResp[1])}
+	}
+
+	// 2. CONNECT request (ATYP=0x03 domain name)
+	req := make([]byte, 0, 7+len(targetHost))
+	req = append(req, 0x05, 0x01, 0x00, 0x03, byte(len(targetHost)))
+	req = append(req, targetHost...)
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], targetPort)
+	req = append(req, portBuf[:]...)
+	if _, err := c.Write(req); err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+
+	var hdr [4]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+	if hdr[0] != 0x05 || hdr[1] != 0x00 {
+		return ProbeResult{Alive: false, Latency: time.Since(start), Err: fmt.Errorf("SOCKS5 CONNECT failed: code %d", hdr[1])}
+	}
+	// Drain bound address + port
+	var skip int
+	switch hdr[3] {
+	case 0x01:
+		skip = 4 + 2
+	case 0x04:
+		skip = 16 + 2
+	case 0x03:
+		var l [1]byte
+		if _, err := io.ReadFull(c, l[:]); err != nil {
+			return ProbeResult{Alive: false, Err: err}
+		}
+		skip = int(l[0]) + 2
+	default:
+		return ProbeResult{Alive: false, Err: fmt.Errorf("invalid SOCKS5 ATYP %d", hdr[3])}
+	}
+	if _, err := io.CopyN(io.Discard, c, int64(skip)); err != nil {
+		return ProbeResult{Alive: false, Err: err}
+	}
+
+	return verifyTunnelTLSAndOptional204(ctx, c, targetHost, rootCAs, requireHTTP204, start)
+}
+
+// buildVerifyRootPool returns OS system roots plus any Lux-installed corporate
+// CA certificates (in-memory extraRootsPEM and proxy_ca_bundle.pem on disk).
+func buildVerifyRootPool() *x509.CertPool {
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	extraRootsMu.RLock()
+	if len(extraRootsPEM) > 0 {
+		roots.AppendCertsFromPEM(extraRootsPEM)
+	}
+	extraRootsMu.RUnlock()
+	if bundlePath := filepath.Join(constants.Path.HomeDir(), "proxy_ca_bundle.pem"); bundlePath != "" {
+		if data, err := os.ReadFile(bundlePath); err == nil && len(data) > 0 {
+			roots.AppendCertsFromPEM(data)
+		}
+	}
+	return roots
+}
+
+// verifyTunnelTLSAndOptional204 validates TLS through an established proxy tunnel
+// and, when requireHTTP204 is true, performs GET /generate_204 to prove real
+// upstream internet connectivity.
+func verifyTunnelTLSAndOptional204(
+	ctx context.Context,
+	tunnelConn net.Conn,
+	targetHost string,
+	rootCAs *x509.CertPool,
+	requireHTTP204 bool,
+	start time.Time,
+) ProbeResult {
+	roots := rootCAs
+	if roots == nil {
+		roots = buildVerifyRootPool()
+	}
+	tlsCfg := &tls.Config{
+		ServerName: targetHost,
+		RootCAs:    roots,
+	}
+	tlsConn := tls.Client(tunnelConn, tlsCfg)
+	tlsErr := tlsConn.HandshakeContext(ctx)
+	if tlsErr != nil {
+		// Corporate Squid SSL-bump proxies may present an institutional CA not
+		// yet installed in the OS root store; x509.UnknownAuthorityError still
+		// proves a real TLS handshake for the requested hostname took place.
+		var unknownAuth x509.UnknownAuthorityError
+		if !errors.As(tlsErr, &unknownAuth) {
+			return ProbeResult{
+				Alive:   false,
+				Latency: time.Since(start),
+				Err:     fmt.Errorf("tunnel TLS check failed: %w", tlsErr),
+			}
+		}
+		// If we need HTTP 204 through an untrusted bump cert, the handshake above
+		// already failed; treat as unreachable unless we retry with SkipVerify
+		// only after proving UnknownAuthorityError.
+		if requireHTTP204 {
+			return ProbeResult{
+				Alive:   false,
+				Latency: time.Since(start),
+				Err:     fmt.Errorf("tunnel TLS untrusted CA on health check: %w", tlsErr),
+			}
+		}
+		return ProbeResult{Alive: true, Latency: time.Since(start)}
+	}
+
+	if !requireHTTP204 {
+		return ProbeResult{Alive: true, Latency: time.Since(start)}
+	}
+
+	// End-to-end HTTP GET /generate_204 through the verified TLS tunnel.
+	httpReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Lux-Health/1.0\r\nConnection: close\r\n\r\n",
+		healthCheckPath, targetHost)
+	if _, err := tlsConn.Write([]byte(httpReq)); err != nil {
+		return ProbeResult{Alive: false, Latency: time.Since(start), Err: fmt.Errorf("health GET write: %w", err)}
+	}
+	hResp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		return ProbeResult{Alive: false, Latency: time.Since(start), Err: fmt.Errorf("health GET read: %w", err)}
+	}
+	hResp.Body.Close()
+	if hResp.StatusCode == http.StatusNoContent || hResp.StatusCode == http.StatusOK {
+		return ProbeResult{Alive: true, Latency: time.Since(start)}
+	}
+	return ProbeResult{
+		Alive:   false,
+		Latency: time.Since(start),
+		Err:     fmt.Errorf("health GET returned HTTP %d", hResp.StatusCode),
+	}
+}
+
+// probePACOnlyProxy evaluates a PAC-only proxy (empty server + pacUrl) to
+// determine reachability or end-to-end health.
+//
+// Crucially, if the PAC script itself cannot be fetched/compiled (e.g. you left
+// the office network and http://wpad/wpad.dat is unreachable), this returns
+// Alive=false — giving Auto Home/Office an exact Office-vs-Home signal!
+func probePACOnlyProxy(cand ProxyCandidate, requireHTTP204 bool) ProbeResult {
+	start := time.Now()
+	probeHost := probeConnectHostName
+	probeURL := "https://" + probeConnectHostName + "/"
+	if requireHTTP204 {
+		probeHost = healthCheckHostName
+		probeURL = "https://" + healthCheckHostName + healthCheckPath
+	}
+
+	// Always verify fresh PAC reachability if not compiled or on network change:
+	// first check registry; if missing/uncompiled, try RetryCompile and direct Fetch.
+	directive, hasPAC, timedOut := pac.DefaultRegistry.EvalDirective(cand.ID, probeURL, probeHost)
+	if (!hasPAC || timedOut) && cand.PacURL != "" {
+		if pac.DefaultRegistry.RetryCompile(cand.ID) {
+			directive, hasPAC, timedOut = pac.DefaultRegistry.EvalDirective(cand.ID, probeURL, probeHost)
+		}
+		if (!hasPAC || timedOut) {
+			// Direct on-demand fetch + compile (bypasses RetryCompile 5s cooldown
+			// and works even if DefaultRegistry hasn't registered this ID yet).
+			js, err := pac.Fetch(cand.PacURL)
+			if err != nil {
+				return ProbeResult{
+					ProxyID: cand.ID,
+					Alive:   false,
+					Latency: time.Since(start),
+					Err:     fmt.Errorf("PAC unreachable (%s): %w", cand.PacURL, err),
+				}
+			}
+			compiled, err := pac.Compile(js)
+			if err != nil {
+				return ProbeResult{
+					ProxyID: cand.ID,
+					Alive:   false,
+					Latency: time.Since(start),
+					Err:     fmt.Errorf("PAC compile failed: %w", err),
+				}
+			}
+			directive, timedOut = compiled.EvalRaw(probeURL, probeHost)
+			hasPAC = true
+		}
+	}
+	if !hasPAC || timedOut {
+		return ProbeResult{
+			ProxyID: cand.ID,
+			Alive:   false,
+			Latency: time.Since(start),
+			Err:     fmt.Errorf("PAC script unavailable for proxy %s", cand.ID),
+		}
+	}
+
+	directives := pac.ParseDirectives(directive)
+	if len(directives) == 0 {
+		return ProbeResult{ProxyID: cand.ID, Alive: false, Latency: time.Since(start), Err: fmt.Errorf("PAC returned no directives")}
+	}
+
+	var lastErr error
+	for _, d := range directives {
+		if d.IsDirect() {
+			// PAC server is reachable AND explicitly directs this host DIRECT:
+			// verify internet actually works directly.
+			dr := probeDirect()
+			if dr.State == directOK {
+				return ProbeResult{ProxyID: cand.ID, Alive: true, Latency: time.Since(start)}
+			}
+			lastErr = fmt.Errorf("PAC directive DIRECT but direct probe=%s", dr.State)
+			continue
+		}
+		portNum, err := strconv.Atoi(d.Port)
+		if err != nil || d.Host == "" || portNum <= 0 {
+			continue
+		}
+		var res ProbeResult
+		if d.Scheme == "socks5" {
+			res = probeSOCKS5Proxy(d.Host, portNum, cand.Username, cand.Password, nil, requireHTTP204)
+		} else {
+			res = probeHTTPProxy(d.Host, portNum, cand.Username, cand.Password, nil, requireHTTP204)
+		}
+		res.ProxyID = cand.ID
+		if res.Alive || res.AuthRequired {
+			return res
+		}
+		lastErr = res.Err
+	}
+
+	return ProbeResult{ProxyID: cand.ID, Alive: false, Latency: time.Since(start), Err: lastErr}
+}
+
+// probeCandidate probes a single ProxyCandidate (HTTP, SOCKS5, or PAC-only).
+func probeCandidate(cand ProxyCandidate, requireHTTP204 bool) ProbeResult {
+	var r ProbeResult
+	if cand.Host == "" && cand.PacURL != "" {
+		r = probePACOnlyProxy(cand, requireHTTP204)
+	} else if strings.EqualFold(cand.Type, "socks5") || strings.EqualFold(cand.Type, "socks") {
+		r = probeSOCKS5Proxy(cand.Host, cand.Port, cand.Username, cand.Password, nil, requireHTTP204)
+	} else {
+		r = probeHTTPProxy(cand.Host, cand.Port, cand.Username, cand.Password, nil, requireHTTP204)
+	}
+	r.ProxyID = cand.ID
+	return r
+}
+
+// probeProxyHealth performs a real end-to-end internet check (GET /generate_204
+// through the proxy) used by Stay-Connected failover.
+func probeProxyHealth(cand ProxyCandidate) ProbeResult {
+	return probeCandidate(cand, true)
 }
 
 // bufferedConn wraps a net.Conn with any bytes already buffered by bufio.Reader.
@@ -318,11 +653,13 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
-// ProxyCandidate is the input type for probeProxiesParallel.
+// ProxyCandidate is the input type for probeProxiesParallel and probeProxyHealth.
 type ProxyCandidate struct {
 	ID       string
-	Host     string
-	Port     int
+	Type     string // "http", "socks5", etc.
+	Host     string // empty for PAC-only
+	Port     int    // 0 for PAC-only
+	PacURL   string // non-empty for PAC-only or PAC-attached
 	Username string
 	Password string
 }
@@ -336,9 +673,7 @@ func probeProxiesParallel(candidates []ProxyCandidate) []ProbeResult {
 		wg.Add(1)
 		go func(idx int, cand ProxyCandidate) {
 			defer wg.Done()
-			r := probeProxy(cand.Host, cand.Port, cand.Username, cand.Password)
-			r.ProxyID = cand.ID
-			results[idx] = r
+			results[idx] = probeCandidate(cand, false)
 		}(i, c)
 	}
 	wg.Wait()

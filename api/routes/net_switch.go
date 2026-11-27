@@ -46,6 +46,7 @@ const (
 	stateIdle          switchState = "idle"
 	stateProbing       switchState = "probing"
 	stateCorporate     switchState = "corporate"
+	stateFailover      switchState = "failover"
 	stateDirect        switchState = "direct"
 	stateCaptivePortal switchState = "captive_portal"
 	stateNoInternet    switchState = "no_internet"
@@ -53,22 +54,33 @@ const (
 
 const (
 	defaultPreferredBackInterval = 45 * time.Second
+	defaultHealthCheckInterval   = 30 * time.Second
+	defaultFailoverMinDwell      = 2 * time.Minute
+	defaultFailoverMaxBackoff    = 2 * time.Minute
 	defaultCaptivePollInterval   = 4 * time.Second
 	defaultCaptiveMaxDuration    = 3 * time.Minute
 	defaultCaptiveCooldown       = 2 * time.Minute
 	maxTriggerReasonLen          = 64
+	failoverFailuresThreshold    = 2
+	preferredReturnThreshold     = 2
 )
 
 type SwitchStatus struct {
-	Enabled          bool        `json:"enabled"`
-	State            switchState `json:"state"`
-	ActiveProxyID    string      `json:"activeProxyId"`   // proxy ID or "direct"
-	ActiveProxyName  string      `json:"activeProxyName"` // human-readable
-	CaptivePortalURL string      `json:"captivePortalUrl,omitempty"`
-	LastSwitchedAt   time.Time   `json:"lastSwitchedAt"`
-	LastReason       string      `json:"lastReason"`
-	LastTriggeredAt  time.Time   `json:"lastTriggeredAt"`
-	Probing          bool        `json:"probing"`
+	Enabled            bool        `json:"enabled"`
+	StayConnected      bool        `json:"stayConnected"`
+	BackupMode         string      `json:"backupMode"` // "all" or "selected"
+	BackupProxyIDs     []string    `json:"backupProxyIds"`
+	State              switchState `json:"state"`
+	ActiveProxyID      string      `json:"activeProxyId"`      // proxy ID or "direct"
+	ActiveProxyName    string      `json:"activeProxyName"`    // human-readable
+	PreferredProxyID   string      `json:"preferredProxyId"`   // user's chosen proxy
+	PreferredProxyName string      `json:"preferredProxyName"` // human-readable
+	FailoverReason     string      `json:"failoverReason,omitempty"`
+	CaptivePortalURL   string      `json:"captivePortalUrl,omitempty"`
+	LastSwitchedAt     time.Time   `json:"lastSwitchedAt"`
+	LastReason         string      `json:"lastReason"`
+	LastTriggeredAt    time.Time   `json:"lastTriggeredAt"`
+	Probing            bool        `json:"probing"`
 }
 
 var switchCtrl = &switchController{}
@@ -80,9 +92,13 @@ type switchController struct {
 	mu           sync.Mutex
 
 	enabled          bool
+	stayConnected    bool
+	backupMode       string   // "all" (default) or "selected"
+	backupProxyIDs   []string // allowed backup IDs when backupMode == "selected"
 	state            switchState
 	activeProxyID    string
 	activeProxyName  string
+	failoverReason   string
 	captivePortalURL string
 	directOverride   bool
 	lastSwitchedAt   time.Time
@@ -91,6 +107,13 @@ type switchController struct {
 	probing          bool
 	rerunPending     bool
 	pendingReason    string
+
+	// Stay-connected active health loop & anti-flapping hysteresis counters.
+	healthStopChan    chan struct{}
+	consecFailures    int
+	preferredConsecOK int
+	lastFailoverAt    time.Time
+	allDownStep       int
 
 	// epoch increments on every user/config mutation (SetEnabled, NotifyManual*)
 	// so in-flight probes abort cleanly rather than applying stale decisions.
@@ -124,11 +147,15 @@ type switchController struct {
 	// Injectable timings & dependencies for deterministic unit tests.
 	// Zero/nil values fall back to production defaults.
 	preferredBackInterval time.Duration
+	healthCheckInterval   time.Duration
+	failoverMinDwell      time.Duration
+	failoverMaxBackoff    time.Duration
 	captivePollInterval   time.Duration
 	captiveMaxDuration    time.Duration
 	captiveCooldown       time.Duration
 
 	probeProxiesFn       func([]ProxyCandidate) []ProbeResult
+	probeHealthFn        func(ProxyCandidate) ProbeResult
 	probeDirectFn        func() DirectProbeResult
 	getProxiesFn         func() ([]map[string]any, error)
 	getProxyPasswordFn   func(string) string
@@ -148,6 +175,76 @@ func (c *switchController) getPreferredBackInterval() time.Duration {
 		return c.preferredBackInterval
 	}
 	return defaultPreferredBackInterval
+}
+
+func (c *switchController) getHealthCheckInterval() time.Duration {
+	if c.healthCheckInterval > 0 {
+		return c.healthCheckInterval
+	}
+	return defaultHealthCheckInterval
+}
+
+func (c *switchController) getFailoverMinDwell() time.Duration {
+	if c.failoverMinDwell > 0 {
+		return c.failoverMinDwell
+	}
+	return defaultFailoverMinDwell
+}
+
+func (c *switchController) getFailoverMaxBackoff() time.Duration {
+	if c.failoverMaxBackoff > 0 {
+		return c.failoverMaxBackoff
+	}
+	return defaultFailoverMaxBackoff
+}
+
+func (c *switchController) probeHealth(cand ProxyCandidate) ProbeResult {
+	if c.probeHealthFn != nil {
+		return c.probeHealthFn(cand)
+	}
+	return probeProxyHealth(cand)
+}
+
+func (c *switchController) getBackupModeLocked() string {
+	if c.backupMode == "selected" {
+		return "selected"
+	}
+	return "all"
+}
+
+func (c *switchController) copyBackupIDsLocked() []string {
+	if len(c.backupProxyIDs) == 0 {
+		return []string{}
+	}
+	out := make([]string, len(c.backupProxyIDs))
+	copy(out, c.backupProxyIDs)
+	return out
+}
+
+// filterBackupCandidates returns the ordered list of allowed backup proxies
+// (excluding excludeID) according to backupMode / backupProxyIDs.
+func (c *switchController) filterBackupCandidates(all []ProxyCandidate, excludeID string) []ProxyCandidate {
+	c.mu.Lock()
+	mode := c.getBackupModeLocked()
+	allowed := make(map[string]bool, len(c.backupProxyIDs))
+	for _, id := range c.backupProxyIDs {
+		if id != "" {
+			allowed[id] = true
+		}
+	}
+	c.mu.Unlock()
+
+	var out []ProxyCandidate
+	for _, cand := range all {
+		if cand.ID == "" || cand.ID == excludeID {
+			continue
+		}
+		if mode == "selected" && !allowed[cand.ID] {
+			continue
+		}
+		out = append(out, cand)
+	}
+	return out
 }
 
 func (c *switchController) getCaptivePollInterval() time.Duration {
@@ -294,8 +391,15 @@ func (c *switchController) NotifyManualSelect(proxyID, proxyName string) {
 	c.directOverride = false
 	c.activeProxyID = proxyID
 	c.activeProxyName = proxyName
+	c.failoverReason = ""
+	c.consecFailures = 0
+	c.preferredConsecOK = 0
+	c.allDownStep = 0
 	c.state = stateCorporate
 	c.stopPreferredBackTickerLocked()
+	if c.stayConnected && c.isManagerStarted() {
+		c.ensureStayConnectedLoopLocked()
+	}
 	c.mu.Unlock()
 
 	log.Infoln("[net-switch] manual select: %s (%s) — hold until %s",
@@ -328,10 +432,15 @@ func (c *switchController) notifyManualStopUnderTransitionLock() {
 	c.captiveGen++
 	c.stopCaptiveLoopLocked()
 	c.stopPreferredBackTickerLocked()
+	c.stopStayConnectedLoopLocked()
 	c.directOverride = false
 	c.captivePortalURL = ""
 	c.activeProxyID = ""
 	c.activeProxyName = ""
+	c.failoverReason = ""
+	c.consecFailures = 0
+	c.preferredConsecOK = 0
+	c.allDownStep = 0
 	c.rerunPending = false
 	c.state = stateIdle
 	c.mu.Unlock()
@@ -348,7 +457,15 @@ func (c *switchController) ManualStart() error {
 	defer c.transitionMu.Unlock()
 
 	c.notifyManualStartUnderTransitionLock()
-	return c.startManager()
+	if err := c.startManager(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.stayConnected {
+		c.ensureStayConnectedLoopLocked()
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 // NotifyManualStart cancels active captive-portal / recovery loops and clears
@@ -357,6 +474,11 @@ func (c *switchController) NotifyManualStart() {
 	c.transitionMu.Lock()
 	defer c.transitionMu.Unlock()
 	c.notifyManualStartUnderTransitionLock()
+	c.mu.Lock()
+	if c.stayConnected && c.isManagerStarted() {
+		c.ensureStayConnectedLoopLocked()
+	}
+	c.mu.Unlock()
 }
 
 func (c *switchController) notifyManualStartUnderTransitionLock() {
@@ -367,8 +489,12 @@ func (c *switchController) notifyManualStartUnderTransitionLock() {
 	c.stopPreferredBackTickerLocked()
 	c.directOverride = false
 	c.captivePortalURL = ""
+	c.failoverReason = ""
+	c.consecFailures = 0
+	c.preferredConsecOK = 0
+	c.allDownStep = 0
 	c.captiveCooldownUntil = time.Time{}
-	if c.state == stateCaptivePortal || c.state == stateDirect || c.state == stateNoInternet {
+	if c.state == stateCaptivePortal || c.state == stateDirect || c.state == stateNoInternet || c.state == stateFailover {
 		c.state = stateCorporate
 	}
 	c.mu.Unlock()
@@ -551,20 +677,111 @@ func (c *switchController) failClosedLocked(reason string, err error) {
 	})
 }
 
+// SetStayConnected turns opt-in never-give-up failover on or off.
+// When turned off while temporarily on a backup proxy, smoothly restores the
+// user's preferred proxy for new connections (existing connections survive).
+func (c *switchController) SetStayConnected(enabled bool) {
+	c.transitionMu.Lock()
+	defer c.transitionMu.Unlock()
+
+	c.mu.Lock()
+	c.epoch++
+	c.stayConnected = enabled
+	c.consecFailures = 0
+	c.preferredConsecOK = 0
+	c.allDownStep = 0
+	wasFailover := false
+	restoreID := ""
+	restoreName := ""
+	if enabled {
+		if c.isManagerStarted() {
+			c.ensureStayConnectedLoopLocked()
+		}
+	} else {
+		c.stopStayConnectedLoopLocked()
+		if c.state == stateFailover {
+			wasFailover = true
+			restoreID = c.lastUserProxyID
+			restoreName = c.lastUserProxyName
+		}
+	}
+	c.mu.Unlock()
+
+	if wasFailover {
+		candidates, proxies, _ := c.loadCandidates()
+		restoreID = resolvePreferredProxyID(c.getSelectedProxyID(), restoreID, candidates)
+		if restoreName == "" && restoreID != "" {
+			restoreName = proxyNameFromID(restoreID, proxies)
+		}
+		if restoreID != "" && c.isManagerStarted() {
+			if err := c.applyCorporateMode(restoreID, false); err != nil {
+				log.Warnln("[net-switch] restore preferred proxy on stayConnected disable failed: %v", err)
+			}
+		}
+		c.mu.Lock()
+		c.state = stateCorporate
+		c.activeProxyID = restoreID
+		c.activeProxyName = restoreName
+		c.failoverReason = ""
+		c.mu.Unlock()
+
+		c.broadcast(map[string]any{
+			"proxyId":             restoreID,
+			"proxyName":           restoreName,
+			"preferredProxyId":    restoreID,
+			"preferredProxyName":  restoreName,
+			"state":               string(stateCorporate),
+			"returnedToPreferred": true,
+		})
+	}
+	log.Infoln("[net-switch] stayConnected=%v", enabled)
+}
+
+// SetBackupConfig updates whether Stay-Connected can fail over to all saved
+// proxies ("all") or only user-selected backup proxy IDs ("selected").
+func (c *switchController) SetBackupConfig(mode string, ids []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if mode == "selected" {
+		c.backupMode = "selected"
+	} else {
+		c.backupMode = "all"
+	}
+	if ids != nil {
+		cleaned := make([]string, 0, len(ids))
+		seen := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id != "" && !seen[id] {
+				seen[id] = true
+				cleaned = append(cleaned, id)
+			}
+		}
+		c.backupProxyIDs = cleaned
+	}
+	log.Infoln("[net-switch] backupMode=%s backupProxyIds=%d", c.backupMode, len(c.backupProxyIDs))
+}
+
 // Status returns a snapshot of the current state.
 func (c *switchController) Status() SwitchStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return SwitchStatus{
-		Enabled:          c.enabled,
-		State:            c.state,
-		ActiveProxyID:    c.activeProxyID,
-		ActiveProxyName:  c.activeProxyName,
-		CaptivePortalURL: c.captivePortalURL,
-		LastSwitchedAt:   c.lastSwitchedAt,
-		LastReason:       c.lastReason,
-		LastTriggeredAt:  c.lastTriggeredAt,
-		Probing:          c.probing,
+		Enabled:            c.enabled,
+		StayConnected:      c.stayConnected,
+		BackupMode:         c.getBackupModeLocked(),
+		BackupProxyIDs:     c.copyBackupIDsLocked(),
+		State:              c.state,
+		ActiveProxyID:      c.activeProxyID,
+		ActiveProxyName:    c.activeProxyName,
+		PreferredProxyID:   c.lastUserProxyID,
+		PreferredProxyName: c.lastUserProxyName,
+		FailoverReason:     c.failoverReason,
+		CaptivePortalURL:   c.captivePortalURL,
+		LastSwitchedAt:     c.lastSwitchedAt,
+		LastReason:         c.lastReason,
+		LastTriggeredAt:    c.lastTriggeredAt,
+		Probing:            c.probing,
 	}
 }
 
@@ -622,6 +839,9 @@ func (c *switchController) loadCandidates() ([]ProxyCandidate, []map[string]any,
 		id, _ := p["id"].(string)
 		typ, _ := p["type"].(string)
 		host, _ := p["server"].(string)
+		pacURL, _ := p["pacUrl"].(string)
+		host = strings.TrimSpace(host)
+		pacURL = strings.TrimSpace(pacURL)
 		port := 0
 		switch v := p["port"].(type) {
 		case float64:
@@ -629,13 +849,26 @@ func (c *switchController) loadCandidates() ([]ProxyCandidate, []map[string]any,
 		case int:
 			port = v
 		}
-		if id == "" || typ == "direct" || host == "" || port == 0 {
+		if id == "" || typ == "direct" {
+			continue
+		}
+		// Accept fixed-server proxies (host + port) AND PAC-only proxies (empty host + pacUrl).
+		if host == "" && pacURL == "" {
+			continue
+		}
+		if host != "" && port == 0 {
 			continue
 		}
 		user, _ := p["username"].(string)
 		pass := c.getProxyPassword(id)
 		candidates = append(candidates, ProxyCandidate{
-			ID: id, Host: host, Port: port, Username: user, Password: pass,
+			ID:       id,
+			Type:     typ,
+			Host:     host,
+			Port:     port,
+			PacURL:   pacURL,
+			Username: user,
+			Password: pass,
 		})
 	}
 	return candidates, proxies, nil
@@ -1602,6 +1835,473 @@ func (c *switchController) stopPreferredBackTickerLocked() {
 	}
 }
 
+// ── Stay-connected active health & backup failover loop ──────────────────────
+// Optional power-user mode: checks real end-to-end internet (GET /generate_204)
+// through the active proxy every 30s. After 2 consecutive failures it fails over
+// to an allowed backup proxy WITHOUT closing existing connections (downloads
+// survive; new connections use the new proxy), while polling the user's preferred
+// proxy every 30s and returning only after 2 consecutive healthy checks + min dwell.
+// When all proxies are down, stays fail-closed on the preferred proxy and retries
+// with backoff (30s -> 60s -> 120s cap) without ever disconnecting.
+
+func (c *switchController) ensureStayConnectedLoopLocked() {
+	if c.healthStopChan != nil {
+		return
+	}
+	stop := make(chan struct{})
+	c.healthStopChan = stop
+	go c.runStayConnectedLoop(stop)
+}
+
+func (c *switchController) stopStayConnectedLoopLocked() {
+	if c.healthStopChan != nil {
+		close(c.healthStopChan)
+		c.healthStopChan = nil
+	}
+}
+
+func (c *switchController) nextHealthDelay() time.Duration {
+	base := c.getHealthCheckInterval()
+	maxBackoff := c.getFailoverMaxBackoff()
+	c.mu.Lock()
+	step := c.allDownStep
+	c.mu.Unlock()
+	if step <= 0 {
+		return base
+	}
+	delay := base
+	for i := 0; i < step; i++ {
+		delay *= 2
+		if delay >= maxBackoff {
+			return maxBackoff
+		}
+	}
+	return delay
+}
+
+func (c *switchController) runStayConnectedLoop(stop <-chan struct{}) {
+	for {
+		delay := c.nextHealthDelay()
+		timer := time.NewTimer(delay)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		c.mu.Lock()
+		active := c.stayConnected && c.healthStopChan == stop
+		c.mu.Unlock()
+		if !active {
+			return
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorln("[net-switch] panic recovered in stayConnected tick: %v", r)
+				}
+			}()
+			c.runStayConnectedTick()
+		}()
+	}
+}
+
+func findCandidateByID(candidates []ProxyCandidate, id string) (ProxyCandidate, bool) {
+	for _, cand := range candidates {
+		if cand.ID == id {
+			return cand, true
+		}
+	}
+	return ProxyCandidate{}, false
+}
+
+// runStayConnectedTick executes one active health check & failover decision.
+// Callable directly from unit tests for deterministic verification.
+func (c *switchController) runStayConnectedTick() {
+	c.mu.Lock()
+	if !c.stayConnected || c.state == stateCaptivePortal || c.state == stateDirect {
+		c.mu.Unlock()
+		return
+	}
+	startEpoch := c.epoch
+	curState := c.state
+	activeID := c.activeProxyID
+	lastUserID := c.lastUserProxyID
+	lastFailoverAt := c.lastFailoverAt
+	autoHomeOffice := c.enabled
+	c.mu.Unlock()
+
+	if !c.isManagerStarted() {
+		return
+	}
+
+	candidates, proxies, err := c.loadCandidates()
+	if err != nil || len(candidates) == 0 {
+		return
+	}
+
+	selectedID := c.getSelectedProxyID()
+	preferredID := resolvePreferredProxyID(selectedID, lastUserID, candidates)
+	if activeID == "" || activeID == "direct" {
+		activeID = selectedID
+	}
+	if activeID == "" {
+		activeID = preferredID
+	}
+	preferredName := proxyNameFromID(preferredID, proxies)
+	preferredCand, hasPreferred := findCandidateByID(candidates, preferredID)
+
+	// Helper to switch to a healthy backup proxy while keeping existing connections alive.
+	tryFailoverToBackup := func(excludeIDs map[string]bool, reason string) bool {
+		backups := c.filterBackupCandidates(candidates, preferredID)
+		for _, b := range backups {
+			if excludeIDs[b.ID] {
+				continue
+			}
+			res := c.probeHealth(b)
+			if !res.Alive || res.AuthRequired {
+				continue
+			}
+			bName := proxyNameFromID(b.ID, proxies)
+			c.transitionMu.Lock()
+			c.mu.Lock()
+			if c.epoch != startEpoch || !c.stayConnected || c.state == stateCaptivePortal || !c.isManagerStarted() {
+				c.mu.Unlock()
+				c.transitionMu.Unlock()
+				return true
+			}
+			c.mu.Unlock()
+
+			// Keep existing connections alive (closeExisting=false); new connections use backup.
+			if err := c.applyCorporateMode(b.ID, false); err != nil {
+				log.Errorln("[net-switch] failover applyCorporateMode(%s) failed: %v", b.ID, err)
+				c.transitionMu.Unlock()
+				continue
+			}
+
+			c.mu.Lock()
+			c.state = stateFailover
+			c.directOverride = false
+			c.activeProxyID = b.ID
+			c.activeProxyName = bName
+			if c.lastUserProxyID == "" {
+				c.lastUserProxyID = preferredID
+				c.lastUserProxyName = preferredName
+			}
+			c.failoverReason = reason
+			c.consecFailures = 0
+			c.preferredConsecOK = 0
+			c.allDownStep = 0
+			c.lastFailoverAt = time.Now()
+			c.lastSwitchedAt = time.Now()
+			c.lastReason = fmt.Sprintf("%s — switched to backup %s", reason, bName)
+			c.stopPreferredBackTickerLocked()
+			c.mu.Unlock()
+			c.transitionMu.Unlock()
+
+			log.Infoln("[net-switch] stay-connected failover: %s -> backup %s (%s)", preferredName, bName, reason)
+			c.broadcast(map[string]any{
+				"proxyId":            b.ID,
+				"proxyName":          bName,
+				"preferredProxyId":   preferredID,
+				"preferredProxyName": preferredName,
+				"state":              string(stateFailover),
+				"reason":             reason,
+			})
+			return true
+		}
+		return false
+	}
+
+	// Helper when every proxy is down: optionally check Home/Direct if Auto Home/Office
+	// is ALSO enabled; otherwise stay fail-closed on preferred proxy with backoff.
+	handleAllDown := func(reason string) {
+		if autoHomeOffice {
+			directRes := c.probeDirect()
+			c.transitionMu.Lock()
+			c.mu.Lock()
+			if c.epoch != startEpoch || !c.stayConnected || c.state == stateCaptivePortal || !c.isManagerStarted() {
+				c.mu.Unlock()
+				c.transitionMu.Unlock()
+				return
+			}
+			inCooldown := time.Now().Before(c.captiveCooldownUntil)
+			c.mu.Unlock()
+
+			if directRes.State == captivePortal && !inCooldown {
+				c.enterCaptivePortalUnderTransitionLock(directRes.RedirectURL, preferredID, preferredName, candidates, "stay-connected")
+				c.transitionMu.Unlock()
+				return
+			}
+			if directRes.State == directOK {
+				if err := c.applyDirectMode(); err == nil {
+					c.mu.Lock()
+					c.state = stateDirect
+					c.directOverride = true
+					c.activeProxyID = "direct"
+					c.activeProxyName = "Direct"
+					c.failoverReason = ""
+					c.consecFailures = 0
+					c.preferredConsecOK = 0
+					c.allDownStep = 0
+					c.lastSwitchedAt = time.Now()
+					c.lastReason = "no proxy reachable, direct connection active (stay-connected)"
+					c.mu.Unlock()
+					c.startPreferredBackTicker(candidates)
+					c.transitionMu.Unlock()
+					c.broadcast(map[string]any{
+						"proxyId":   "direct",
+						"proxyName": "Direct",
+						"state":     string(stateDirect),
+					})
+					return
+				}
+			}
+			c.transitionMu.Unlock()
+		}
+
+		// Fail-closed: keep routing pointed at preferred proxy (never disconnect, never leak direct).
+		c.transitionMu.Lock()
+		c.mu.Lock()
+		if c.epoch != startEpoch || !c.stayConnected || c.state == stateCaptivePortal || !c.isManagerStarted() {
+			c.mu.Unlock()
+			c.transitionMu.Unlock()
+			return
+		}
+		needRestorePreferred := c.activeProxyID != preferredID && preferredID != ""
+		prevState := c.state
+		c.mu.Unlock()
+
+		if needRestorePreferred {
+			_ = c.applyCorporateMode(preferredID, false)
+		}
+
+		c.mu.Lock()
+		c.state = stateNoInternet
+		c.directOverride = false
+		c.activeProxyID = preferredID
+		c.activeProxyName = preferredName
+		c.failoverReason = reason
+		c.allDownStep++
+		c.lastSwitchedAt = time.Now()
+		c.lastReason = "all proxies unavailable — retrying (stay-connected)"
+		c.mu.Unlock()
+		c.transitionMu.Unlock()
+
+		if prevState != stateNoInternet {
+			c.broadcast(map[string]any{
+				"proxyId":            preferredID,
+				"proxyName":          preferredName,
+				"preferredProxyId":   preferredID,
+				"preferredProxyName": preferredName,
+				"state":              string(stateNoInternet),
+				"reason":             reason,
+			})
+		}
+	}
+
+	// ── Case 1: Currently on a backup proxy (stateFailover) ──────────────────
+	if curState == stateFailover {
+		// 1a. Always poll the user's preferred proxy to see if it recovered.
+		preferredHealthyNow := false
+		if hasPreferred {
+			prefRes := c.probeHealth(preferredCand)
+			if prefRes.Alive && !prefRes.AuthRequired {
+				preferredHealthyNow = true
+				c.mu.Lock()
+				c.preferredConsecOK++
+				okCount := c.preferredConsecOK
+				c.mu.Unlock()
+
+				dwellMet := time.Since(lastFailoverAt) >= c.getFailoverMinDwell()
+				if okCount >= preferredReturnThreshold && dwellMet {
+					c.transitionMu.Lock()
+					c.mu.Lock()
+					if c.epoch != startEpoch || !c.stayConnected || c.state != stateFailover || !c.isManagerStarted() {
+						c.mu.Unlock()
+						c.transitionMu.Unlock()
+						return
+					}
+					c.mu.Unlock()
+
+					// Smooth switch back: existing downloads finish on backup; new connections use preferred!
+					if err := c.applyCorporateMode(preferredID, false); err != nil {
+						log.Errorln("[net-switch] return to preferred %s failed: %v", preferredID, err)
+						c.transitionMu.Unlock()
+						return
+					}
+					c.mu.Lock()
+					c.state = stateCorporate
+					c.activeProxyID = preferredID
+					c.activeProxyName = preferredName
+					c.failoverReason = ""
+					c.consecFailures = 0
+					c.preferredConsecOK = 0
+					c.allDownStep = 0
+					c.lastSwitchedAt = time.Now()
+					c.lastReason = preferredName + " is back — switched back"
+					c.mu.Unlock()
+					c.transitionMu.Unlock()
+
+					log.Infoln("[net-switch] preferred proxy %s stable (%d checks) — switched back smoothly", preferredName, okCount)
+					c.broadcast(map[string]any{
+						"proxyId":             preferredID,
+						"proxyName":           preferredName,
+						"preferredProxyId":    preferredID,
+						"preferredProxyName":  preferredName,
+						"state":               string(stateCorporate),
+						"returnedToPreferred": true,
+					})
+					return
+				}
+			} else {
+				c.mu.Lock()
+				c.preferredConsecOK = 0
+				c.mu.Unlock()
+			}
+		}
+
+		// 1b. Also check whether the active backup proxy is still healthy.
+		if activeCand, ok := findCandidateByID(candidates, activeID); ok {
+			actRes := c.probeHealth(activeCand)
+			if actRes.Alive && !actRes.AuthRequired {
+				c.mu.Lock()
+				c.consecFailures = 0
+				c.mu.Unlock()
+				return
+			}
+		}
+
+		// Active backup failed — if preferred JUST passed health, jump straight back to preferred!
+		if preferredHealthyNow && hasPreferred {
+			c.transitionMu.Lock()
+			c.mu.Lock()
+			if c.epoch != startEpoch || !c.stayConnected || c.state != stateFailover || !c.isManagerStarted() {
+				c.mu.Unlock()
+				c.transitionMu.Unlock()
+				return
+			}
+			c.mu.Unlock()
+			if err := c.applyCorporateMode(preferredID, false); err == nil {
+				c.mu.Lock()
+				c.state = stateCorporate
+				c.activeProxyID = preferredID
+				c.activeProxyName = preferredName
+				c.failoverReason = ""
+				c.consecFailures = 0
+				c.preferredConsecOK = 0
+				c.allDownStep = 0
+				c.lastSwitchedAt = time.Now()
+				c.lastReason = preferredName + " is back — switched back"
+				c.mu.Unlock()
+				c.transitionMu.Unlock()
+				c.broadcast(map[string]any{
+					"proxyId":             preferredID,
+					"proxyName":           preferredName,
+					"preferredProxyId":    preferredID,
+					"preferredProxyName":  preferredName,
+					"state":               string(stateCorporate),
+					"returnedToPreferred": true,
+				})
+				return
+			}
+			c.transitionMu.Unlock()
+		}
+
+		c.mu.Lock()
+		c.consecFailures++
+		fails := c.consecFailures
+		c.mu.Unlock()
+		if fails < failoverFailuresThreshold {
+			return
+		}
+		if tryFailoverToBackup(map[string]bool{activeID: true}, "backup proxy failed") {
+			return
+		}
+		handleAllDown("all proxies unreachable")
+		return
+	}
+
+	// ── Case 2: All proxies were down (stateNoInternet) — keep retrying ──────
+	if curState == stateNoInternet {
+		if hasPreferred {
+			if prefRes := c.probeHealth(preferredCand); prefRes.Alive && !prefRes.AuthRequired {
+				c.transitionMu.Lock()
+				c.mu.Lock()
+				if c.epoch != startEpoch || !c.stayConnected || c.state != stateNoInternet || !c.isManagerStarted() {
+					c.mu.Unlock()
+					c.transitionMu.Unlock()
+					return
+				}
+				c.mu.Unlock()
+				if err := c.applyCorporateMode(preferredID, false); err == nil {
+					c.mu.Lock()
+					c.state = stateCorporate
+					c.activeProxyID = preferredID
+					c.activeProxyName = preferredName
+					c.failoverReason = ""
+					c.consecFailures = 0
+					c.preferredConsecOK = 0
+					c.allDownStep = 0
+					c.lastSwitchedAt = time.Now()
+					c.lastReason = preferredName + " recovered"
+					c.mu.Unlock()
+					c.transitionMu.Unlock()
+					c.broadcast(map[string]any{
+						"proxyId":             preferredID,
+						"proxyName":           preferredName,
+						"preferredProxyId":    preferredID,
+						"preferredProxyName":  preferredName,
+						"state":               string(stateCorporate),
+						"resumed":             true,
+						"returnedToPreferred": true,
+					})
+					return
+				}
+				c.transitionMu.Unlock()
+			}
+		}
+		if tryFailoverToBackup(nil, preferredName+" unavailable") {
+			return
+		}
+		handleAllDown("all proxies unreachable")
+		return
+	}
+
+	// ── Case 3: Normal operation on preferred proxy ──────────────────────────
+	activeCand, hasActive := findCandidateByID(candidates, activeID)
+	if !hasActive {
+		return
+	}
+	res := c.probeHealth(activeCand)
+	if res.Alive && !res.AuthRequired {
+		c.mu.Lock()
+		c.consecFailures = 0
+		c.allDownStep = 0
+		c.mu.Unlock()
+		return
+	}
+
+	c.mu.Lock()
+	c.consecFailures++
+	fails := c.consecFailures
+	c.mu.Unlock()
+	if fails < failoverFailuresThreshold {
+		log.Infoln("[net-switch] health check failed on %s (%d/%d): %v", preferredName, fails, failoverFailuresThreshold, res.Err)
+		return
+	}
+
+	reason := preferredName + " isn't working"
+	if res.AuthRequired {
+		reason = preferredName + " requires authentication"
+	}
+	if tryFailoverToBackup(map[string]bool{activeID: true}, reason) {
+		return
+	}
+	handleAllDown(reason)
+}
+
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 func netSwitchRouter() http.Handler {
@@ -1641,11 +2341,17 @@ func netSwitchTrigger(w http.ResponseWriter, r *http.Request) {
 func netSwitchGetConfig(w http.ResponseWriter, r *http.Request) {
 	switchCtrl.mu.Lock()
 	enabled := switchCtrl.enabled
+	stayConnected := switchCtrl.stayConnected
+	backupMode := switchCtrl.getBackupModeLocked()
+	backupIDs := switchCtrl.copyBackupIDsLocked()
 	lastID := switchCtrl.lastUserProxyID
 	lastName := switchCtrl.lastUserProxyName
 	switchCtrl.mu.Unlock()
 	render.JSON(w, r, render.M{
 		"enabled":           enabled,
+		"stayConnected":     stayConnected,
+		"backupMode":        backupMode,
+		"backupProxyIds":    backupIDs,
 		"lastUserProxyId":   lastID,
 		"lastUserProxyName": lastName,
 	})
@@ -1653,8 +2359,11 @@ func netSwitchGetConfig(w http.ResponseWriter, r *http.Request) {
 
 func netSwitchSetConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled         *bool  `json:"enabled"`
-		LastUserProxyID string `json:"lastUserProxyId"`
+		Enabled         *bool     `json:"enabled"`
+		StayConnected   *bool     `json:"stayConnected"`
+		BackupMode      *string   `json:"backupMode"`
+		BackupProxyIDs  *[]string `json:"backupProxyIds"`
+		LastUserProxyID string    `json:"lastUserProxyId"`
 	}
 	if err := render.DecodeJSON(r.Body, &req); err != nil {
 		render.Status(r, http.StatusBadRequest)
@@ -1683,8 +2392,26 @@ func netSwitchSetConfig(w http.ResponseWriter, r *http.Request) {
 			switchCtrl.mu.Unlock()
 		}
 	}
+	if req.BackupMode != nil || req.BackupProxyIDs != nil {
+		mode := ""
+		if req.BackupMode != nil {
+			mode = *req.BackupMode
+		} else {
+			switchCtrl.mu.Lock()
+			mode = switchCtrl.getBackupModeLocked()
+			switchCtrl.mu.Unlock()
+		}
+		var ids []string
+		if req.BackupProxyIDs != nil {
+			ids = *req.BackupProxyIDs
+		}
+		switchCtrl.SetBackupConfig(mode, ids)
+	}
 	if req.Enabled != nil {
 		switchCtrl.SetEnabled(*req.Enabled)
+	}
+	if req.StayConnected != nil {
+		switchCtrl.SetStayConnected(*req.StayConnected)
 	}
 	render.JSON(w, r, render.M{"ok": true})
 }
