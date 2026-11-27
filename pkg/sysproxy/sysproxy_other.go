@@ -53,3 +53,6 @@ func clearNodeExtraCAPlatform() {}
 // getAllNetworkServices returns nil so Set/Clear fall back to the single
 // interface path (multi-service enumeration is macOS-only via networksetup).
 func getAllNetworkServices() []string { return nil }
+
+// SavedPACURL returns empty on unsupported platforms.
+func SavedPACURL() string { return "" }

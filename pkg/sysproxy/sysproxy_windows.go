@@ -44,6 +44,12 @@ var (
 	prevSaved      bool
 )
 
+// SavedPACURL returns the WinINET AutoConfigURL that was active before Lux
+// overrode the system proxy, if any.
+func SavedPACURL() string {
+	return prevPACURL
+}
+
 // prevProxyOverride remembers the user's ProxyOverride (proxy exception list)
 // from before lux enabled its proxy, so it can be restored on disable instead
 // of being wiped. mergeProxyOverride adds lux's required entries without

@@ -7,9 +7,7 @@ package pac
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -841,137 +839,9 @@ func (c *CompiledPAC) ExtractUpstreamHosts() []string {
 // ── WPAD helper ──────────────────────────────────────────────────────────────
 
 // ProbeWPADUrl tries to find a PAC URL via OS DHCP option 252, scutil/registry,
-// and parallel LAN probes.
+// and parallel TUN-bypassing LAN probes.
 func ProbeWPADUrl() string {
-	if runtime.GOOS == "darwin" {
-		// Fast path: DHCP option 252
-		defaultIface := getDefaultIfaceName()
-		if defaultIface != "" {
-			out, err := exec.Command("ipconfig", "getpacket", defaultIface).Output()
-			if err == nil {
-				for _, line := range strings.Split(string(out), "\n") {
-					if strings.Contains(line, "proxy_auto_discovery_url") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) == 2 {
-							u := strings.TrimSpace(parts[1])
-							if strings.HasPrefix(u, "http") {
-								log.Infoln("[wpad] found via DHCP option 252: %s", u)
-								return u
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Fast path: scutil --proxy (system proxy config)
-		out, err := exec.Command("scutil", "--proxy").Output()
-		if err == nil {
-			for _, line := range strings.Split(string(out), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "ProxyAutoConfigURLString") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) == 2 {
-						u := strings.TrimSpace(parts[1])
-						if strings.HasPrefix(u, "http") {
-							log.Infoln("[wpad] found via scutil --proxy: %s", u)
-							return u
-						}
-					}
-				}
-			}
-		}
-
-		// Slow path: parallel probes
-		var candidates []string
-		if defaultIface != "" {
-			out2, err2 := exec.Command("ipconfig", "getpacket", defaultIface).Output()
-			if err2 == nil {
-				for _, line := range strings.Split(string(out2), "\n") {
-					if strings.Contains(line, "domain_name") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) == 2 {
-							domain := strings.TrimSpace(parts[1])
-							if domain != "" {
-								candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if gw := getDefaultGateway(); gw != "" {
-			candidates = append(candidates, "http://"+gw+"/wpad.dat")
-		}
-
-		if u := probeURLsParallel(candidates); u != "" {
-			return u
-		}
-	}
-
-	if runtime.GOOS == "windows" {
-		// Fast path: Windows registry AutoConfigURL
-		for _, hive := range []string{"HKCU", "HKLM"} {
-			out, err := exec.Command("powershell.exe",
-				"-noprofile", "-NonInteractive", "-command",
-				fmt.Sprintf(`(Get-ItemProperty "%s:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA SilentlyContinue).AutoConfigURL`, hive),
-			).Output()
-			if err == nil {
-				u := strings.TrimSpace(string(out))
-				if u != "" && strings.HasPrefix(u, "http") {
-					log.Infoln("[wpad] found via Windows registry (%s): %s", hive, u)
-					return u
-				}
-			}
-		}
-
-		// Slow path: parallel probes
-		candidates := []string{"http://wpad/wpad.dat"}
-		if domain := getWindowsDNSSuffix(); domain != "" {
-			candidates = append(candidates, "http://wpad."+domain+"/wpad.dat")
-		}
-		if gw := getDefaultGateway(); gw != "" {
-			candidates = append(candidates, "http://"+gw+"/wpad.dat")
-		}
-
-		if u := probeURLsParallel(candidates); u != "" {
-			return u
-		}
-	}
-
-	return ""
-}
-
-func probeURLsParallel(candidates []string) string {
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	type result struct {
-		url string
-	}
-	ch := make(chan result, len(candidates))
-
-	for _, u := range candidates {
-		u := u
-		go func() {
-			if probeURL(u) {
-				ch <- result{url: u}
-			} else {
-				ch <- result{url: ""}
-			}
-		}()
-	}
-
-	for range candidates {
-		r := <-ch
-		if r.url != "" {
-			log.Infoln("[wpad] found via parallel probe: %s", r.url)
-			return r.url
-		}
-	}
-	return ""
+	return ProbeWPADUrlWithSource().URL
 }
 
 func getDefaultIfaceName() string {
@@ -990,14 +860,7 @@ func getDefaultIfaceName() string {
 
 func getDefaultGateway() string {
 	if runtime.GOOS == "windows" {
-		out, err := exec.Command("powershell.exe",
-			"-noprofile", "-NonInteractive", "-command",
-			`(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop`,
-		).Output()
-		if err != nil {
-			return ""
-		}
-		return strings.TrimSpace(string(out))
+		return ""
 	}
 	out, err := exec.Command("route", "-n", "get", "default").Output()
 	if err != nil {
@@ -1012,46 +875,9 @@ func getDefaultGateway() string {
 	return ""
 }
 
-func probeURL(url string) bool {
-	client := &http.Client{
-		Timeout:   1500 * time.Millisecond,
-		Transport: &http.Transport{Proxy: nil},
-	}
-	resp, err := client.Get(url)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return false
-	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(b), "FindProxyForURL")
-}
-
-func getWindowsDNSSuffix() string {
-	if runtime.GOOS != "windows" {
-		return ""
-	}
-	out, err := exec.Command("powershell.exe",
-		"-noprofile", "-NonInteractive", "-command",
-		`\ = Get-NetIPConfiguration | Where-Object { \.IPv4DefaultGateway } | Select-Object -First 1; if (\) { (Get-DnsClient -InterfaceIndex \.InterfaceIndex -EA SilentlyContinue).ConnectionSpecificSuffix }`,
-	).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func NoPacFoundMessage() string {
 	if runtime.GOOS == "windows" {
-		return "No PAC URL found: registry AutoConfigURL (HKCU and HKLM) is empty, " +
-			"and no PAC was served at http://wpad/wpad.dat, wpad.<dns-suffix>, " +
-			"or the default gateway."
+		return "No proxy or PAC script found on this network (checked Windows proxy settings, WPAD/PAC auto-discovery, and local network gateway)."
 	}
-	return "No PAC URL found: DHCP option 252 is unset and no PAC was served at " +
-		"wpad.<domain> or the default gateway."
+	return "No proxy or PAC script found on this network (checked DHCP option 252, macOS proxy settings, WPAD/PAC auto-discovery, and local network gateway)."
 }

@@ -39,6 +39,10 @@ const (
 	proxyTypeSOCKS ProxyType = "socks"
 )
 
+// SavedPACURL returns any PAC URL saved prior to Lux overriding system proxy
+// (macOS does not clear AutoConfigURL on SetWebProxy, so scutil reads it live).
+func SavedPACURL() string { return "" }
+
 type proxySettings struct {
 	host    string
 	port    string
