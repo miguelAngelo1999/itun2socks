@@ -172,9 +172,25 @@ func ExtractProxiesFromPAC(js string) []PACProxyEntry {
 	return out
 }
 
-// BuildWPADCandidates constructs a prioritized, deduplicated list of WPAD / PAC
-// candidate URLs following RFC WPAD domain walking plus gateway & LAN DNS checks.
-func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
+// IsIPHostPACURL reports whether rawURL's hostname is a static IP address
+// literal (e.g. http://10.60.0.1:80/wpad.dat) rather than a dynamic DNS
+// hostname (e.g. http://wpad/wpad.dat or http://wpad.corp.local/wpad.dat).
+func IsIPHostPACURL(rawURL string) bool {
+	u, err := neturl.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return false
+	}
+	return net.ParseIP(host) != nil
+}
+
+// BuildHostnameWPADCandidates builds ONLY DNS-hostname-based WPAD/PAC URLs
+// (bare http://wpad/wpad.dat, http://wpad/proxy.pac, plus RFC DNS suffix walk),
+// excluding raw gateway/DNS IP literals.
+func BuildHostnameWPADCandidates(suffixes []string) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(u string) {
@@ -186,7 +202,7 @@ func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
 		out = append(out, u)
 	}
 
-	// Standard unqualified WPAD first (resolved via direct LAN DNS on Windows).
+	// Standard unqualified WPAD first (resolved dynamically by self-hosted fleet DNS).
 	add("http://wpad/wpad.dat")
 	add("http://wpad/proxy.pac")
 
@@ -209,7 +225,23 @@ func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
 		}
 	}
 
-	// Physical router gateway(s)
+	return out
+}
+
+// BuildIPWPADCandidates builds IP-based WPAD/PAC fallback URLs on physical
+// gateways and private LAN DNS servers.
+func BuildIPWPADCandidates(gateways, privateDNS []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(u string) {
+		u = strings.TrimSpace(u)
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+
 	for _, gw := range gateways {
 		gw = strings.TrimSpace(gw)
 		if gw == "" || isLoopbackHost(gw) {
@@ -219,7 +251,6 @@ func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
 		add("http://" + gw + "/proxy.pac")
 	}
 
-	// Private LAN DNS servers (often run Squid + Apache WPAD on corporate networks)
 	for _, dnsIP := range privateDNS {
 		dnsIP = strings.TrimSpace(dnsIP)
 		if dnsIP == "" || isLoopbackHost(dnsIP) {
@@ -232,17 +263,57 @@ func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
 	return out
 }
 
-// ProbeWPADUrlWithSource tries OS-configured PAC / DHCP option 252 first, then
-// probes prioritized WPAD & PAC candidate URLs in parallel (bypassing TUN).
+// BuildWPADCandidates constructs a prioritized, deduplicated list of WPAD / PAC
+// candidate URLs following RFC WPAD domain walking plus gateway & LAN DNS checks.
+func BuildWPADCandidates(suffixes, gateways, privateDNS []string) []string {
+	out := BuildHostnameWPADCandidates(suffixes)
+	seen := make(map[string]bool, len(out))
+	for _, u := range out {
+		seen[u] = true
+	}
+	for _, u := range BuildIPWPADCandidates(gateways, privateDNS) {
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// ProbeHostnameWPADUrl probes ONLY DNS-hostname-based WPAD URLs
+// (http://wpad/wpad.dat, http://wpad/proxy.pac, http://wpad.<suffix>/...)
+// in parallel, bypassing TUN and system proxy.
+func ProbeHostnameWPADUrl(suffixes []string) string {
+	return probeURLsParallelPrioritized(BuildHostnameWPADCandidates(suffixes))
+}
+
+// ProbeIPWPADUrl probes IP-based WPAD URLs on gateways and private LAN DNS
+// servers in parallel, bypassing TUN and system proxy.
+func ProbeIPWPADUrl(gateways, privateDNS []string) string {
+	return probeURLsParallelPrioritized(BuildIPWPADCandidates(gateways, privateDNS))
+}
+
+// ProbeWPADUrlWithSource discovers the best WPAD/PAC URL on the network.
+// When DHCP Option 252 or OS settings return a hardcoded IP-based PAC URL
+// (e.g. http://10.60.0.1:80/wpad.dat), it still probes DNS-hostname WPAD
+// (e.g. http://wpad/wpad.dat) and prefers the dynamic DNS hostname URL if
+// available so roaming company fleets stay working across branches/VPNs.
 func ProbeWPADUrlWithSource() WPADProbeResult {
 	cfg := DetectOSProxyConfig()
+	if cfg.PacURL != "" && !IsIPHostPACURL(cfg.PacURL) {
+		return WPADProbeResult{URL: cfg.PacURL, Source: cfg.PacSource}
+	}
+
+	if dnsURL := ProbeHostnameWPADUrl(cfg.DNSSuffixes); dnsURL != "" {
+		return WPADProbeResult{URL: dnsURL, Source: "wpad-dns"}
+	}
+
 	if cfg.PacURL != "" {
 		return WPADProbeResult{URL: cfg.PacURL, Source: cfg.PacSource}
 	}
 
-	candidates := BuildWPADCandidates(cfg.DNSSuffixes, cfg.Gateways, cfg.PrivateDNS)
-	if u := probeURLsParallelPrioritized(candidates); u != "" {
-		return WPADProbeResult{URL: u, Source: "wpad-probe"}
+	if ipURL := ProbeIPWPADUrl(cfg.Gateways, cfg.PrivateDNS); ipURL != "" {
+		return WPADProbeResult{URL: ipURL, Source: "wpad-probe"}
 	}
 	return WPADProbeResult{}
 }

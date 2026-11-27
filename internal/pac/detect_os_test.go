@@ -152,3 +152,28 @@ func TestProbeHTTPProxyPort_AcceptsProxyRejectsRouterHTML(t *testing.T) {
 		t.Error("expected HTML router page to be rejected")
 	}
 }
+
+func TestIsIPHostPACURLAndHostnameWPAD(t *testing.T) {
+	if !IsIPHostPACURL("http://10.60.0.1:80/wpad.dat") {
+		t.Error("expected IPv4 PAC URL to be flagged as IP host")
+	}
+	if !IsIPHostPACURL("http://192.168.71.254/proxy.pac") {
+		t.Error("expected IPv4 PAC URL without port to be flagged as IP host")
+	}
+	if IsIPHostPACURL("http://wpad/wpad.dat") {
+		t.Error("expected http://wpad/wpad.dat to be recognized as dynamic hostname")
+	}
+	if IsIPHostPACURL("http://wpad.corp.local/proxy.pac") {
+		t.Error("expected http://wpad.corp.local/proxy.pac to be recognized as dynamic hostname")
+	}
+
+	hostOnly := BuildHostnameWPADCandidates([]string{"corp.local"})
+	for _, u := range hostOnly {
+		if IsIPHostPACURL(u) {
+			t.Errorf("BuildHostnameWPADCandidates must not return IP URLs: %s", u)
+		}
+	}
+	if len(hostOnly) < 2 || hostOnly[0] != "http://wpad/wpad.dat" || hostOnly[1] != "http://wpad/proxy.pac" {
+		t.Errorf("expected http://wpad/wpad.dat & proxy.pac first, got %+v", hostOnly)
+	}
+}

@@ -17,11 +17,22 @@ type DetectedProxy struct {
 	PacOnly bool   `json:"pacOnly,omitempty"`
 }
 
+// DetectedPAC is one valid PAC script URL discovered on the network.
+// IsDynamic is true when the URL uses a DNS hostname (e.g. http://wpad/wpad.dat)
+// rather than a static IP address (e.g. http://10.60.0.1:80/wpad.dat).
+type DetectedPAC struct {
+	URL       string `json:"url"`
+	Source    string `json:"source"`
+	IsDynamic bool   `json:"isDynamic"`
+}
+
 // detectProxies runs a multi-stage proxy & PAC auto-discovery pipeline:
 //  1. OS-configured PAC / WPAD (DHCP option 252, macOS scutil, Windows Win32
-//     registry across user SID/HKCU/HKLM, saved pre-Lux PAC URL, plus parallel
-//     TUN-bypassing WPAD/PAC probes on wpad, DNS search suffixes, gateways,
-//     and private LAN DNS servers).
+//     registry across user SID/HKCU/HKLM, saved pre-Lux PAC URL) AND
+//     self-hosted DNS WPAD discovery (http://wpad/wpad.dat, http://wpad/proxy.pac,
+//     http://wpad.<suffix>/...). When both a dynamic DNS WPAD URL and a static
+//     IP DHCP/OS PAC URL are available, the dynamic DNS URL is preferred first
+//     and both are returned in `pacUrls`.
 //  2. Full PAC evaluation (Goja JS) + comment-stripped static extraction of
 //     PROXY / HTTP / HTTPS / SOCKS / SOCKS5 upstreams, plus PAC-only fallback
 //     when a valid PAC script routes dynamically with no static server.
@@ -34,28 +45,70 @@ type DetectedProxy struct {
 func detectProxies(w http.ResponseWriter, r *http.Request) {
 	osCfg := pac.DetectOSProxyConfig()
 
-	pacURL := osCfg.PacURL
-	source := osCfg.PacSource
-
-	if pacURL == "" {
-		wpadRes := pac.ProbeWPADUrlWithSource()
-		if wpadRes.URL != "" {
-			pacURL = wpadRes.URL
-			source = wpadRes.Source
+	var pacCandidates []DetectedPAC
+	seenPAC := make(map[string]bool)
+	addPAC := func(rawURL, src string) {
+		u := rawURL
+		if u == "" || seenPAC[u] {
+			return
 		}
+		seenPAC[u] = true
+		pacCandidates = append(pacCandidates, DetectedPAC{
+			URL:       u,
+			Source:    src,
+			IsDynamic: !pac.IsIPHostPACURL(u),
+		})
+	}
+
+	// Stage 0a: Always probe DNS-hostname WPAD (http://wpad/wpad.dat,
+	// http://wpad/proxy.pac, http://wpad.<suffix>/...) unless OS/DHCP already
+	// gave us a dynamic hostname PAC URL — AND even if OS/DHCP gave a static IP
+	// URL (like http://10.60.0.1:80/wpad.dat), probe DNS WPAD so roaming company
+	// fleets discover http://wpad/wpad.dat too!
+	if osCfg.PacURL != "" && !pac.IsIPHostPACURL(osCfg.PacURL) {
+		addPAC(osCfg.PacURL, osCfg.PacSource)
+	}
+	if dnsURL := pac.ProbeHostnameWPADUrl(osCfg.DNSSuffixes); dnsURL != "" {
+		addPAC(dnsURL, "wpad-dns")
+	}
+	if osCfg.PacURL != "" && pac.IsIPHostPACURL(osCfg.PacURL) {
+		addPAC(osCfg.PacURL, osCfg.PacSource)
+	}
+	// Stage 0b: Only fall back to IP-based gateway / LAN DNS WPAD probing if no
+	// PAC URL has been found yet.
+	if len(pacCandidates) == 0 {
+		if ipURL := pac.ProbeIPWPADUrl(osCfg.Gateways, osCfg.PrivateDNS); ipURL != "" {
+			addPAC(ipURL, "wpad-probe")
+		}
+	}
+
+	pacURL := ""
+	source := ""
+	if len(pacCandidates) > 0 {
+		pacURL = pacCandidates[0].URL
+		source = pacCandidates[0].Source
 	}
 
 	var proxies []DetectedProxy
 	pacRuleCount := 0
 
-	// Stage 1: If a PAC URL was found, fetch and parse/evaluate it.
-	if pacURL != "" {
-		log.Infoln("[detect-proxy] found PAC URL (%s): %s", source, pacURL)
-		js, fetchErr := pac.Fetch(pacURL)
-		if fetchErr != nil {
-			log.Warnln("[detect-proxy] could not fetch PAC %s: %v", pacURL, fetchErr)
-			// Still fall through to check OS manual / LAN proxies, while preserving pacUrl.
-		} else {
+	// Stage 1: If any PAC URL was found, fetch and parse/evaluate the highest-
+	// priority one (dynamic DNS first), falling back to secondary candidates if
+	// the first fails to fetch.
+	if len(pacCandidates) > 0 {
+		for idx, cand := range pacCandidates {
+			log.Infoln("[detect-proxy] trying PAC URL (%s, dynamic=%v): %s", cand.Source, cand.IsDynamic, cand.URL)
+			js, fetchErr := pac.Fetch(cand.URL)
+			if fetchErr != nil {
+				log.Warnln("[detect-proxy] could not fetch PAC %s: %v", cand.URL, fetchErr)
+				continue
+			}
+			// Promote the candidate that actually fetched successfully as primary.
+			pacURL = cand.URL
+			source = cand.Source
+			if idx > 0 {
+				pacCandidates[0], pacCandidates[idx] = pacCandidates[idx], pacCandidates[0]
+			}
 			if rules, err := pac.Parse(js); err == nil {
 				pacRuleCount = len(rules)
 			}
@@ -78,6 +131,7 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 					PacOnly: true,
 				})
 			}
+			break
 		}
 	}
 
@@ -133,6 +187,7 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 	if pacURL == "" && len(proxies) > 0 && proxies[0].Host != "" {
 		if hostPac := pac.ProbeProxyHostPAC(proxies[0].Host); hostPac != "" {
 			pacURL = hostPac
+			addPAC(hostPac, "wpad-probe")
 			if js, err := pac.Fetch(hostPac); err == nil {
 				if rules, err := pac.Parse(js); err == nil {
 					pacRuleCount = len(rules)
@@ -149,6 +204,7 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 		render.Status(r, http.StatusOK)
 		render.JSON(w, r, map[string]any{
 			"pacUrl":       "",
+			"pacUrls":      []DetectedPAC{},
 			"pacRuleCount": 0,
 			"source":       "",
 			"proxies":      []DetectedProxy{},
@@ -167,8 +223,13 @@ func detectProxies(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	if pacCandidates == nil {
+		pacCandidates = []DetectedPAC{}
+	}
+
 	render.JSON(w, r, map[string]any{
 		"pacUrl":       pacURL,
+		"pacUrls":      pacCandidates,
 		"pacRuleCount": pacRuleCount,
 		"source":       source,
 		"proxies":      proxies,
