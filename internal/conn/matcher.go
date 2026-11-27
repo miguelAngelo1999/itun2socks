@@ -1,6 +1,8 @@
 package conn
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +59,77 @@ func policyDisplayName(policy string) string {
 	return policy
 }
 
+// ResolvePolicyLabel returns a clear human label for a routing policy, including
+// the active selected proxy name when policy == PROXY (e.g. "PROXY (test-proxy)").
+func ResolvePolicyLabel(policy constants.Policy) string {
+	if policy == constants.PolicyProxy {
+		if id := GetSelectedProxyId(); id != "" {
+			if name := policyDisplayName(id); name != "" && name != id {
+				return fmt.Sprintf("PROXY (%s)", name)
+			}
+		}
+		if p, err := GetProxy(constants.PolicyProxy); err == nil && p != nil {
+			if name := strings.TrimSpace(p.Name()); name != "" && name != "PROXY" {
+				return fmt.Sprintf("PROXY (%s)", name)
+			}
+		}
+		return string(policy)
+	}
+	return policyDisplayName(string(policy))
+}
+
+// FormatTargetForLog returns a concise host:port target, enriching bare IP
+// destinations with the cached DNS domain when available (e.g. TUN mode).
+func FormatTargetForLog(metadata *C.Metadata) string {
+	if metadata == nil {
+		return "unknown"
+	}
+	remote := metadata.RemoteAddress()
+	if metadata.Host != "" {
+		return remote
+	}
+	if metadata.DstIP != nil {
+		if cached, ok := dns.GetCachedDnsItem(metadata.DstIP.String()); ok && cached != "" {
+			if metadata.DstPort > 0 {
+				return fmt.Sprintf("%s:%s (%s)", cached, metadata.DstPort.String(), metadata.DstIP.String())
+			}
+			return fmt.Sprintf("%s (%s)", cached, remote)
+		}
+	}
+	return remote
+}
+
+// FormatProcessTag returns " [AppName]" when metadata carries a process path,
+// or "" otherwise. Handles both POSIX '/' and Windows '\' separators.
+func FormatProcessTag(metadata *C.Metadata) string {
+	if metadata == nil || metadata.ProcessPath == "" {
+		return ""
+	}
+	p := strings.TrimSpace(metadata.ProcessPath)
+	if idx := strings.LastIndexAny(p, `/\`); idx >= 0 && idx+1 < len(p) {
+		p = p[idx+1:]
+	}
+	if p == "" {
+		return ""
+	}
+	return " [" + p + "]"
+}
+
+func formatMatchedRuleTag(rule rule_engine.Rule) string {
+	if rule == nil {
+		return ""
+	}
+	rt := rule.Type()
+	val := strings.TrimSpace(rule.Value())
+	if rt == "" || rt == constants.RuleBuiltIn {
+		return ""
+	}
+	if val != "" {
+		return fmt.Sprintf("%s:%s", rt, val)
+	}
+	return string(rt)
+}
+
 var defaultConnMatchers []Matcher
 var matcherMux sync.RWMutex
 
@@ -88,26 +161,33 @@ func resolveMetadata(metadata *C.Metadata) rule_engine.Rule {
 			rule = tempRule
 		}
 	}
-	remoteAddr := metadata.DstIP.String()
 	if metadata.NetWork == C.UDP {
 		logType = log.UdpPrefix
 	}
 	if GetIsDNSConn(metadata) {
 		printLog = log.Debugln
 	}
-	cachedDomain, ok := dns.GetCachedDnsItem(remoteAddr)
+
+	target := FormatTargetForLog(metadata)
+	procTag := FormatProcessTag(metadata)
+	ruleTag := formatMatchedRuleTag(rule)
+
 	if rule.GetPolicy() == constants.PolicyReject {
-		// Log denied connections at warn level so they appear in orange in the
-		// log view and are easy to spot without filtering.
-		if ok {
-			log.Warnln(log.FormatLog(logType, " [DENY] %s to %s(%s) matched rule: %s"), metadata.SourceAddress(), metadata.RemoteAddress(), cachedDomain, rule.GetPolicy())
+		// Log locally rejected connections at warn level with [RULE_REJECT] so
+		// the UI can distinguish Lux rules from upstream proxy denials.
+		if ruleTag != "" {
+			log.Warnln(log.FormatLog(logType, "[DENY] [RULE_REJECT] %s%s matched %s → REJECT"), target, procTag, ruleTag)
 		} else {
-			log.Warnln(log.FormatLog(logType, " [DENY] %s to %s matched rule: %s"), metadata.SourceAddress(), metadata.RemoteAddress(), rule.GetPolicy())
+			log.Warnln(log.FormatLog(logType, "[DENY] [RULE_REJECT] %s%s matched rule: REJECT"), target, procTag)
 		}
-	} else if ok {
-		printLog(log.FormatLog(logType, " %s to %s(%s) using %s"), metadata.SourceAddress(), metadata.RemoteAddress(), cachedDomain, policyDisplayName(string(rule.GetPolicy())))
+		return rule
+	}
+
+	policyLabel := ResolvePolicyLabel(rule.GetPolicy())
+	if ruleTag != "" {
+		printLog(log.FormatLog(logType, "%s%s → %s (%s)"), target, procTag, policyLabel, ruleTag)
 	} else {
-		printLog(log.FormatLog(logType, " %s to %s using %s"), metadata.SourceAddress(), metadata.RemoteAddress(), policyDisplayName(string(rule.GetPolicy())))
+		printLog(log.FormatLog(logType, "%s%s → %s"), target, procTag, policyLabel)
 	}
 	return rule
 }

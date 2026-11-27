@@ -37,6 +37,14 @@ type Socks5Option struct {
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 }
 
+func (ss *Socks5) proxyLabel() string {
+	name := strings.TrimSpace(ss.Name())
+	if name == "" || name == ss.addr {
+		return ss.addr
+	}
+	return fmt.Sprintf("%s (%s)", name, ss.addr)
+}
+
 // StreamConn implements C.ProxyAdapter
 func (ss *Socks5) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
 	if ss.tls {
@@ -58,7 +66,7 @@ func (ss *Socks5) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error)
 		}
 	}
 	if _, err := socks5.ClientHandshake(c, serializesSocksAddr(metadata), socks5.CmdConnect, user); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("SOCKS5 proxy %s: %w", ss.proxyLabel(), err)
 	}
 	return c, nil
 }

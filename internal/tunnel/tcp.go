@@ -1,7 +1,10 @@
 package tunnel
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"time"
 
 	"github.com/igoogolx/itun2socks/internal/conn"
 	"github.com/igoogolx/itun2socks/internal/tunnel/statistic"
@@ -19,25 +22,32 @@ func TcpQueue() chan conn.TcpConnContext {
 }
 
 func handleTCPConn(ct conn.TcpConnContext) {
+	dialStart := time.Now()
+	target := conn.FormatTargetForLog(ct.Metadata())
+	procTag := conn.FormatProcessTag(ct.Metadata())
+	policy := ct.Rule().GetPolicy()
+	policyLabel := conn.ResolvePolicyLabel(policy)
+
 	remoteConn, err := conn.NewTcpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), network_iface.GetDefaultInterfaceName())
 	defer func() {
 		ct.Wg().Done()
-		if err := closeConn(ct.Conn()); err != nil {
+		if err := closeConn(ct.Conn()); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Debugln(log.FormatLog(log.TcpPrefix, "fail to close local tcp conn,err: %v"), err)
 		}
-		if err := closeConn(remoteConn); err != nil {
+		if err := closeConn(remoteConn); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Debugln(log.FormatLog(log.TcpPrefix, "fail to close remote tcp conn, err: %v"), err)
 		}
 	}()
 	if err != nil {
-		if IsProxyDenied(err) {
-			log.Warnln(log.FormatLog(log.TcpPrefix, "[DENY] [PROXY_DENIED] upstream proxy denied connection to %s, err: %v"), ct.Metadata().RemoteAddress(), err)
+		if tag, denied := ClassifyProxyError(err); denied {
+			log.Warnln(log.FormatLog(log.TcpPrefix, "[DENY] [PROXY_DENIED] [%s] %s%s via %s — %v"), tag, target, procTag, policyLabel, err)
 		} else {
-			log.Warnln(log.FormatLog(log.TcpPrefix, "fail to get tcp conn, err: %v, rule: %v, remote address: %v"), err, ct.Rule().GetPolicy(), ct.Metadata().RemoteAddress())
+			log.Warnln(log.FormatLog(log.TcpPrefix, "[DIAL_FAIL] %s%s via %s — %v"), target, procTag, policyLabel, err)
 		}
 		return
 	}
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())
+	tracker := statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, ct.Metadata(), ct.Rule())
+	remoteConn = tracker
 
 	// CopyConn, rather than two bufio.Copy goroutines joined by a WaitGroup.
 	//
@@ -60,8 +70,17 @@ func handleTCPConn(ct conn.TcpConnContext) {
 	//
 	// CopyConn calls CloseWrite on the peer when a direction reaches EOF, so each
 	// side learns the other has finished, and closes outright on error.
-	if err := bufio.CopyConn(ct.Ctx(), ct.Conn(), remoteConn); err != nil {
-		conn.PrintPacketError(err, fmt.Sprintf(log.FormatLog(log.TcpPrefix, "relay ended: %v, remote address: %v"), err, ct.Metadata().RemoteAddress()))
+	relayErr := bufio.CopyConn(ct.Ctx(), ct.Conn(), remoteConn)
+	upBytes := tracker.UploadTotal.Load()
+	downBytes := tracker.DownloadTotal.Load()
+	if isEarlyUpstreamReset(policy, upBytes, downBytes, time.Since(dialStart), relayErr) {
+		if relayErr != nil {
+			log.Warnln(log.FormatLog(log.TcpPrefix, "[PROXY_RESET] %s%s via %s — upstream closed/reset right after handshake (possible SNI/TLS block, ↑%dB ↓%dB): %v"), target, procTag, policyLabel, upBytes, downBytes, relayErr)
+		} else {
+			log.Warnln(log.FormatLog(log.TcpPrefix, "[PROXY_RESET] %s%s via %s — upstream closed right after handshake with no reply (possible SNI/TLS block, ↑%dB ↓%dB)"), target, procTag, policyLabel, upBytes, downBytes)
+		}
+	} else if relayErr != nil {
+		conn.PrintPacketError(relayErr, fmt.Sprintf(log.FormatLog(log.TcpPrefix, "relay ended: %v, remote address: %v"), relayErr, target))
 	}
 }
 

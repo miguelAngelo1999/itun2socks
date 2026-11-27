@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/igoogolx/itun2socks/internal/pac"
@@ -12,6 +13,20 @@ import (
 	C "github.com/igoogolx/itun2socks/pkg/clash/constant"
 	"github.com/igoogolx/itun2socks/pkg/log"
 )
+
+func looksLikeUpstreamDeny(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "denied") ||
+		strings.Contains(s, "403") ||
+		strings.Contains(s, "407") ||
+		strings.Contains(s, "405") ||
+		strings.Contains(s, "not allowed") ||
+		strings.Contains(s, "need auth") ||
+		strings.Contains(s, "auth failed")
+}
 
 // PacDynamic is a "PAC-only" outbound: it has no fixed upstream server. For each
 // connection it evaluates the proxy's PAC against the destination and dials
@@ -134,7 +149,7 @@ func (p *PacDynamic) DialContext(ctx context.Context, metadata *C.Metadata, opts
 	// The PAC may return an ordered failover list; try each in order.
 	directives := pac.ParseDirectives(directive)
 	var lastErr error
-	for _, d := range directives {
+	for idx, d := range directives {
 		if d.IsDirect() {
 			var targetIP net.IP
 			if ip := net.ParseIP(metadata.Host); ip != nil {
@@ -184,7 +199,11 @@ func (p *PacDynamic) DialContext(ctx context.Context, metadata *C.Metadata, opts
 		conn, err := upstream.DialContext(ctx, metadata, childOpts...)
 		if err != nil {
 			lastErr = err
-			log.Debugln("[pac-dynamic] upstream %s://%s dial failed for %s: %v", d.Scheme, net.JoinHostPort(d.Host, d.Port), host, err)
+			if idx+1 < len(directives) && looksLikeUpstreamDeny(err) {
+				log.Warnln("[TCP], [DENY] [PROXY_DENIED] [PAC] %s denied by %s://%s — trying next PAC directive (%v)", metadata.RemoteAddress(), d.Scheme, net.JoinHostPort(d.Host, d.Port), err)
+			} else {
+				log.Debugln("[pac-dynamic] upstream %s://%s dial failed for %s: %v", d.Scheme, net.JoinHostPort(d.Host, d.Port), host, err)
+			}
 			continue
 		}
 		return conn, nil

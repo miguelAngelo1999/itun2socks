@@ -100,6 +100,119 @@ func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata, opts ...di
 	return NewConn(c, h), nil
 }
 
+// proxyLabel returns a human-readable identifier for this upstream proxy,
+// combining name and host:port when both are useful.
+func (h *Http) proxyLabel() string {
+	name := strings.TrimSpace(h.Name())
+	if name == "" || name == h.addr {
+		return h.addr
+	}
+	return fmt.Sprintf("%s (%s)", name, h.addr)
+}
+
+// extractProxyDenyReason pulls diagnostic hints that corporate proxies
+// (Squid, OpenSWG, FortiGate, BlueCoat, etc.) attach to 403/405/407/5xx
+// CONNECT responses — headers first, then a bounded <title> or plain text line.
+func extractProxyDenyReason(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+
+	var hints []string
+	for _, key := range []string{
+		"X-Squid-Error",
+		"X-Block-Reason",
+		"X-OpenSWG-Rule",
+		"X-Swg-Rule",
+		"X-Denied-Reason",
+		"X-Category",
+	} {
+		if v := strings.TrimSpace(resp.Header.Get(key)); v != "" {
+			if key == "X-Squid-Error" {
+				hints = append(hints, v)
+			} else {
+				hints = append(hints, key+"="+v)
+			}
+		}
+	}
+	if len(hints) > 0 {
+		return clampLogHint(strings.Join(hints, ", "), 140)
+	}
+
+	if resp.Body != nil {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		text := strings.TrimSpace(string(raw))
+		if text != "" {
+			lower := strings.ToLower(text)
+			if start := strings.Index(lower, "<title>"); start >= 0 {
+				rest := text[start+len("<title>"):]
+				if end := strings.Index(strings.ToLower(rest), "</title>"); end >= 0 {
+					title := collapseWhitespace(rest[:end])
+					if title != "" && !strings.EqualFold(title, resp.Status) {
+						return clampLogHint(title, 120)
+					}
+				}
+			} else if !strings.HasPrefix(text, "<") {
+				line := text
+				if nl := strings.IndexAny(line, "\r\n"); nl >= 0 {
+					line = line[:nl]
+				}
+				line = collapseWhitespace(line)
+				if line != "" && !strings.EqualFold(line, resp.Status) {
+					return clampLogHint(line, 120)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func clampLogHint(s string, maxLen int) string {
+	s = collapseWhitespace(s)
+	if len(s) > maxLen {
+		return s[:maxLen-1] + "…"
+	}
+	return s
+}
+
+func cleanHTTPStatusText(resp *http.Response) string {
+	codePrefix := strconv.Itoa(resp.StatusCode)
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(resp.Status), codePrefix))
+	if text == "" {
+		text = http.StatusText(resp.StatusCode)
+	}
+	return text
+}
+
+func formatHttpProxyError(proxyLabel string, resp *http.Response) error {
+	reason := extractProxyDenyReason(resp)
+	suffix := ""
+	if reason != "" {
+		suffix = " [" + reason + "]"
+	}
+	statusText := cleanHTTPStatusText(resp)
+
+	switch {
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("upstream proxy %s denied connection (HTTP 403 Forbidden)%s", proxyLabel, suffix)
+	case resp.StatusCode == http.StatusProxyAuthRequired:
+		return fmt.Errorf("upstream proxy %s authentication required (HTTP 407)%s", proxyLabel, suffix)
+	case resp.StatusCode == http.StatusMethodNotAllowed:
+		return fmt.Errorf("upstream proxy %s denied connection (HTTP 405 Method Not Allowed)%s", proxyLabel, suffix)
+	case resp.StatusCode >= http.StatusInternalServerError:
+		return fmt.Errorf("upstream proxy %s gateway error (HTTP %d %s)%s", proxyLabel, resp.StatusCode, statusText, suffix)
+	default:
+		return fmt.Errorf("upstream proxy %s rejected connection: HTTP %d %s%s", proxyLabel, resp.StatusCode, statusText, suffix)
+	}
+}
+
 // connectVia tunnels through the upstream proxy to reach this proxy's address.
 func (h *Http) connectVia(c net.Conn) error {
 	req := &http.Request{
@@ -119,17 +232,10 @@ func (h *Http) connectVia(c net.Conn) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusForbidden {
-			return fmt.Errorf("upstream proxy denied connection (HTTP 403 Forbidden)")
-		} else if resp.StatusCode == http.StatusProxyAuthRequired {
-			return fmt.Errorf("upstream proxy authentication required (HTTP 407)")
-		} else if resp.StatusCode >= http.StatusInternalServerError {
-			return fmt.Errorf("upstream proxy gateway error (HTTP %d %s)", resp.StatusCode, resp.Status)
-		}
-		return fmt.Errorf("upstream proxy rejected connection: HTTP %d %s", resp.StatusCode, resp.Status)
+		return formatHttpProxyError(h.via, resp)
 	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -164,23 +270,7 @@ func (h *Http) shakeHand(metadata *C.Metadata, rw io.ReadWriter) error {
 		return nil
 	}
 
-	if resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("upstream proxy denied connection (HTTP 403 Forbidden)")
-	}
-
-	if resp.StatusCode == http.StatusProxyAuthRequired {
-		return fmt.Errorf("upstream proxy authentication required (HTTP 407)")
-	}
-
-	if resp.StatusCode == http.StatusMethodNotAllowed {
-		return fmt.Errorf("upstream proxy denied connection (HTTP 405 Method Not Allowed)")
-	}
-
-	if resp.StatusCode >= http.StatusInternalServerError {
-		return fmt.Errorf("upstream proxy gateway error (HTTP %d %s)", resp.StatusCode, resp.Status)
-	}
-
-	return fmt.Errorf("upstream proxy rejected connection: HTTP %d %s", resp.StatusCode, resp.Status)
+	return formatHttpProxyError(h.proxyLabel(), resp)
 }
 
 func NewHttp(option HttpOption) *Http {

@@ -54,10 +54,13 @@ func handleUdpConn(ct conn.UdpConnContext) {
 
 	localConn, err := conn.NewUdpConn(ct.Ctx(), ct.Metadata(), ct.Rule(), network_iface.GetDefaultInterfaceName())
 	if err != nil {
-		if IsProxyDenied(err) {
-			log.Warnln(log.FormatLog(log.UdpPrefix, "[DENY] [PROXY_DENIED] upstream proxy denied UDP connection to %s, err: %v"), remote, err)
+		target := conn.FormatTargetForLog(ct.Metadata())
+		procTag := conn.FormatProcessTag(ct.Metadata())
+		policyLabel := conn.ResolvePolicyLabel(ct.Rule().GetPolicy())
+		if tag, denied := ClassifyProxyError(err); denied {
+			log.Warnln(log.FormatLog(log.UdpPrefix, "[DENY] [PROXY_DENIED] [%s] %s%s via %s — %v"), tag, target, procTag, policyLabel, err)
 		} else {
-			log.Warnln(log.FormatLog(log.UdpPrefix, "fail to get udp conn, err: %v, remote address: %v"), err, remote)
+			log.Warnln(log.FormatLog(log.UdpPrefix, "[DIAL_FAIL] %s%s via %s — %v"), target, procTag, policyLabel, err)
 		}
 		return
 	}

@@ -39,7 +39,7 @@ func logRouter() http.Handler {
 
 func getLogs(w http.ResponseWriter, r *http.Request) {
 	var mux sync.Mutex
-	logs, err := log.ReadFile(1000)
+	logs, err := log.ReadFile(2000)
 	if err != nil {
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, err)

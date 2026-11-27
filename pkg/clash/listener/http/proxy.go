@@ -74,7 +74,14 @@ func HandleConn(c net.Conn, in chan<- C.ConnContext, cache *cache.LruCache) {
 			} else {
 				resp, err = client.Do(request)
 				if err != nil {
+					log.Warnln("[TCP], [DIAL_FAIL] HTTP %s %s — %v", request.Method, request.URL.String(), err)
 					resp = responseWith(request, http.StatusBadGateway)
+				} else if isUpstreamHTTPProxyDenial(resp) {
+					hint := plainHTTPProxyHint(resp)
+					if hint != "" {
+						hint = " [" + hint + "]"
+					}
+					log.Warnln("[TCP], [DENY] [PROXY_DENIED] [HTTP %d] %s %s — upstream proxy returned %s%s", resp.StatusCode, request.Method, request.URL.String(), resp.Status, hint)
 				}
 			}
 
@@ -133,4 +140,38 @@ func responseWith(request *http.Request, statusCode int) *http.Response {
 		ProtoMinor: request.ProtoMinor,
 		Header:     http.Header{},
 	}
+}
+
+func isUpstreamHTTPProxyDenial(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return true
+	}
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusMethodNotAllowed {
+		return false
+	}
+	for _, key := range []string{"X-Squid-Error", "X-Block-Reason", "X-OpenSWG-Rule", "X-Swg-Rule", "X-Denied-Reason", "Proxy-Authenticate"} {
+		if strings.TrimSpace(resp.Header.Get(key)) != "" {
+			return true
+		}
+	}
+	server := strings.ToLower(resp.Header.Get("Server") + " " + resp.Header.Get("Via"))
+	for _, kw := range []string{"squid", "proxy", "openswg", "forti", "bluecoat", "zscaler", "netskope", "mwg"} {
+		if strings.Contains(server, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func plainHTTPProxyHint(resp *http.Response) string {
+	var parts []string
+	for _, key := range []string{"X-Squid-Error", "X-Block-Reason", "X-OpenSWG-Rule", "X-Category", "Server"} {
+		if v := strings.TrimSpace(resp.Header.Get(key)); v != "" {
+			parts = append(parts, v)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
